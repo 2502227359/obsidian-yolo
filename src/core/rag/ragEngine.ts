@@ -3,23 +3,41 @@ import { App } from 'obsidian'
 import { QueryProgressState } from '../../components/chat-view/QueryProgress'
 import { VectorManager } from '../../database/modules/vector/VectorManager'
 import { SelectEmbedding } from '../../database/schema'
-import { SmartComposerSettings } from '../../settings/schema/setting.types'
+import { YoloSettings } from '../../settings/schema/setting.types'
 import { EmbeddingModelClient } from '../../types/embedding'
 
 import { getEmbeddingModelClient } from './embedding'
+import type { ReconcileScope } from './reconciler'
+
+type RagQueryResult = Omit<SelectEmbedding, 'embedding'> & {
+  similarity: number
+}
+
+export const dedupeRagQueryResults = (
+  rows: RagQueryResult[],
+): RagQueryResult[] => {
+  const deduped = new Map<string, RagQueryResult>()
+
+  for (const row of rows) {
+    const key = `${row.path}:${row.metadata.page ?? ''}:${row.metadata.startLine}:${row.metadata.endLine}`
+    const existing = deduped.get(key)
+    if (!existing || row.similarity > existing.similarity) {
+      deduped.set(key, row)
+    }
+  }
+
+  return [...deduped.values()]
+}
 
 // TODO: do we really need this class? It seems like unnecessary abstraction.
 export class RAGEngine {
   private app: App
-  private settings: SmartComposerSettings
+  private settings: YoloSettings
   private vectorManager: VectorManager | null = null
   private embeddingModel: EmbeddingModelClient | null = null
+  private indexUpdateQueue: Promise<void> = Promise.resolve()
 
-  constructor(
-    app: App,
-    settings: SmartComposerSettings,
-    vectorManager: VectorManager,
-  ) {
+  constructor(app: App, settings: YoloSettings, vectorManager: VectorManager) {
     this.app = app
     this.settings = settings
     this.vectorManager = vectorManager
@@ -35,7 +53,7 @@ export class RAGEngine {
   }
 
   // TODO: use addSettingsChangeListener
-  setSettings(settings: SmartComposerSettings) {
+  setSettings(settings: YoloSettings) {
     this.settings = settings
     this.embeddingModel = getEmbeddingModelClient({
       settings,
@@ -43,38 +61,63 @@ export class RAGEngine {
     })
   }
 
-  // TODO: Implement automatic vault re-indexing when settings are changed.
-  // Currently, users must manually re-index the vault.
+  /**
+   * Reconcile the vault index against the current settings. The single
+   * write entrypoint for indexing — see {@link VectorManager.reconcile}.
+   *
+   * - `truncate: true, scope: { kind: 'all' }` → "rebuild from scratch"
+   * - `truncate: false, scope: { kind: 'all' }` → "sync after settings change"
+   * - `truncate: false, scope: { kind: 'paths', paths }` → "sync changed files"
+   */
   async updateVaultIndex(
-    options: { reindexAll: boolean; signal?: AbortSignal } = {
-      reindexAll: false,
+    options: {
+      scope: ReconcileScope
+      truncate?: boolean
+      signal?: AbortSignal
     },
     onQueryProgressChange?: (queryProgress: QueryProgressState) => void,
   ): Promise<void> {
-    if (!this.embeddingModel) {
-      throw new Error('Embedding model is not set')
+    const run = async () => {
+      if (!this.embeddingModel) {
+        throw new Error('Embedding model is not set')
+      }
+      await this.vectorManager?.reconcile(
+        this.embeddingModel,
+        {
+          chunkSize: this.settings.ragOptions.chunkSize,
+          excludePatterns: this.settings.ragOptions.excludePatterns,
+          includePatterns: this.settings.ragOptions.includePatterns,
+          indexPdf: this.settings.ragOptions.indexPdf ?? true,
+          embeddingConcurrency: this.settings.ragOptions.embeddingConcurrency,
+          settings: this.settings,
+        },
+        {
+          scope: options.scope,
+          truncate: options.truncate,
+          signal: options.signal,
+          onProgress: (indexProgress) => {
+            onQueryProgressChange?.({
+              type: 'indexing',
+              indexProgress,
+            })
+          },
+        },
+      )
     }
-    await this.vectorManager?.updateVaultIndex(
-      this.embeddingModel,
-      {
-        chunkSize: this.settings.ragOptions.chunkSize,
-        excludePatterns: this.settings.ragOptions.excludePatterns,
-        includePatterns: this.settings.ragOptions.includePatterns,
-        reindexAll: options.reindexAll,
-        signal: options.signal,
-      },
-      (indexProgress) => {
-        onQueryProgressChange?.({
-          type: 'indexing',
-          indexProgress,
-        })
-      },
+
+    const queuedRun = this.indexUpdateQueue.catch(() => undefined).then(run)
+    this.indexUpdateQueue = queuedRun.then(
+      () => undefined,
+      () => undefined,
     )
+    await queuedRun
   }
 
   async processQuery({
     query,
     scope,
+    minSimilarity: minSimilarityOverride,
+    limit: limitOverride,
     onQueryProgressChange,
   }: {
     query: string
@@ -82,18 +125,17 @@ export class RAGEngine {
       files: string[]
       folders: string[]
     }
+    /** Override settings.ragOptions.minSimilarity when set */
+    minSimilarity?: number
+    /** Override settings.ragOptions.limit when set */
+    limit?: number
     onQueryProgressChange?: (queryProgress: QueryProgressState) => void
-  }): Promise<
-    (Omit<SelectEmbedding, 'embedding'> & {
-      similarity: number
-    })[]
-  > {
+  }): Promise<RagQueryResult[]> {
     if (!this.embeddingModel) {
       throw new Error('Embedding model is not set')
     }
-    // TODO: Decide the vault index update strategy.
-    // Current approach: Update on every query.
-    await this.updateVaultIndex({ reindexAll: false }, onQueryProgressChange)
+    // Index updates are handled by RagAutoUpdateService (vault events), manual
+    // re-index commands, and settings UI — not on every query — to keep search fast.
     const queryEmbedding = await this.getQueryEmbedding(query)
     onQueryProgressChange?.({
       type: 'querying',
@@ -103,16 +145,18 @@ export class RAGEngine {
         queryEmbedding,
         this.embeddingModel,
         {
-          minSimilarity: this.settings.ragOptions.minSimilarity,
-          limit: this.settings.ragOptions.limit,
+          minSimilarity:
+            minSimilarityOverride ?? this.settings.ragOptions.minSimilarity,
+          limit: limitOverride ?? this.settings.ragOptions.limit,
           scope,
         },
       )) ?? []
+    const dedupedQueryResult = dedupeRagQueryResults(queryResult)
     onQueryProgressChange?.({
       type: 'querying-done',
-      queryResult,
+      queryResult: dedupedQueryResult,
     })
-    return queryResult
+    return dedupedQueryResult
   }
 
   private async getQueryEmbedding(query: string): Promise<number[]> {

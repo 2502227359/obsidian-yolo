@@ -1,3 +1,4 @@
+import { decideAfterLlmResult, decideAfterToolResult } from './loop-decision'
 import { AgentWorkerInbound, AgentWorkerOutbound } from './types'
 
 type WorkerSubscriber = (message: AgentWorkerOutbound) => void
@@ -29,6 +30,23 @@ const emit = (msg) => {
   self.postMessage(msg)
 }
 
+const decideAfterLlmResult = ({ hasToolCalls }) => {
+  if (hasToolCalls) {
+    return { type: 'tool_phase' }
+  }
+  return { type: 'done', reason: 'completed' }
+}
+
+const decideAfterToolResult = ({ hasPendingTools, iteration, maxIterations }) => {
+  if (hasPendingTools) {
+    return { type: 'done', reason: 'completed' }
+  }
+  if (iteration >= maxIterations) {
+    return { type: 'done', reason: 'max_iterations' }
+  }
+  return { type: 'llm_request', nextIteration: iteration + 1 }
+}
+
 self.onmessage = (event) => {
   const message = event.data
   try {
@@ -51,11 +69,25 @@ self.onmessage = (event) => {
           return
         }
         state.iteration += 1
-        if (!message.hasToolCalls) {
-          emit({ type: 'done', runId: message.runId, reason: 'completed' })
+        const decision = decideAfterLlmResult({
+          hasToolCalls: message.hasToolCalls,
+          hasAssistantOutput: message.hasAssistantOutput,
+          iteration: state.iteration,
+          maxIterations: state.maxIterations,
+        })
+        if (decision.type === 'tool_phase') {
+          emit({ type: 'tool_phase', runId: message.runId })
           return
         }
-        emit({ type: 'tool_phase', runId: message.runId })
+        if (decision.type === 'done') {
+          emit({ type: 'done', runId: message.runId, reason: decision.reason })
+          return
+        }
+        emit({
+          type: 'llm_request',
+          runId: message.runId,
+          iteration: decision.nextIteration,
+        })
         return
       }
       case 'tool_result': {
@@ -64,18 +96,19 @@ self.onmessage = (event) => {
           emit({ type: 'done', runId: message.runId, reason: 'aborted' })
           return
         }
-        if (message.hasPendingTools) {
-          emit({ type: 'done', runId: message.runId, reason: 'completed' })
-          return
-        }
-        if (state.iteration >= state.maxIterations) {
-          emit({ type: 'done', runId: message.runId, reason: 'max_iterations' })
+        const decision = decideAfterToolResult({
+          hasPendingTools: message.hasPendingTools,
+          iteration: state.iteration,
+          maxIterations: state.maxIterations,
+        })
+        if (decision.type === 'done') {
+          emit({ type: 'done', runId: message.runId, reason: decision.reason })
           return
         }
         emit({
           type: 'llm_request',
           runId: message.runId,
-          iteration: state.iteration + 1,
+          iteration: decision.nextIteration,
         })
       }
     }
@@ -140,11 +173,29 @@ class AgentLoopWorkerDriver {
           return
         }
         this.state.iteration += 1
-        if (!message.hasToolCalls) {
-          this.emit({ type: 'done', runId: message.runId, reason: 'completed' })
+        const decision = decideAfterLlmResult({
+          hasToolCalls: message.hasToolCalls,
+          hasAssistantOutput: message.hasAssistantOutput,
+          iteration: this.state.iteration,
+          maxIterations: this.state.maxIterations,
+        })
+        if (decision.type === 'tool_phase') {
+          this.emit({ type: 'tool_phase', runId: message.runId })
           return
         }
-        this.emit({ type: 'tool_phase', runId: message.runId })
+        if (decision.type === 'done') {
+          this.emit({
+            type: 'done',
+            runId: message.runId,
+            reason: decision.reason,
+          })
+          return
+        }
+        this.emit({
+          type: 'llm_request',
+          runId: message.runId,
+          iteration: decision.nextIteration,
+        })
         return
       }
       case 'tool_result': {
@@ -154,16 +205,17 @@ class AgentLoopWorkerDriver {
           return
         }
 
-        if (message.hasPendingTools) {
-          this.emit({ type: 'done', runId: message.runId, reason: 'completed' })
-          return
-        }
+        const decision = decideAfterToolResult({
+          hasPendingTools: message.hasPendingTools,
+          iteration: this.state.iteration,
+          maxIterations: this.state.maxIterations,
+        })
 
-        if (this.state.iteration >= this.state.maxIterations) {
+        if (decision.type === 'done') {
           this.emit({
             type: 'done',
             runId: message.runId,
-            reason: 'max_iterations',
+            reason: decision.reason,
           })
           return
         }
@@ -171,7 +223,7 @@ class AgentLoopWorkerDriver {
         this.emit({
           type: 'llm_request',
           runId: message.runId,
-          iteration: this.state.iteration + 1,
+          iteration: decision.nextIteration,
         })
       }
     }

@@ -4,13 +4,13 @@ import { App, Notice } from 'obsidian'
 import { DEFAULT_EMBEDDING_MODELS } from '../../../../constants'
 import { useSettings } from '../../../../contexts/settings-context'
 import { getEmbeddingModelClient } from '../../../../core/rag/embedding'
-import SmartComposerPlugin from '../../../../main'
+import YoloPlugin from '../../../../main'
 import { ConfirmModal } from '../../../modals/ConfirmModal'
 import { AddEmbeddingModelModal } from '../../modals/AddEmbeddingModelModal'
 
 type EmbeddingModelsSubSectionProps = {
   app: App
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
 }
 
 export function EmbeddingModelsSubSection({
@@ -40,22 +40,14 @@ export function EmbeddingModelsSubSection({
           const vectorManager = await plugin.tryGetVectorManager()
 
           if (vectorManager) {
-            const embeddingStats = await vectorManager.getEmbeddingStats()
-            const embeddingStat = embeddingStats.find(
-              (v) => v.model === modelId,
-            )
-
-            if (embeddingStat?.rowCount && embeddingStat.rowCount > 0) {
-              // only clear when there's data
-              const embeddingModelClient = getEmbeddingModelClient({
-                settings,
-                embeddingModelId: modelId,
-              })
-              await vectorManager.clearAllVectors(embeddingModelClient)
-            }
+            const embeddingModelClient = getEmbeddingModelClient({
+              settings,
+              embeddingModelId: modelId,
+            })
+            await vectorManager.clearAllVectors(embeddingModelClient)
           } else {
             console.warn(
-              '[Smart Composer] Skip clearing embeddings because vector manager is unavailable.',
+              '[YOLO] Skip clearing embeddings because vector manager is unavailable.',
             )
           }
 
@@ -75,13 +67,13 @@ export function EmbeddingModelsSubSection({
 
   return (
     <div>
-      <div className="smtcmp-settings-sub-header">Embedding models</div>
-      <div className="smtcmp-settings-desc">
+      <div className="yolo-settings-sub-header">Embedding models</div>
+      <div className="yolo-settings-desc">
         Models used for generating embeddings for RAG
       </div>
 
-      <div className="smtcmp-settings-table-container">
-        <table className="smtcmp-settings-table">
+      <div className="yolo-settings-table-container">
+        <table className="yolo-settings-table">
           <thead>
             <tr>
               <th>ID</th>
@@ -99,7 +91,7 @@ export function EmbeddingModelsSubSection({
                 <td>{embeddingModel.model}</td>
                 <td>{embeddingModel.dimension}</td>
                 <td>
-                  <div className="smtcmp-settings-actions">
+                  <div className="yolo-settings-actions">
                     {!DEFAULT_EMBEDDING_MODELS.some(
                       (v) => v.id === embeddingModel.id,
                     ) && (

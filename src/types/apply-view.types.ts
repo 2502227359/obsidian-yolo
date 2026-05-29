@@ -10,20 +10,22 @@ export type ApplyViewSelectionRange = {
   to: ApplyViewSelectionPosition
 }
 
-export type ApplyViewInitialViewport = {
-  scrollTop: number
-  scrollLeft: number
-  scrollRatio: number
-  anchorLine: number
+export type ApplyViewResult = {
+  finalContent: string
+}
+
+export type ApplyViewCallbacks = {
+  onComplete?: (result: ApplyViewResult) => void
+  onCancel?: () => void
 }
 
 export type ApplyViewState = {
   file: TFile
   originalContent: string
   newContent: string
-  reviewMode?: 'full' | 'inline-selection' | 'selection-focus'
-  initialViewport?: ApplyViewInitialViewport
+  viewMode?: 'apply' | 'revert-review'
+  reviewMode?: 'full' | 'selection-focus'
   selectionRange?: ApplyViewSelectionRange
-  selectionOriginalText?: string
-  selectionNewText?: string
+  callbacks?: ApplyViewCallbacks
+  abortSignal?: AbortSignal
 }

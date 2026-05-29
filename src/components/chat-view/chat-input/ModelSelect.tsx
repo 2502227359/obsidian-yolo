@@ -1,9 +1,23 @@
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
-import { ChevronDown, ChevronUp } from 'lucide-react'
+import { Check, ChevronDown, ChevronUp } from 'lucide-react'
 import { forwardRef, useCallback, useEffect, useRef, useState } from 'react'
 
 import { useSettings } from '../../../contexts/settings-context'
+import {
+  getNodeDocument,
+  getNodeWindow,
+} from '../../../utils/dom/window-context'
 import { getModelDisplayName } from '../../../utils/model-id-utils'
+import { YoloDropdownContent, YoloPopoverVariant } from '../../common/popover'
+
+export type ModelSelectPopoverProps = {
+  variant?: YoloPopoverVariant
+  minWidth?: number | string
+  maxWidth?: number | string
+  maxHeight?: number | string
+  /** Extra class for consumer-specific concerns (rare; use sparingly). */
+  className?: string
+}
 
 export const ModelSelect = forwardRef<
   HTMLButtonElement,
@@ -17,7 +31,8 @@ export const ModelSelect = forwardRef<
     align?: 'start' | 'center' | 'end'
     alignOffset?: number
     container?: HTMLElement
-    contentClassName?: string
+    /** Popover surface variant + sizing. Each caller declares its own. */
+    popover?: ModelSelectPopoverProps
     onKeyDown?: (
       event: React.KeyboardEvent<HTMLButtonElement>,
       isMenuOpen: boolean,
@@ -35,15 +50,28 @@ export const ModelSelect = forwardRef<
       align = 'end',
       alignOffset = 0,
       container,
-      contentClassName,
+      popover,
       onKeyDown,
     } = {},
     ref,
   ) => {
     const { settings, setSettings } = useSettings()
     const [isOpen, setIsOpen] = useState(false)
+    const triggerRef = useRef<HTMLButtonElement | null>(null)
     const itemRefs = useRef<Record<string, HTMLDivElement | null>>({})
     const selectedModelId = externalModelId ?? settings.chatModelId
+
+    const setTriggerRef = useCallback(
+      (node: HTMLButtonElement | null) => {
+        triggerRef.current = node
+        if (typeof ref === 'function') {
+          ref(node)
+        } else if (ref) {
+          ref.current = node
+        }
+      },
+      [ref],
+    )
 
     const enabledModels = settings.chatModels.filter(
       ({ enable }) => enable ?? true,
@@ -84,9 +112,9 @@ export const ModelSelect = forwardRef<
       if (!target) return
       target.focus({ preventScroll: true })
 
-      // 手动滚动到选中项，确保其在可视区域内
+      // 打开时把选中项滚动到列表中部，避免贴边
       target.scrollIntoView({
-        block: 'nearest',
+        block: 'center',
         inline: 'nearest',
       })
     }, [selectedModelId])
@@ -94,7 +122,8 @@ export const ModelSelect = forwardRef<
     const focusByDelta = useCallback(
       (delta: number) => {
         if (orderedModelIds.length === 0) return
-        const activeElement = document.activeElement as HTMLElement | null
+        const activeElement = getNodeDocument(triggerRef.current)
+          .activeElement as HTMLElement | null
         const activeId =
           activeElement?.dataset?.modelId &&
           orderedModelIds.includes(activeElement.dataset.modelId)
@@ -118,10 +147,11 @@ export const ModelSelect = forwardRef<
 
     useEffect(() => {
       if (!isOpen) return
-      const rafId = window.requestAnimationFrame(() => {
+      const ownerWindow = getNodeWindow(triggerRef.current)
+      const rafId = ownerWindow.requestAnimationFrame(() => {
         focusSelectedItem()
       })
-      return () => window.cancelAnimationFrame(rafId)
+      return () => ownerWindow.cancelAnimationFrame(rafId)
     }, [isOpen, focusSelectedItem])
 
     const handleTriggerKeyDown = (
@@ -169,133 +199,135 @@ export const ModelSelect = forwardRef<
     return (
       <DropdownMenu.Root open={isOpen} onOpenChange={handleOpenChange}>
         <DropdownMenu.Trigger
-          ref={ref}
-          className="smtcmp-chat-input-model-select"
+          ref={setTriggerRef}
+          className="yolo-chat-input-model-select"
           onKeyDown={handleTriggerKeyDown}
         >
-          <div className="smtcmp-chat-input-model-select__model-name">
+          <div className="yolo-chat-input-model-select__label yolo-chat-input-model-select__model-name">
             {getCurrentModelDisplay()}
           </div>
-          <div className="smtcmp-chat-input-model-select__icon">
+          <div className="yolo-chat-input-model-select__icon">
             {isOpen ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
           </div>
         </DropdownMenu.Trigger>
 
-        <DropdownMenu.Portal container={container}>
-          <DropdownMenu.Content
-            className={
-              contentClassName
-                ? `smtcmp-popover ${contentClassName}`
-                : 'smtcmp-popover'
-            }
-            side={side}
-            sideOffset={sideOffset}
-            align={align}
-            alignOffset={alignOffset}
-            collisionPadding={8}
-            loop
-            onPointerDownOutside={(e) => {
-              // 阻止事件冒泡，防止关闭父容器
-              e.stopPropagation()
+        <YoloDropdownContent
+          container={container}
+          anchorRef={triggerRef}
+          variant={popover?.variant ?? 'default'}
+          minWidth={popover?.minWidth}
+          maxWidth={popover?.maxWidth}
+          maxHeight={popover?.maxHeight}
+          className={popover?.className}
+          side={side}
+          sideOffset={sideOffset}
+          align={align}
+          alignOffset={alignOffset}
+          collisionPadding={8}
+          loop
+          onPointerDownOutside={(e) => {
+            // 阻止事件冒泡，防止关闭父容器
+            e.stopPropagation()
+          }}
+          onCloseAutoFocus={(e) => {
+            e.preventDefault()
+            triggerRef.current?.focus({ preventScroll: true })
+          }}
+        >
+          <DropdownMenu.RadioGroup
+            className="yolo-model-select-list"
+            value={selectedModelId}
+            onKeyDown={(event) => {
+              if (event.key === 'ArrowDown') {
+                event.preventDefault()
+                focusByDelta(1)
+              } else if (event.key === 'ArrowUp') {
+                event.preventDefault()
+                focusByDelta(-1)
+              }
             }}
-            onCloseAutoFocus={(e) => {
-              // 防止关闭后自动聚焦，保持焦点在触发器上
-              e.preventDefault()
+            onValueChange={(modelId: string) => {
+              if (onChange) {
+                onChange(modelId)
+              } else {
+                void (async () => {
+                  try {
+                    await setSettings({
+                      ...settings,
+                      chatModelId: modelId,
+                    })
+                  } catch (error: unknown) {
+                    console.error('Failed to update chat model setting', error)
+                  }
+                })()
+              }
+              onModelSelected?.(modelId)
             }}
           >
-            <DropdownMenu.RadioGroup
-              className="smtcmp-model-select-list"
-              value={selectedModelId}
-              onKeyDown={(event) => {
-                if (event.key === 'ArrowDown') {
-                  event.preventDefault()
-                  focusByDelta(1)
-                } else if (event.key === 'ArrowUp') {
-                  event.preventDefault()
-                  focusByDelta(-1)
-                }
-              }}
-              onValueChange={(modelId: string) => {
-                if (onChange) {
-                  onChange(modelId)
-                } else {
-                  void (async () => {
-                    try {
-                      await setSettings({
-                        ...settings,
-                        chatModelId: modelId,
-                      })
-                    } catch (error: unknown) {
-                      console.error(
-                        'Failed to update chat model setting',
-                        error,
-                      )
-                    }
-                  })()
-                }
-                onModelSelected?.(modelId)
-              }}
-            >
-              {(() => {
-                let runningIndex = 0
+            {(() => {
+              let runningIndex = 0
 
-                return orderedProviderIds.flatMap((pid, groupIndex) => {
-                  const groupModels = enabledModels.filter(
-                    (m) => m.providerId === pid,
-                  )
-                  if (groupModels.length === 0) return []
+              return orderedProviderIds.flatMap((pid, groupIndex) => {
+                const groupModels = enabledModels.filter(
+                  (m) => m.providerId === pid,
+                )
+                if (groupModels.length === 0) return []
 
-                  const groupHeader = (
-                    <DropdownMenu.Label
-                      key={`label-${pid}`}
-                      className="smtcmp-popover-group-label"
+                const groupHeader = (
+                  <DropdownMenu.Label
+                    key={`label-${pid}`}
+                    className="yolo-popover-group-label"
+                  >
+                    {pid}
+                  </DropdownMenu.Label>
+                )
+
+                const items = groupModels.map((chatModelOption, index) => {
+                  // 列表项名称：优先显示「展示名称」，其次调用ID(model)，最后回退到内部 id
+                  const displayName =
+                    chatModelOption.name ||
+                    chatModelOption.model ||
+                    getModelDisplayName(chatModelOption.id)
+                  runningIndex += 1
+                  return (
+                    <DropdownMenu.RadioItem
+                      key={chatModelOption.id}
+                      className="yolo-popover-item"
+                      value={chatModelOption.id}
+                      ref={(element) => {
+                        itemRefs.current[chatModelOption.id] = element
+                      }}
+                      data-model-id={chatModelOption.id}
+                      data-first-item={
+                        runningIndex === 1 && index === 0 ? 'true' : undefined
+                      }
                     >
-                      {pid}
-                    </DropdownMenu.Label>
-                  )
-
-                  const items = groupModels.map((chatModelOption, index) => {
-                    // 列表项名称：优先显示「展示名称」，其次调用ID(model)，最后回退到内部 id
-                    const displayName =
-                      chatModelOption.name ||
-                      chatModelOption.model ||
-                      getModelDisplayName(chatModelOption.id)
-                    runningIndex += 1
-                    return (
-                      <DropdownMenu.RadioItem
-                        key={chatModelOption.id}
-                        className="smtcmp-popover-item"
-                        value={chatModelOption.id}
-                        ref={(element) => {
-                          itemRefs.current[chatModelOption.id] = element
-                        }}
-                        data-model-id={chatModelOption.id}
-                        data-first-item={
-                          runningIndex === 1 && index === 0 ? 'true' : undefined
-                        }
-                      >
+                      <span className="yolo-popover-item__label">
                         {displayName}
-                      </DropdownMenu.RadioItem>
-                    )
-                  })
-
-                  return [
-                    groupHeader,
-                    ...items,
-                    ...(groupIndex < orderedProviderIds.length - 1
-                      ? [
-                          <DropdownMenu.Separator
-                            key={`sep-${pid}`}
-                            className="smtcmp-popover-group-separator"
-                          />,
-                        ]
-                      : []),
-                  ]
+                      </span>
+                      <DropdownMenu.ItemIndicator className="yolo-popover-item__indicator">
+                        <Check size={12} />
+                      </DropdownMenu.ItemIndicator>
+                    </DropdownMenu.RadioItem>
+                  )
                 })
-              })()}
-            </DropdownMenu.RadioGroup>
-          </DropdownMenu.Content>
-        </DropdownMenu.Portal>
+
+                return [
+                  groupHeader,
+                  ...items,
+                  ...(groupIndex < orderedProviderIds.length - 1
+                    ? [
+                        <DropdownMenu.Separator
+                          key={`sep-${pid}`}
+                          className="yolo-popover-group-separator"
+                        />,
+                      ]
+                    : []),
+                ]
+              })
+            })()}
+          </DropdownMenu.RadioGroup>
+        </YoloDropdownContent>
       </DropdownMenu.Root>
     )
   },

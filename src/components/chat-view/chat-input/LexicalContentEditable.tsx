@@ -3,6 +3,7 @@ import {
   InitialEditorStateType,
   LexicalComposer,
 } from '@lexical/react/LexicalComposer'
+import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext'
 import { ContentEditable } from '@lexical/react/LexicalContentEditable'
 import { EditorRefPlugin } from '@lexical/react/LexicalEditorRefPlugin'
 import { LexicalErrorBoundary } from '@lexical/react/LexicalErrorBoundary'
@@ -13,7 +14,10 @@ import { $getRoot, LexicalEditor, SerializedEditorState } from 'lexical'
 import { RefObject, useCallback, useEffect, useState } from 'react'
 
 import { useApp } from '../../../contexts/app-context'
+import { LiteSkillEntry } from '../../../core/skills/liteSkills'
+import { SnippetEntry } from '../../../core/snippets/snippetsManager'
 import { Assistant } from '../../../types/assistant.types'
+import { ChatModel } from '../../../types/chat-model.types'
 import { MentionableFolder } from '../../../types/mentionable'
 import { Mentionable, MentionableImage } from '../../../types/mentionable'
 import {
@@ -22,11 +26,16 @@ import {
   fuzzySearchFolders,
 } from '../../../utils/fuzzy-search'
 
+import ObsidianFileDropPlugin from './plugins/drop/ObsidianFileDropPlugin'
 import DragDropPaste from './plugins/image/DragDropPastePlugin'
 import ImagePastePlugin from './plugins/image/ImagePastePlugin'
 import AutoLinkMentionPlugin from './plugins/mention/AutoLinkMentionPlugin'
 import { MentionNode } from './plugins/mention/MentionNode'
 import MentionPlugin from './plugins/mention/MentionPlugin'
+import { SkillNode } from './plugins/mention/SkillNode'
+import SkillSlashPlugin, {
+  type SlashCommand,
+} from './plugins/mention/SkillSlashPlugin'
 import NoFormatPlugin from './plugins/no-format/NoFormatPlugin'
 import OnEnterPlugin from './plugins/on-enter/OnEnterPlugin'
 import OnMutationPlugin, {
@@ -43,6 +52,7 @@ export type LexicalContentEditableProps = {
   onKeyDown?: (event: React.KeyboardEvent<HTMLDivElement>) => void
   onFocus?: () => void
   onMentionNodeMutation?: (mutations: NodeMutations<MentionNode>) => void
+  onSkillNodeMutation?: (mutations: NodeMutations<SkillNode>) => void
   onCreateImageMentionables?: (mentionables: MentionableImage[]) => void
   initialEditorState?: InitialEditorStateType
   autoFocus?: boolean
@@ -60,12 +70,76 @@ export type LexicalContentEditableProps = {
   currentChatMode?: 'chat' | 'agent'
   onSelectChatMode?: (mode: 'chat' | 'agent') => void
   allowAgentModeOption?: boolean
+  models?: ChatModel[]
+  selectedModelIds?: string[]
+  skills?: LiteSkillEntry[]
+  selectedSkillIds?: string[]
+  onSelectSkill?: (skill: LiteSkillEntry) => void
+  onRunSlashCommand?: (command: SlashCommand) => void
+  snippets?: SnippetEntry[]
+  onCreateSnippetsFile?: () => void
   plugins?: {
     onEnter?: {
       onVaultChat: () => void
     }
     // templates feature removed
   }
+}
+
+/**
+ * Patches `editor.setRootElement` to swallow the `Root element not registered`
+ * error that Lexical throws while *detaching* a root element whose
+ * `ownerDocument` has been reparented to a different window (Obsidian
+ * pop-out). On `setRootElement(null)`, Lexical's `removeRootElementEvents`
+ * reads `prevRootElement.ownerDocument` — which now points at the new
+ * document — and fails to find the original registration in
+ * `rootElementsRegistered`.
+ *
+ * Caveat: this is not perfectly harmless. Lexical 0.17.1 tracks roots in a
+ * `WeakMap<Document, number>` keyed by document, so the original document
+ * still owns a `selectionchange` listener bound to the now-dead editor's
+ * closure. We rely on ChatView rebuilding its React root on host migration
+ * (see `ChatView.rebuild`) so a fresh LexicalEditor instance takes over;
+ * the stale listener stays attached to the original document for that
+ * document's lifetime. Acceptable: each pop-out leaks one listener, which
+ * is dwarfed by the alternative (typing into the input being broken).
+ *
+ * The error message string targets Lexical 0.17.1; revisit if upgrading.
+ *
+ * The patch is idempotent per editor instance.
+ */
+const PATCHED_FLAG = '__yoloSafeSetRootElementPatched'
+
+function SafeSetRootElementPatchPlugin() {
+  const [editor] = useLexicalComposerContext()
+
+  useEffect(() => {
+    const editorAsRecord = editor as unknown as Record<string, unknown>
+    if (editorAsRecord[PATCHED_FLAG] === true) {
+      return
+    }
+
+    const original = editor.setRootElement.bind(editor)
+    editor.setRootElement = (next: HTMLElement | null) => {
+      try {
+        original(next)
+      } catch (error) {
+        // Only swallow the specific teardown failure: detaching (next === null)
+        // with the exact Lexical 0.17.1 error string. Anything else rethrows.
+        if (
+          next === null &&
+          error instanceof Error &&
+          error.message === 'Root element not registered'
+        ) {
+          return
+        }
+        throw error
+      }
+    }
+    editorAsRecord[PATCHED_FLAG] = true
+  }, [editor])
+
+  return null
 }
 
 export default function LexicalContentEditable({
@@ -77,6 +151,7 @@ export default function LexicalContentEditable({
   onKeyDown,
   onFocus,
   onMentionNodeMutation,
+  onSkillNodeMutation,
   onCreateImageMentionables,
   initialEditorState,
   autoFocus = false,
@@ -94,6 +169,14 @@ export default function LexicalContentEditable({
   currentChatMode,
   onSelectChatMode,
   allowAgentModeOption = true,
+  models = [],
+  selectedModelIds = [],
+  skills = [],
+  selectedSkillIds = [],
+  onSelectSkill,
+  onRunSlashCommand,
+  snippets = [],
+  onCreateSnippetsFile,
   plugins,
 }: LexicalContentEditableProps) {
   const app = useApp()
@@ -104,10 +187,10 @@ export default function LexicalContentEditable({
   const initialConfig: InitialConfigType = {
     namespace: 'LexicalContentEditable',
     theme: {
-      root: 'smtcmp-lexical-content-editable-root',
-      paragraph: 'smtcmp-lexical-content-editable-paragraph',
+      root: 'yolo-lexical-content-editable-root',
+      paragraph: 'yolo-lexical-content-editable-paragraph',
     },
-    nodes: [MentionNode],
+    nodes: [MentionNode, SkillNode],
     editorState: initialEditorState,
     onError: (error) => {
       console.error(error)
@@ -141,9 +224,12 @@ export default function LexicalContentEditable({
     if (autoFocus) {
       requestAnimationFrame(() => {
         contentEditableRef.current?.focus()
+        editorRef.current?.update(() => {
+          $getRoot().selectEnd()
+        })
       })
     }
-  }, [autoFocus, contentEditableRef])
+  }, [autoFocus, contentEditableRef, editorRef])
 
   useEffect(() => {
     const handleActiveLeafChange = () => {
@@ -157,7 +243,8 @@ export default function LexicalContentEditable({
 
   return (
     <LexicalComposer initialConfig={initialConfig}>
-      {/* 
+      <SafeSetRootElementPatchPlugin />
+      {/*
             There was two approach to make mentionable node copy and pasteable.
             1. use RichTextPlugin and reset text format when paste
               - so I implemented NoFormatPlugin to reset text format when paste
@@ -169,8 +256,7 @@ export default function LexicalContentEditable({
         contentEditable={
           <ContentEditable
             className={
-              contentClassName ??
-              'smtcmp-obsidian-textarea smtcmp-content-editable'
+              contentClassName ?? 'yolo-obsidian-textarea yolo-content-editable'
             }
             onFocus={onFocus}
             onKeyDown={onKeyDown}
@@ -194,8 +280,27 @@ export default function LexicalContentEditable({
         currentChatMode={currentChatMode}
         onSelectChatMode={onSelectChatMode}
         allowAgentModeOption={allowAgentModeOption}
+        models={models}
+        selectedModelIds={selectedModelIds}
         searchFoldersByQuery={searchFoldersByQuery}
       />
+      {(skills.length > 0 ||
+        snippets.length > 0 ||
+        onRunSlashCommand ||
+        onCreateSnippetsFile) && (
+        <SkillSlashPlugin
+          skills={skills}
+          snippets={snippets}
+          selectedSkillIds={selectedSkillIds}
+          mentionDisplayMode={mentionDisplayMode}
+          onMenuOpenChange={onMentionMenuToggle}
+          menuContainerRef={mentionMenuContainerRef}
+          placement={mentionMenuPlacement}
+          onSelectSkill={onSelectSkill}
+          onRunCommand={onRunSlashCommand}
+          onCreateSnippetsFile={onCreateSnippetsFile}
+        />
+      )}
       <OnChangePlugin
         onChange={(editorState, _editor) => {
           onChange?.(editorState.toJSON())
@@ -219,10 +324,17 @@ export default function LexicalContentEditable({
           onMentionNodeMutation?.(mutations)
         }}
       />
+      <OnMutationPlugin
+        nodeClass={SkillNode}
+        onMutation={(mutations) => {
+          onSkillNodeMutation?.(mutations)
+        }}
+      />
       <EditorRefPlugin editorRef={editorRef} />
       <NoFormatPlugin />
       <AutoLinkMentionPlugin />
       <ImagePastePlugin onCreateImageMentionables={onCreateImageMentionables} />
+      <ObsidianFileDropPlugin />
       <DragDropPaste onCreateImageMentionables={onCreateImageMentionables} />
       {/* templates feature removed */}
     </LexicalComposer>

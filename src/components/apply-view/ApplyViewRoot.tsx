@@ -11,25 +11,22 @@ import {
 import { useApp } from '../../contexts/app-context'
 import { useLanguage } from '../../contexts/language-context'
 import { usePlugin } from '../../contexts/plugin-context'
+import {
+  type ApplyParagraph,
+  type ReviewDecision,
+  buildFullReviewBlocks,
+  findSelectionTargetBlockIndex,
+  splitInlineLinesIntoParagraphs,
+} from '../../features/editor/diff-review/review-model'
+import { ReviewSession } from '../../features/editor/diff-review/review-session'
 import type { ApplyViewState } from '../../types/apply-view.types'
 import {
   DiffBlock,
   InlineDiffLine,
   InlineDiffToken,
-  createDiffBlocks,
 } from '../../utils/chat/diff'
 
-// Decision type for each diff block
-type BlockDecision = 'pending' | 'incoming' | 'current'
-
-export type ApplyViewActions = {
-  goToPreviousDiff: () => void
-  goToNextDiff: () => void
-  acceptIncomingActive: () => void
-  acceptCurrentActive: () => void
-  undoActive: () => void
-  close: () => void
-}
+import type { ApplyViewActions } from './types'
 
 export default function ApplyViewRoot({
   state,
@@ -52,21 +49,19 @@ export default function ApplyViewRoot({
   const suppressRafRef = useRef<number | null>(null)
   const scrollRafRef = useRef<number | null>(null)
   const manualNavLockRef = useRef(false)
-  const initialViewportAppliedRef = useRef(false)
-  const persistInFlightRef = useRef(false)
-  const persistOnUnmountRef = useRef(true)
-  const preferredFinalContentRef = useRef<string | null>(null)
+  const [decisions, setDecisions] = useState<
+    ReadonlyMap<number, ReviewDecision>
+  >(() => new Map())
 
   const app = useApp()
   const plugin = usePlugin()
   const { t } = useLanguage()
 
   const isSelectionFocusMode = state.reviewMode === 'selection-focus'
+  const isRevertReviewMode = state.viewMode === 'revert-review'
+  const defaultDecision = isRevertReviewMode ? 'incoming' : 'current'
   const diff = useMemo(
-    () =>
-      splitDiffBlocksByParagraph(
-        createDiffBlocks(state.originalContent, state.newContent),
-      ),
+    () => buildFullReviewBlocks(state.originalContent, state.newContent),
     [state.newContent, state.originalContent],
   )
   const selectionTargetBlockIndex = useMemo(
@@ -75,11 +70,6 @@ export default function ApplyViewRoot({
         ? findSelectionTargetBlockIndex(diff, state.selectionRange)
         : null,
     [diff, isSelectionFocusMode, state.selectionRange],
-  )
-
-  // Track decisions for each modified block
-  const [decisions, setDecisions] = useState<Map<number, BlockDecision>>(
-    () => new Map(),
   )
 
   const modifiedBlockIndices = useMemo(
@@ -92,55 +82,55 @@ export default function ApplyViewRoot({
       }, []),
     [diff],
   )
+  const session = useMemo(
+    () =>
+      new ReviewSession({ file: state.file, vault: app.vault, blocks: diff }),
+    [app.vault, diff, state.file],
+  )
 
   const activeBlockIndex =
     modifiedBlockIndices[currentDiffIndex] ?? Number.POSITIVE_INFINITY
   const autoCloseRef = useRef(false)
+  const decisionCount = decisions.size
+  const headerTitle = isRevertReviewMode
+    ? t('applyView.reviewTitle', 'Review changes')
+    : t('applyView.applying', 'Applying')
+  const acceptIncomingLabel = isRevertReviewMode
+    ? t('applyView.keepChange', 'Keep this change')
+    : t('applyView.acceptIncoming', 'Accept incoming')
+  const acceptCurrentLabel = isRevertReviewMode
+    ? t('applyView.revertChange', 'Revert this change')
+    : t('applyView.acceptCurrent', 'Accept current')
+  const acceptAllIncomingLabel = isRevertReviewMode
+    ? t('applyView.keepAllChanges', 'Keep all changes')
+    : t('applyView.acceptAllIncoming', 'Accept all incoming')
+  const acceptAllCurrentLabel = isRevertReviewMode
+    ? t('applyView.revertAllChanges', 'Revert all changes')
+    : t('applyView.rejectAll', 'Reject all')
+
+  const touchSession = useCallback(() => {
+    setDecisions(new Map(session.getDecisions()))
+  }, [session])
+
+  useEffect(() => {
+    setDecisions(new Map(session.getDecisions()))
+  }, [session])
 
   // Count of decided and pending blocks
 
   // Generate final content based on decisions
-  const generateFinalContent = useCallback(
-    (defaultDecision: 'incoming' | 'current' = 'current') => {
-      return diff
-        .map((block, index) => {
-          if (block.type === 'unchanged') return block.value
-          const original = block.originalValue
-          const incoming = block.modifiedValue
-          const decision = decisions.get(index) ?? defaultDecision
-          const resolveIncoming = () =>
-            incoming !== undefined ? incoming : (original ?? '')
-          const resolveCurrent = () => original ?? ''
-
-          switch (decision) {
-            case 'incoming':
-              return resolveIncoming()
-            case 'current':
-            case 'pending':
-              return decision === 'pending' && defaultDecision === 'incoming'
-                ? resolveIncoming()
-                : resolveCurrent()
-            default:
-              return resolveCurrent()
-          }
-        })
-        .join('\n')
-    },
-    [diff, decisions],
-  )
-
   const persistAndClose = useCallback(
     async (finalContent?: string) => {
-      if (persistInFlightRef.current) return
-      persistInFlightRef.current = true
-      if (finalContent !== undefined) {
-        preferredFinalContentRef.current = finalContent
-      }
-      const contentToWrite = finalContent ?? generateFinalContent('current')
+      const resolvedContent =
+        finalContent ?? session.getFinalContent(defaultDecision)
       try {
-        await app.vault.modify(state.file, contentToWrite)
-
-        persistOnUnmountRef.current = false
+        await session.persist(resolvedContent, state.abortSignal)
+        if (state.abortSignal?.aborted) {
+          return
+        }
+        state.callbacks?.onComplete?.({
+          finalContent: resolvedContent,
+        })
       } catch (error) {
         console.error(
           '[ApplyView] Failed to persist changes before close',
@@ -150,17 +140,35 @@ export default function ApplyViewRoot({
         close()
       }
     },
-    [app.vault, close, generateFinalContent, state.file],
+    [close, defaultDecision, session, state.abortSignal, state.callbacks],
   )
 
+  useEffect(() => {
+    const signal = state.abortSignal
+    if (!signal) return
+    if (signal.aborted) {
+      close()
+      return
+    }
+
+    const handleAbort = () => {
+      close()
+    }
+
+    signal.addEventListener('abort', handleAbort, { once: true })
+    return () => {
+      signal.removeEventListener('abort', handleAbort)
+    }
+  }, [close, state.abortSignal])
+
   // Individual block decisions (don't close, just mark decision)
-  const makeDecision = useCallback((index: number, decision: BlockDecision) => {
-    setDecisions((prev) => {
-      const next = new Map(prev)
-      next.set(index, decision)
-      return next
-    })
-  }, [])
+  const makeDecision = useCallback(
+    (index: number, decision: ReviewDecision) => {
+      session.setDecision(index, decision)
+      touchSession()
+    },
+    [session, touchSession],
+  )
 
   const acceptIncomingBlock = useCallback(
     (index: number) => {
@@ -177,13 +185,13 @@ export default function ApplyViewRoot({
   )
 
   // Undo a decision
-  const undoDecision = useCallback((index: number) => {
-    setDecisions((prev) => {
-      const next = new Map(prev)
-      next.delete(index)
-      return next
-    })
-  }, [])
+  const undoDecision = useCallback(
+    (index: number) => {
+      session.clearDecision(index)
+      touchSession()
+    },
+    [session, touchSession],
+  )
 
   // Global actions
   const acceptAllIncoming = useCallback(() => {
@@ -198,26 +206,26 @@ export default function ApplyViewRoot({
 
   useEffect(() => {
     if (autoCloseRef.current) return
-    if (modifiedBlockIndices.length === 0) return
-    const allDecided = modifiedBlockIndices.every((idx) => {
-      const decision = decisions.get(idx)
-      return decision && decision !== 'pending'
-    })
+    if (modifiedBlockIndices.length === 0) {
+      // Nothing to review — close immediately to prevent the user from
+      // being stranded on a "0/0" overlay with all buttons disabled.
+      autoCloseRef.current = true
+      void persistAndClose(state.originalContent)
+      return
+    }
+    if (decisionCount < modifiedBlockIndices.length) return
+    const allDecided = session.areAllModifiedBlocksDecided()
     if (!allDecided) return
     autoCloseRef.current = true
-    void persistAndClose()
-  }, [decisions, modifiedBlockIndices, persistAndClose])
-
-  useEffect(() => {
-    return () => {
-      if (!persistOnUnmountRef.current) return
-      const fallbackContent =
-        preferredFinalContentRef.current ?? generateFinalContent('current')
-      void app.vault.modify(state.file, fallbackContent).catch((error) => {
-        console.error('[ApplyView] Failed to persist changes on unmount', error)
-      })
-    }
-  }, [app.vault, generateFinalContent, state.file])
+    void persistAndClose(session.getFinalContent(defaultDecision))
+  }, [
+    decisionCount,
+    defaultDecision,
+    modifiedBlockIndices.length,
+    persistAndClose,
+    session,
+    state.originalContent,
+  ])
 
   const getOffsetTopFromScroller = useCallback(
     (element: HTMLElement, scroller: HTMLElement) => {
@@ -399,16 +407,16 @@ export default function ApplyViewRoot({
       acceptIncomingActive,
       acceptCurrentActive,
       undoActive,
-      close: () => void persistAndClose(),
+      close,
     })
     return () => onActionsReady(null)
   }, [
     acceptCurrentActive,
     acceptIncomingActive,
+    close,
     goToNextDiff,
     goToPreviousDiff,
     onActionsReady,
-    persistAndClose,
     undoActive,
   ])
 
@@ -460,7 +468,7 @@ export default function ApplyViewRoot({
     }
 
     scheduleUpdate()
-  }, [decisions, diff, updateCurrentDiffFromScroll, updateDiffOffsets])
+  }, [updateCurrentDiffFromScroll, updateDiffOffsets])
 
   useEffect(() => {
     const scroller = scrollerRef.current
@@ -497,80 +505,18 @@ export default function ApplyViewRoot({
       scroller.removeEventListener('touchmove', handleUserScrollIntent)
       scroller.removeEventListener('pointerdown', handleUserScrollIntent)
     }
-  }, [updateCurrentDiffFromScroll])
-
-  useEffect(() => {
-    if (initialViewportAppliedRef.current) return
-    const scroller = scrollerRef.current
-    const initialViewport = state.initialViewport
-    if (!scroller || !initialViewport) return
-
-    const applyInitialViewport = () => {
-      const currentScroller = scrollerRef.current
-      if (!currentScroller) return
-
-      const maxScrollTop = Math.max(
-        0,
-        currentScroller.scrollHeight - currentScroller.clientHeight,
-      )
-      const topFromRatio = initialViewport.scrollRatio * maxScrollTop
-      const topFromOriginal = initialViewport.scrollTop
-      const mergedTop =
-        maxScrollTop > 0
-          ? clampNumber((topFromOriginal + topFromRatio) / 2, 0, maxScrollTop)
-          : 0
-
-      currentScroller.scrollTop = mergedTop
-      currentScroller.scrollLeft = Math.max(0, initialViewport.scrollLeft)
-
-      const anchorBlockIndex = findBlockIndexAtOriginalLine(
-        diff,
-        initialViewport.anchorLine,
-      )
-      if (anchorBlockIndex !== null) {
-        const anchorElement = diffBlockRefs.current[anchorBlockIndex]
-        if (anchorElement) {
-          const anchorTop = getOffsetTopFromScroller(
-            anchorElement,
-            currentScroller,
-          )
-          if (
-            Math.abs(anchorTop - mergedTop) >
-            currentScroller.clientHeight * 1.4
-          ) {
-            currentScroller.scrollTop = clampNumber(anchorTop, 0, maxScrollTop)
-          }
-        }
-      }
-
-      initialViewportAppliedRef.current = true
-      updateDiffOffsets()
-      updateCurrentDiffFromScroll()
-    }
-
-    const raf1 = requestAnimationFrame(() => {
-      requestAnimationFrame(applyInitialViewport)
-    })
-
-    return () => cancelAnimationFrame(raf1)
-  }, [
-    diff,
-    getOffsetTopFromScroller,
-    state.initialViewport,
-    updateCurrentDiffFromScroll,
-    updateDiffOffsets,
-  ])
+  }, [updateCurrentDiffFromScroll, updateDiffOffsets])
 
   return (
     <div
-      id={useRootId ? 'smtcmp-apply-view' : undefined}
-      className="smtcmp-apply-view-root"
+      id={useRootId ? 'yolo-apply-view' : undefined}
+      className="yolo-apply-view-root"
     >
       {showHeader && (
         <div className="view-header">
           <div className="view-header-title-container mod-at-start">
             <div className="view-header-title">
-              {t('applyView.applying', 'Applying')}: {state?.file?.name ?? ''}
+              {headerTitle}: {state?.file?.name ?? ''}
             </div>
           </div>
         </div>
@@ -581,8 +527,8 @@ export default function ApplyViewRoot({
           <div className="cm-editor">
             <div className="cm-scroller" ref={scrollerRef}>
               <div className="cm-sizer">
-                <div className="smtcmp-apply-content">
-                  <div className="inline-title smtcmp-inline-title">
+                <div className="yolo-apply-content">
+                  <div className="inline-title yolo-inline-title">
                     {state?.file?.name
                       ? state.file.name.replace(/\.[^/.]+$/, '')
                       : ''}
@@ -590,7 +536,11 @@ export default function ApplyViewRoot({
 
                   {diff.map((block, index) => (
                     <DiffBlockView
-                      key={index}
+                      key={
+                        block.type === 'unchanged'
+                          ? `unchanged:${index}:${block.value}`
+                          : `modified:${index}:${block.blockType}:${block.originalValue ?? ''}:${block.modifiedValue ?? ''}`
+                      }
                       block={block}
                       decision={decisions.get(index)}
                       isActive={index === activeBlockIndex}
@@ -606,6 +556,9 @@ export default function ApplyViewRoot({
                       }
                       onAcceptSelectionIncoming={acceptAllIncoming}
                       onAcceptSelectionCurrent={acceptAllCurrent}
+                      isRevertReviewMode={isRevertReviewMode}
+                      acceptIncomingLabel={acceptIncomingLabel}
+                      acceptCurrentLabel={acceptCurrentLabel}
                       t={t}
                       pluginComponent={plugin}
                       ref={(el) => {
@@ -621,55 +574,67 @@ export default function ApplyViewRoot({
       </div>
 
       {!isSelectionFocusMode && (
-        <div className="smtcmp-apply-toolbar smtcmp-apply-toolbar-bottom">
-          <div className="smtcmp-apply-toolbar-pill">
-            <div className="smtcmp-apply-toolbar-nav">
+        <div className="yolo-apply-toolbar yolo-apply-toolbar-bottom">
+          <div className="yolo-apply-toolbar-pill">
+            <div className="yolo-apply-toolbar-nav">
               <button
+                type="button"
                 onClick={goToPreviousDiff}
-                className="smtcmp-toolbar-icon-btn"
+                className="yolo-toolbar-icon-btn"
                 title={t('applyView.prevChange', 'Previous change')}
                 aria-label={t('applyView.prevChange', 'Previous change')}
                 disabled={modifiedBlockIndices.length === 0}
               >
-                <span className="smtcmp-toolbar-icon">↑</span>
+                <span className="yolo-toolbar-icon">↑</span>
               </button>
-              <span className="smtcmp-apply-progress">
+              <span className="yolo-apply-progress">
                 {modifiedBlockIndices.length === 0
                   ? '0/0'
                   : `${currentDiffIndex + 1}/${modifiedBlockIndices.length}`}
               </span>
               <button
+                type="button"
                 onClick={goToNextDiff}
-                className="smtcmp-toolbar-icon-btn"
+                className="yolo-toolbar-icon-btn"
                 title={t('applyView.nextChange', 'Next change')}
                 aria-label={t('applyView.nextChange', 'Next change')}
                 disabled={modifiedBlockIndices.length === 0}
               >
-                <span className="smtcmp-toolbar-icon">↓</span>
+                <span className="yolo-toolbar-icon">↓</span>
               </button>
             </div>
-            <div className="smtcmp-apply-toolbar-actions">
+            <div className="yolo-apply-toolbar-actions">
               <button
+                type="button"
                 onClick={acceptAllIncoming}
-                className="smtcmp-toolbar-btn smtcmp-accept"
+                className="yolo-toolbar-btn yolo-accept"
                 title={t(
-                  'applyView.acceptAllIncoming',
-                  'Accept all incoming changes',
+                  isRevertReviewMode
+                    ? 'applyView.keepAllChanges'
+                    : 'applyView.acceptAllIncoming',
+                  isRevertReviewMode
+                    ? 'Keep all changes'
+                    : 'Accept all incoming changes',
                 )}
                 disabled={modifiedBlockIndices.length === 0}
               >
-                {t('applyView.acceptAllIncoming', 'Accept All Incoming')}
+                {acceptAllIncomingLabel}
               </button>
               <button
+                type="button"
                 onClick={acceptAllCurrent}
-                className="smtcmp-toolbar-btn smtcmp-exclude"
+                className="yolo-toolbar-btn yolo-exclude"
                 title={t(
-                  'applyView.rejectAll',
-                  'Reject all changes (keep original)',
+                  isRevertReviewMode
+                    ? 'applyView.revertAllChanges'
+                    : 'applyView.rejectAll',
+                  isRevertReviewMode
+                    ? 'Revert all changes'
+                    : 'Reject all changes (keep original)',
                 )}
                 disabled={modifiedBlockIndices.length === 0}
               >
-                {t('applyView.rejectAll', 'Reject All')}
+                {acceptAllCurrentLabel}
               </button>
             </div>
           </div>
@@ -683,7 +648,7 @@ const DiffBlockView = forwardRef<
   HTMLDivElement,
   {
     block: DiffBlock
-    decision?: BlockDecision
+    decision?: ReviewDecision
     isActive: boolean
     sourcePath: string
     onAcceptIncoming: () => void
@@ -693,6 +658,9 @@ const DiffBlockView = forwardRef<
     isSelectionTarget: boolean
     onAcceptSelectionIncoming: () => void
     onAcceptSelectionCurrent: () => void
+    isRevertReviewMode: boolean
+    acceptIncomingLabel: string
+    acceptCurrentLabel: string
     t: (keyPath: string, fallback?: string) => string
     pluginComponent: Component
   }
@@ -711,6 +679,9 @@ const DiffBlockView = forwardRef<
       isSelectionTarget,
       onAcceptSelectionIncoming,
       onAcceptSelectionCurrent,
+      isRevertReviewMode,
+      acceptIncomingLabel,
+      acceptCurrentLabel,
       t,
       pluginComponent,
     },
@@ -752,19 +723,28 @@ const DiffBlockView = forwardRef<
 
     if (part.type === 'unchanged') {
       return (
-        <div className="smtcmp-diff-block">
-          <div className="smtcmp-diff-block-content">
+        <div className="yolo-diff-block">
+          <div className="yolo-diff-block-content">
             <ApplyMarkdownContent
               content={part.value}
               component={pluginComponent}
               sourcePath={sourcePath}
-              className="smtcmp-apply-markdown"
+              className="yolo-apply-markdown"
             />
           </div>
         </div>
       )
     } else if (part.type === 'modified') {
       const isDecided = decision && decision !== 'pending'
+      const decisionStatusText = decision
+        ? decision === 'incoming'
+          ? isRevertReviewMode
+            ? t('applyView.keptChange', 'Kept this change')
+            : t('applyView.acceptedIncoming', 'Accepted incoming')
+          : isRevertReviewMode
+            ? t('applyView.revertedChange', 'Reverted this change')
+            : t('applyView.keptCurrent', 'Kept current')
+        : null
 
       // Show preview of the decision result
       const getDecisionPreview = () => {
@@ -787,7 +767,7 @@ const DiffBlockView = forwardRef<
 
       return (
         <div
-          className={`smtcmp-diff-block-container${isActive ? ' is-active' : ''}${
+          className={`yolo-diff-block-container${isActive ? ' is-active' : ''}${
             isSelectionTarget ? ' is-selection-focus-target' : ''
           }`}
           ref={ref}
@@ -795,13 +775,18 @@ const DiffBlockView = forwardRef<
           {isDecided ? (
             // Show resolved content only
             <>
-              <div className="smtcmp-diff-block smtcmp-diff-block--resolved">
-                <div className="smtcmp-diff-block-content">
+              <div className="yolo-diff-block yolo-diff-block--resolved">
+                <div className="yolo-diff-block-content">
+                  {decisionStatusText && (
+                    <div className="yolo-apply-decision-status">
+                      {decisionStatusText}
+                    </div>
+                  )}
                   <ApplyMarkdownContent
                     content={getDecisionPreview() ?? ''}
                     component={pluginComponent}
                     sourcePath={sourcePath}
-                    className="smtcmp-apply-markdown smtcmp-apply-markdown-preview"
+                    className="yolo-apply-markdown yolo-apply-markdown-preview"
                   />
                 </div>
               </div>
@@ -809,7 +794,7 @@ const DiffBlockView = forwardRef<
           ) : (
             // Show original diff view with actions
             <>
-              <div className="smtcmp-diff-block smtcmp-diff-block--inline">
+              <div className="yolo-diff-block yolo-diff-block--inline">
                 {inlineParagraphs.length > 0 ? (
                   inlineParagraphs.map((paragraph, paragraphIndex) => {
                     const paragraphContent = paragraph.isEmpty
@@ -824,29 +809,29 @@ const DiffBlockView = forwardRef<
                     return (
                       <div
                         key={`${paragraphIndex}-${paragraph.isEmpty ? 'empty' : 'content'}`}
-                        className={`smtcmp-apply-paragraph${
+                        className={`yolo-apply-paragraph${
                           paragraph.isEmpty ? ' is-empty' : ''
                         }${paragraph.hasChanges ? ' has-changes' : ''}${
                           isActive ? ' is-active' : ''
                         }`}
                       >
-                        <div className="smtcmp-diff-block-content">
+                        <div className="yolo-diff-block-content">
                           {paragraph.isEmpty ? (
-                            <div className="smtcmp-apply-empty-line" />
+                            <div className="yolo-apply-empty-line" />
                           ) : (
                             <ApplyMarkdownContent
                               content={paragraphContent}
                               component={pluginComponent}
                               sourcePath={sourcePath}
-                              className="smtcmp-apply-markdown smtcmp-apply-inline-markdown"
+                              className="yolo-apply-markdown yolo-apply-inline-markdown"
                             />
                           )}
                         </div>
                         {showActionsForParagraph && (
-                          <span className="smtcmp-apply-paragraph-indicator" />
+                          <span className="yolo-apply-paragraph-indicator" />
                         )}
                         {showActionsForParagraph && (
-                          <div className="smtcmp-diff-block-actions">
+                          <div className="yolo-diff-block-actions">
                             <button
                               type="button"
                               onClick={
@@ -854,18 +839,12 @@ const DiffBlockView = forwardRef<
                                   ? onAcceptSelectionIncoming
                                   : onAcceptIncoming
                               }
-                              className="smtcmp-apply-action smtcmp-apply-action-accept"
-                              title={t(
-                                'applyView.acceptIncoming',
-                                'Accept incoming',
-                              )}
-                              aria-label={t(
-                                'applyView.acceptIncoming',
-                                'Accept incoming',
-                              )}
+                              className="yolo-apply-action yolo-apply-action-accept"
+                              title={acceptIncomingLabel}
+                              aria-label={acceptIncomingLabel}
                             >
                               <span
-                                className="smtcmp-apply-action-icon"
+                                className="yolo-apply-action-icon"
                                 aria-hidden="true"
                               >
                                 ✓
@@ -878,18 +857,12 @@ const DiffBlockView = forwardRef<
                                   ? onAcceptSelectionCurrent
                                   : onAcceptCurrent
                               }
-                              className="smtcmp-apply-action smtcmp-apply-action-reject"
-                              title={t(
-                                'applyView.acceptCurrent',
-                                'Accept current',
-                              )}
-                              aria-label={t(
-                                'applyView.acceptCurrent',
-                                'Accept current',
-                              )}
+                              className="yolo-apply-action yolo-apply-action-reject"
+                              title={acceptCurrentLabel}
+                              aria-label={acceptCurrentLabel}
                             >
                               <span
-                                className="smtcmp-apply-action-icon"
+                                className="yolo-apply-action-icon"
                                 aria-hidden="true"
                               >
                                 ×
@@ -902,21 +875,21 @@ const DiffBlockView = forwardRef<
                   })
                 ) : (
                   <div
-                    className={`smtcmp-apply-paragraph has-changes${
+                    className={`yolo-apply-paragraph has-changes${
                       isActive ? ' is-active' : ''
                     }`}
                   >
-                    <div className="smtcmp-diff-block-content">
+                    <div className="yolo-diff-block-content">
                       <ApplyMarkdownContent
                         content={inlineMarkdown}
                         component={pluginComponent}
                         sourcePath={sourcePath}
-                        className="smtcmp-apply-markdown smtcmp-apply-inline-markdown"
+                        className="yolo-apply-markdown yolo-apply-inline-markdown"
                       />
                     </div>
-                    <span className="smtcmp-apply-paragraph-indicator" />
+                    <span className="yolo-apply-paragraph-indicator" />
                     {(!isSelectionFocusMode || isSelectionTarget) && (
-                      <div className="smtcmp-diff-block-actions">
+                      <div className="yolo-diff-block-actions">
                         <button
                           type="button"
                           onClick={
@@ -924,18 +897,12 @@ const DiffBlockView = forwardRef<
                               ? onAcceptSelectionIncoming
                               : onAcceptIncoming
                           }
-                          className="smtcmp-apply-action smtcmp-apply-action-accept"
-                          title={t(
-                            'applyView.acceptIncoming',
-                            'Accept incoming',
-                          )}
-                          aria-label={t(
-                            'applyView.acceptIncoming',
-                            'Accept incoming',
-                          )}
+                          className="yolo-apply-action yolo-apply-action-accept"
+                          title={acceptIncomingLabel}
+                          aria-label={acceptIncomingLabel}
                         >
                           <span
-                            className="smtcmp-apply-action-icon"
+                            className="yolo-apply-action-icon"
                             aria-hidden="true"
                           >
                             ✓
@@ -948,15 +915,12 @@ const DiffBlockView = forwardRef<
                               ? onAcceptSelectionCurrent
                               : onAcceptCurrent
                           }
-                          className="smtcmp-apply-action smtcmp-apply-action-reject"
-                          title={t('applyView.acceptCurrent', 'Accept current')}
-                          aria-label={t(
-                            'applyView.acceptCurrent',
-                            'Accept current',
-                          )}
+                          className="yolo-apply-action yolo-apply-action-reject"
+                          title={acceptCurrentLabel}
+                          aria-label={acceptCurrentLabel}
                         >
                           <span
-                            className="smtcmp-apply-action-icon"
+                            className="yolo-apply-action-icon"
                             aria-hidden="true"
                           >
                             ×
@@ -1006,168 +970,9 @@ function ApplyMarkdownContent({
   return (
     <div
       ref={containerRef}
-      className={`markdown-rendered smtcmp-markdown-rendered ${className ?? ''}`}
+      className={`markdown-rendered yolo-markdown-rendered ${className ?? ''}`}
     />
   )
-}
-
-type ApplyParagraph = {
-  lines: InlineDiffLine[]
-  hasChanges: boolean
-  isEmpty: boolean
-}
-
-function splitInlineLinesIntoParagraphs(
-  lines: InlineDiffLine[],
-): ApplyParagraph[] {
-  if (lines.length === 0) return []
-
-  const paragraphs: ApplyParagraph[] = []
-  let currentLines: InlineDiffLine[] = []
-  let currentHasChanges = false
-
-  const pushCurrentParagraph = () => {
-    if (currentLines.length === 0) return
-    paragraphs.push({
-      lines: currentLines,
-      hasChanges: currentHasChanges,
-      isEmpty: false,
-    })
-    currentLines = []
-    currentHasChanges = false
-  }
-
-  lines.forEach((line) => {
-    if (isInlineLineEmpty(line)) {
-      pushCurrentParagraph()
-      paragraphs.push({
-        lines: [],
-        hasChanges: false,
-        isEmpty: true,
-      })
-      return
-    }
-
-    currentLines.push(line)
-    currentHasChanges = currentHasChanges || lineHasChanges(line)
-  })
-
-  pushCurrentParagraph()
-
-  const hasAnyChanges = paragraphs.some(
-    (paragraph) => !paragraph.isEmpty && paragraph.hasChanges,
-  )
-  if (!hasAnyChanges) {
-    const firstContentParagraph = paragraphs.find(
-      (paragraph) => !paragraph.isEmpty,
-    )
-    if (firstContentParagraph) {
-      firstContentParagraph.hasChanges = true
-    }
-  }
-  return paragraphs
-}
-
-function isInlineLineEmpty(line: InlineDiffLine): boolean {
-  const content = line.tokens.map((token) => token.text).join('')
-  return content.trim().length === 0
-}
-
-function lineHasChanges(line: InlineDiffLine): boolean {
-  if (line.type === 'added' || line.type === 'removed') return true
-  return line.tokens.some(
-    (token) => token.type === 'add' || token.type === 'del',
-  )
-}
-
-function splitDiffBlocksByParagraph(blocks: DiffBlock[]): DiffBlock[] {
-  const paragraphBlocks: DiffBlock[] = []
-
-  blocks.forEach((block) => {
-    if (block.type === 'unchanged') {
-      paragraphBlocks.push(block)
-      return
-    }
-
-    const paragraphs = splitInlineLinesIntoParagraphs(block.inlineLines)
-    if (paragraphs.length === 0) {
-      paragraphBlocks.push(block)
-      return
-    }
-
-    paragraphs.forEach((paragraph) => {
-      if (paragraph.isEmpty) {
-        paragraphBlocks.push({
-          type: 'unchanged',
-          value: '',
-        })
-        return
-      }
-
-      if (!paragraph.hasChanges) {
-        paragraphBlocks.push({
-          type: 'unchanged',
-          value: inlineLinesToText(paragraph.lines, 'original'),
-        })
-        return
-      }
-
-      const hasOriginalLines = paragraph.lines.some(
-        (line) => line.type !== 'added',
-      )
-      const hasModifiedLines = paragraph.lines.some(
-        (line) => line.type !== 'removed',
-      )
-      const originalValue = hasOriginalLines
-        ? inlineLinesToText(paragraph.lines, 'original')
-        : undefined
-      const modifiedValue = hasModifiedLines
-        ? inlineLinesToText(paragraph.lines, 'modified')
-        : undefined
-      paragraphBlocks.push({
-        type: 'modified',
-        originalValue,
-        modifiedValue,
-        inlineLines: paragraph.lines,
-      })
-    })
-  })
-
-  return mergeAdjacentUnchangedBlocks(paragraphBlocks)
-}
-
-function inlineLinesToText(
-  lines: InlineDiffLine[],
-  variant: 'original' | 'modified',
-): string {
-  return lines
-    .map((line) => inlineTokensToText(line.tokens, variant))
-    .join('\n')
-}
-
-function inlineTokensToText(
-  tokens: InlineDiffToken[],
-  variant: 'original' | 'modified',
-): string {
-  return tokens
-    .filter((token) =>
-      variant === 'original' ? token.type !== 'add' : token.type !== 'del',
-    )
-    .map((token) => token.text)
-    .join('')
-}
-
-function mergeAdjacentUnchangedBlocks(blocks: DiffBlock[]): DiffBlock[] {
-  const merged: DiffBlock[] = []
-  blocks.forEach((block) => {
-    const last = merged[merged.length - 1]
-    if (block.type === 'unchanged' && last?.type === 'unchanged') {
-      last.value = `${last.value}\n${block.value}`
-      return
-    }
-    merged.push(block)
-  })
-  return merged
 }
 
 function buildInlineDiffMarkdown(lines: InlineDiffLine[]): string {
@@ -1179,10 +984,10 @@ function inlineTokensToMarkdown(tokens: InlineDiffToken[]): string {
     .map((token) => {
       const text = escapeHtml(token.text)
       if (token.type === 'add') {
-        return `<span class="smtcmp-inline-diff smtcmp-inline-diff-add">${text}</span>`
+        return `<span class="yolo-inline-diff yolo-inline-diff-add">${text}</span>`
       }
       if (token.type === 'del') {
-        return `<span class="smtcmp-inline-diff smtcmp-inline-diff-del">${text}</span>`
+        return `<span class="yolo-inline-diff yolo-inline-diff-del">${text}</span>`
       }
       return text
     })
@@ -1196,83 +1001,4 @@ function escapeHtml(value: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;')
-}
-
-function clampNumber(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value))
-}
-
-function findBlockIndexAtOriginalLine(
-  blocks: DiffBlock[],
-  targetLine: number,
-): number | null {
-  if (targetLine < 0) return null
-
-  let cursorLine = 0
-  for (let index = 0; index < blocks.length; index += 1) {
-    const block = blocks[index]
-    const lineCount = countOriginalLines(block)
-    if (lineCount <= 0) continue
-
-    const blockStart = cursorLine
-    const blockEnd = cursorLine + lineCount - 1
-    if (targetLine >= blockStart && targetLine <= blockEnd) {
-      return index
-    }
-    cursorLine += lineCount
-  }
-  return null
-}
-
-function countOriginalLines(block: DiffBlock): number {
-  if (block.type === 'unchanged') {
-    return block.value.split('\n').length
-  }
-  if (block.originalValue === undefined) return 0
-  return block.originalValue.split('\n').length
-}
-
-function findSelectionTargetBlockIndex(
-  blocks: DiffBlock[],
-  selectionRange: ApplyViewState['selectionRange'],
-): number | null {
-  if (!selectionRange) return null
-
-  const selectionStartLine = Math.min(
-    selectionRange.from.line,
-    selectionRange.to.line,
-  )
-  const selectionEndLine = Math.max(
-    selectionRange.from.line,
-    selectionRange.to.line,
-  )
-
-  let cursorLine = 0
-  let fallbackModifiedIndex: number | null = null
-
-  for (let index = 0; index < blocks.length; index += 1) {
-    const block = blocks[index]
-    if (block.type !== 'modified') {
-      cursorLine += countOriginalLines(block)
-      continue
-    }
-
-    if (fallbackModifiedIndex === null) {
-      fallbackModifiedIndex = index
-    }
-
-    const lineCount = countOriginalLines(block)
-    const blockStart = cursorLine
-    const blockEnd = lineCount > 0 ? cursorLine + lineCount - 1 : cursorLine
-    const intersects =
-      blockStart <= selectionEndLine && blockEnd >= selectionStartLine
-
-    if (intersects) {
-      return index
-    }
-
-    cursorLine += lineCount
-  }
-
-  return fallbackModifiedIndex
 }

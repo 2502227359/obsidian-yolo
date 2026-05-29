@@ -1,22 +1,20 @@
 import { App, Notice } from 'obsidian'
 import { useState } from 'react'
 
-import SmartComposerPlugin from '../../../../main'
-import { ChatModel, chatModelSchema } from '../../../../types/chat-model.types'
+import YoloPlugin from '../../../../main'
+import { ChatModel } from '../../../../types/chat-model.types'
 import { ObsidianButton } from '../../../common/ObsidianButton'
 import { ObsidianDropdown } from '../../../common/ObsidianDropdown'
 import { ObsidianSetting } from '../../../common/ObsidianSetting'
-import { ObsidianTextInput } from '../../../common/ObsidianTextInput'
-import { ObsidianToggle } from '../../../common/ObsidianToggle'
 import { ReactModal } from '../../../common/ReactModal'
 
 type SettingsComponentProps = {
   model: ChatModel
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
 }
 
 export class ChatModelSettingsModal extends ReactModal<SettingsComponentProps> {
-  constructor(model: ChatModel, app: App, plugin: SmartComposerPlugin) {
+  constructor(model: ChatModel, app: App, plugin: YoloPlugin) {
     const modelSettings = getModelSettings(model)
     super({
       app: app,
@@ -43,116 +41,9 @@ type ModelSettingsRegistry = {
  * The SettingsComponent is the component that will be displayed when the model settings are opened.
  */
 const MODEL_SETTINGS_REGISTRY: ModelSettingsRegistry[] = [
-  /**
-   * Claude model settings
-   *
-   * For extended thinking, see:
-   * @see https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
-   */
-  {
-    check: (model) => model.providerType === 'anthropic',
-    SettingsComponent: (props) => {
-      const DEFAULT_THINKING_BUDGET_TOKENS = 8192
-
-      const { model, plugin, onClose } = props
-      const typedModel = model as ChatModel & { providerType: 'anthropic' }
-      const [thinkingEnabled, setThinkingEnabled] = useState<boolean>(
-        typedModel.thinking?.enabled ?? false,
-      )
-      const [budgetTokens, setBudgetTokens] = useState(
-        (
-          typedModel.thinking?.budget_tokens ?? DEFAULT_THINKING_BUDGET_TOKENS
-        ).toString(),
-      )
-
-      const handleSubmit = async () => {
-        const parsedTokens = parseInt(budgetTokens, 10)
-        if (isNaN(parsedTokens)) {
-          new Notice('Please enter a valid number')
-          return
-        }
-
-        if (parsedTokens < 1024) {
-          new Notice('Budget tokens must be at least 1024')
-          return
-        }
-
-        const updatedModel = {
-          ...typedModel,
-          thinking: {
-            enabled: thinkingEnabled,
-            budget_tokens: parsedTokens,
-          },
-        }
-
-        const validationResult = chatModelSchema.safeParse(updatedModel)
-        if (!validationResult.success) {
-          new Notice(
-            validationResult.error.issues.map((v) => v.message).join('\n'),
-          )
-          return
-        }
-
-        await plugin.setSettings({
-          ...plugin.settings,
-          chatModels: plugin.settings.chatModels.map((m) =>
-            m.id === model.id ? updatedModel : m,
-          ),
-        })
-        onClose()
-      }
-
-      return (
-        <>
-          <ObsidianSetting
-            name="Extended Thinking"
-            desc="Enable extended thinking for Claude. Available for Claude Sonnet 3.7+ and Claude Opus 4.0+."
-          >
-            <ObsidianToggle
-              value={thinkingEnabled}
-              onChange={(value: boolean) => setThinkingEnabled(value)}
-            />
-          </ObsidianSetting>
-          {thinkingEnabled && (
-            <ObsidianSetting
-              name="Budget Tokens"
-              desc="The maximum number of tokens that Claude can use for thinking. Must be at least 1024."
-              className="smtcmp-setting-item--nested"
-              required
-            >
-              <ObsidianTextInput
-                value={budgetTokens}
-                placeholder="Number of tokens"
-                onChange={(value: string) => setBudgetTokens(value)}
-                type="number"
-              />
-            </ObsidianSetting>
-          )}
-
-          <ObsidianSetting>
-            <ObsidianButton
-              text="Save"
-              onClick={() => {
-                handleSubmit().catch((error) => {
-                  console.error(
-                    'Failed to save anthropic model settings',
-                    error,
-                  )
-                })
-              }}
-              cta
-            />
-            <ObsidianButton text="Cancel" onClick={onClose} />
-          </ObsidianSetting>
-        </>
-      )
-    },
-  },
-
   // Perplexity settings
   {
     check: (model) =>
-      model.providerType === 'perplexity' &&
       [
         'sonar',
         'sonar-pro',
@@ -163,9 +54,8 @@ const MODEL_SETTINGS_REGISTRY: ModelSettingsRegistry[] = [
 
     SettingsComponent: (props) => {
       const { model, plugin, onClose } = props
-      const typedModel = model as ChatModel & { providerType: 'perplexity' }
       const [searchContextSize, setSearchContextSize] = useState(
-        typedModel.web_search_options?.search_context_size ?? 'low',
+        model.web_search_options?.search_context_size ?? 'low',
       )
 
       const handleSubmit = async () => {
@@ -177,9 +67,9 @@ const MODEL_SETTINGS_REGISTRY: ModelSettingsRegistry[] = [
         }
 
         const updatedModel = {
-          ...typedModel,
+          ...model,
           web_search_options: {
-            ...typedModel.web_search_options,
+            ...model.web_search_options,
             search_context_size: searchContextSize,
           },
         }

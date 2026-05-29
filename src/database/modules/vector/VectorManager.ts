@@ -10,24 +10,62 @@ import {
   LLMAPIKeyInvalidException,
   LLMAPIKeyNotSetException,
   LLMBaseUrlNotSetException,
-  LLMRateLimitExceededException,
 } from '../../../core/llm/exception'
+import { isTransientRagIndexError } from '../../../core/rag/ragIndexErrors'
 import {
-  InsertEmbedding,
-  SelectEmbedding,
-  VectorMetaData,
-} from '../../../database/schema'
+  type DesiredChunk,
+  type ReconcileScope,
+  planReconcile,
+} from '../../../core/rag/reconciler'
 import {
   EmbeddingDbStats,
   EmbeddingModelClient,
 } from '../../../types/embedding'
-import { chunkArray } from '../../../utils/common/chunk-array'
+import { sha256HexPrefix16 } from '../../../utils/common/content-hash'
 import {
   createYieldController,
   yieldToMain,
 } from '../../../utils/common/yield-to-main'
+import {
+  PDF_INDEX_MAX_BYTES,
+  PDF_INDEX_MAX_PAGES,
+  extractPdfText,
+} from '../../../utils/pdf/extractPdfText'
+import { InsertEmbedding, SelectEmbedding, VectorMetaData } from '../../schema'
 
 import { VectorRepository } from './VectorRepository'
+
+const PDF_PAGE_CHUNK_CHAR_THRESHOLD = 1500
+
+/** Opaque handle for the YOLO-root-aware PDF text cache. */
+type YoloSettingsLike = {
+  yolo?: {
+    baseDir?: string
+  }
+}
+
+export type ReconcileConfig = {
+  chunkSize: number
+  includePatterns: string[]
+  excludePatterns: string[]
+  /** When false, PDFs are excluded from the desired set (and existing PDF rows are removed). */
+  indexPdf: boolean
+  /**
+   * Max parallel embedding requests. Clamped to [1, 24]. Default 10. Lower
+   * this when the embedding provider returns 429 (e.g. Azure S0 tier).
+   */
+  embeddingConcurrency?: number
+  /** Optional YOLO-root-aware settings handle; enables the PDF text cache. */
+  settings?: YoloSettingsLike | null
+}
+
+export type ReconcileOptions = {
+  scope: ReconcileScope
+  /** When true, wipe the model namespace before reconciling (rebuild semantics). */
+  truncate?: boolean
+  signal?: AbortSignal
+  onProgress?: (progress: IndexProgress) => void
+}
 
 export class VectorManager {
   private app: App
@@ -52,6 +90,7 @@ export class VectorManager {
           showReportBugButton: true,
         },
       ).open()
+      throw error instanceof Error ? error : new Error(String(error))
     }
   }
 
@@ -97,81 +136,98 @@ export class VectorManager {
     )
   }
 
-  async updateVaultIndex(
+  /**
+   * Reconcile the index for one model namespace against the current vault and
+   * configuration. Single entry point for all index writes:
+   *
+   * - "rebuild": pass `truncate: true, scope: { kind: 'all' }`
+   * - "sync after settings change": `truncate: false, scope: { kind: 'all' }`
+   * - "sync after file events": `truncate: false, scope: { kind: 'paths', paths: [...] }`
+   *
+   * Idempotent: re-running the same call after a crash will only re-embed
+   * chunks that didn't make it to the DB before.
+   */
+  async reconcile(
     embeddingModel: EmbeddingModelClient,
-    options: {
-      chunkSize: number
-      excludePatterns: string[]
-      includePatterns: string[]
-      reindexAll?: boolean
-      signal?: AbortSignal
-    },
-    updateProgress?: (indexProgress: IndexProgress) => void,
+    config: ReconcileConfig,
+    options: ReconcileOptions,
   ): Promise<void> {
-    const { signal } = options
-    let filesToIndex: TFile[]
-    let newFilesCount = 0
-    let updatedFilesCount = 0
-    const removedFilesCount = 0
+    const { signal, scope, truncate, onProgress } = options
 
-    if (options.reindexAll) {
-      filesToIndex = this.getFilteredMarkdownFiles(
-        options.excludePatterns,
-        options.includePatterns,
-      )
-      await this.repository.clearAllVectors(embeddingModel)
-      newFilesCount = filesToIndex.length // 全量重建时都算新文件
-    } else {
-      await this.deleteVectorsForDeletedFiles(embeddingModel)
-
-      // 使用批量查询获取所有已索引文件的 mtime，避免 N+1 查询
-      const result = await this.getFilesToIndexWithStats({
-        embeddingModel,
-        excludePatterns: options.excludePatterns,
-        includePatterns: options.includePatterns,
-      })
-
-      filesToIndex = result.files
-      newFilesCount = result.newCount
-      updatedFilesCount = result.updatedCount
-
-      // 批量删除需要重新索引的文件的向量
-      if (filesToIndex.length > 0) {
-        await this.repository.deleteVectorsForMultipleFiles(
-          filesToIndex.map((file) => file.path),
-          embeddingModel,
-        )
-      }
+    if (truncate) {
+      await this.repository.truncateModel(embeddingModel.id)
+      await this.requestVacuum()
     }
 
-    if (filesToIndex.length === 0) {
+    // 1. Determine the candidate file universe for this reconcile pass.
+    const allCandidates = this.listIndexableFiles(config)
+    const candidateFiles =
+      scope.kind === 'all'
+        ? allCandidates
+        : (() => {
+            const inScope = new Set(scope.paths)
+            return allCandidates.filter((f) => inScope.has(f.path))
+          })()
+    const candidateSet = new Set(candidateFiles.map((f) => f.path))
+
+    // 2. mtime map (used to skip unchanged files and to find removed paths).
+    const mtimeMap = truncate
+      ? new Map<string, number>()
+      : await this.repository.getFileMtimes(embeddingModel.id)
+
+    // 3. Partition candidates by mtime.
+    //
+    // Skip 0-byte files: they would chunkify into 0 chunks → no DB row →
+    // mtime-based partition would flag them as "new" forever, wasting a
+    // chunkify pass on every sync. Daily-note plugins commonly create empty
+    // placeholder notes; without this guard they'd flicker through the
+    // progress UI on every config change.
+    const filesToChunkify: TFile[] = []
+    let newFilesCount = 0
+    let updatedFilesCount = 0
+    for (const file of candidateFiles) {
+      if (file.stat.size === 0) continue
+      const existingMtime = mtimeMap.get(file.path)
+      if (existingMtime === undefined) {
+        filesToChunkify.push(file)
+        newFilesCount += 1
+      } else if (file.stat.mtime !== existingMtime) {
+        filesToChunkify.push(file)
+        updatedFilesCount += 1
+      }
+      // else: stable, leave actual rows alone.
+    }
+
+    // 4. Removed paths: in actual but no longer a candidate (and within scope).
+    const removedPaths: string[] = []
+    if (!truncate) {
+      const inScope = (path: string): boolean =>
+        scope.kind === 'all' ? true : scope.paths.includes(path)
+      for (const path of mtimeMap.keys()) {
+        if (!candidateSet.has(path) && inScope(path)) {
+          removedPaths.push(path)
+        }
+      }
+    }
+    const removedFilesCount = removedPaths.length
+
+    // 5. Chunkify and read actual for the diff scope.
+    const diffPaths = [...filesToChunkify.map((f) => f.path), ...removedPaths]
+
+    if (filesToChunkify.length === 0 && removedPaths.length === 0) {
+      // Nothing to do (everything is stable). Persist any truncate effect.
+      if (truncate) await this.requestSave()
       return
     }
 
-    // 按文件夹分组文件
-    const folderGroups: Record<string, TFile[]> = {}
-    for (const file of filesToIndex) {
-      const folderPath = file.path.includes('/')
-        ? file.path.substring(0, file.path.lastIndexOf('/'))
-        : ''
-      if (!folderGroups[folderPath]) {
-        folderGroups[folderPath] = []
-      }
-      folderGroups[folderPath].push(file)
-    }
+    const textSplitter = RecursiveCharacterTextSplitter.fromLanguage(
+      'markdown',
+      { chunkSize: config.chunkSize },
+    )
 
-    // 工具方法：返回当前文件夹及其向上的所有父级（不含根空字符串）
-    const getSelfAndAncestors = (folderPath: string): string[] => {
-      if (!folderPath) return []
-      const parts = folderPath.split('/')
-      const list: string[] = []
-      for (let i = parts.length; i >= 1; i--) {
-        list.push(parts.slice(0, i).join('/'))
-      }
-      return list
-    }
-
-    // 初始化文件夹进度
+    const desired: DesiredChunk[] = []
+    const failedFiles: { path: string; error: string }[] = []
+    let completedFilesCount = 0
     const folderProgress: Record<
       string,
       {
@@ -182,16 +238,30 @@ export class VectorManager {
       }
     > = {}
 
-    for (const folder in folderGroups) {
-      // 自身初始化
-      folderProgress[folder] = {
-        completedFiles: 0,
-        totalFiles: folderGroups[folder].length,
-        completedChunks: 0,
-        totalChunks: 0, // 将在处理时更新
+    const folderOf = (path: string) =>
+      path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : ''
+    const ancestorsOf = (folder: string): string[] => {
+      if (!folder) return []
+      const parts = folder.split('/')
+      const out: string[] = []
+      for (let i = parts.length; i >= 1; i--) {
+        out.push(parts.slice(0, i).join('/'))
       }
-      // 确保父级节点存在（用于汇总显示）
-      for (const anc of getSelfAndAncestors(folder).slice(1)) {
+      return out
+    }
+
+    for (const file of filesToChunkify) {
+      const folder = folderOf(file.path)
+      if (!folderProgress[folder]) {
+        folderProgress[folder] = {
+          completedFiles: 0,
+          totalFiles: 0,
+          completedChunks: 0,
+          totalChunks: 0,
+        }
+      }
+      folderProgress[folder].totalFiles += 1
+      for (const anc of ancestorsOf(folder).slice(1)) {
         if (!folderProgress[anc]) {
           folderProgress[anc] = {
             completedFiles: 0,
@@ -203,87 +273,48 @@ export class VectorManager {
       }
     }
 
-    const textSplitter = RecursiveCharacterTextSplitter.fromLanguage(
-      'markdown',
-      {
-        chunkSize: options.chunkSize,
-        // TODO: Evaluate token-based chunking when performance is acceptable.
-      },
-    )
-
-    const failedFiles: { path: string; error: string }[] = []
-    let completedFilesCount = 0
-
-    // 处理文件并生成chunks
-    const contentChunks: Omit<InsertEmbedding, 'model' | 'dimension'>[] = []
-
-    // 创建让步控制器，每处理 10 个文件让步一次给主线程
     const maybeYield = createYieldController(10)
-
-    for (const file of filesToIndex) {
-      // 检查是否被取消
+    for (const file of filesToChunkify) {
       if (signal?.aborted) {
-        // 保存已完成的工作后退出
         await this.requestSave()
         throw new DOMException('Indexing cancelled by user', 'AbortError')
       }
-
-      // 让步给主线程，防止 UI 冻结
       await maybeYield()
 
-      const currentFolder = file.path.includes('/')
-        ? file.path.substring(0, file.path.lastIndexOf('/'))
-        : ''
-
-      // 更新当前处理的文件和文件夹
-      updateProgress?.({
+      const folder = folderOf(file.path)
+      onProgress?.({
         completedChunks: 0,
-        totalChunks: 0, // 将在后面更新
-        totalFiles: filesToIndex.length,
+        totalChunks: 0,
+        totalFiles: filesToChunkify.length,
         completedFiles: completedFilesCount,
         currentFile: file.path,
-        currentFolder: currentFolder,
-        folderProgress: folderProgress,
+        currentFolder: folder,
+        folderProgress,
         newFilesCount,
         updatedFilesCount,
         removedFilesCount,
       })
 
       try {
-        const fileContent = await this.app.vault.cachedRead(file)
-        // Remove null bytes from the content
-        const sanitizedContent = fileContent.split('\u0000').join('')
-
-        const fileDocuments = await textSplitter.createDocuments([
-          sanitizedContent,
-        ])
-
-        const fileChunks = fileDocuments.map(
-          (chunk): Omit<InsertEmbedding, 'model' | 'dimension'> => {
-            return {
-              path: file.path,
-              mtime: file.stat.mtime,
-              content: chunk.pageContent,
-              metadata: {
-                startLine: chunk.metadata.loc.lines.from as number,
-                endLine: chunk.metadata.loc.lines.to as number,
-              },
-            }
-          },
+        const fileChunks = await this.chunkifyFile(
+          file,
+          textSplitter,
+          config.chunkSize,
+          signal,
+          config.settings ?? null,
         )
-
-        contentChunks.push(...fileChunks)
-
-        // 更新文件夹进度（自身 + 父级聚合）
-        folderProgress[currentFolder].completedFiles++
-        folderProgress[currentFolder].totalChunks += fileChunks.length
-        for (const anc of getSelfAndAncestors(currentFolder).slice(1)) {
-          if (folderProgress[anc]) {
-            folderProgress[anc].totalChunks += fileChunks.length
-          }
+        desired.push(...fileChunks)
+        folderProgress[folder].completedFiles += 1
+        folderProgress[folder].totalChunks += fileChunks.length
+        for (const anc of ancestorsOf(folder).slice(1)) {
+          folderProgress[anc].totalChunks += fileChunks.length
         }
-        completedFilesCount++
+        completedFilesCount += 1
       } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          await this.requestSave()
+          throw error
+        }
         failedFiles.push({
           path: file.path,
           error: error instanceof Error ? error.message : 'Unknown error',
@@ -297,360 +328,477 @@ export class VectorManager {
         failedFiles
           .map(({ path, error }) => `File: ${path}\nError: ${error}`)
           .join('\n\n')
-
       new ErrorModal(
         this.app,
         'Error: chunk embedding failed',
         `Some files failed to process. Please report this issue to the developer if it persists.`,
         `[Error Log]\n\n${errorDetails}`,
-        {
-          showReportBugButton: true,
-        },
+        { showReportBugButton: true },
       ).open()
     }
 
-    if (contentChunks.length === 0) {
-      const hasExistingVectors =
-        await this.repository.hasVectorsForModel(embeddingModel)
-      if (!hasExistingVectors) {
-        throw new Error(
-          'All files failed to process. Stopping indexing process.',
+    // 6. Read actual rows over the diff scope and plan.
+    //
+    // Critical: exclude failed-to-chunkify paths from the diff. Their `desired`
+    // is empty (chunking threw) but their existing rows must NOT be treated as
+    // "no longer desired" — that would silently delete a user's index after a
+    // transient I/O error. Skip them; next reconcile will retry.
+    const failedPaths = new Set(failedFiles.map((f) => f.path))
+    const safeDiffPaths = diffPaths.filter((p) => !failedPaths.has(p))
+    const actualRows = truncate
+      ? []
+      : await this.repository.listChunksForPaths(
+          embeddingModel.id,
+          safeDiffPaths,
         )
-      }
-      console.warn(
-        '[Smart Composer] Vector indexing skipped because all pending files failed. Using existing embeddings.',
-      )
+    const actual = actualRows.map((row) => ({
+      id: row.id,
+      path: row.path,
+      contentHash: row.content_hash,
+      metadata: row.metadata,
+      mtime: row.mtime,
+    }))
+    const plan = planReconcile(desired, actual)
+
+    // 7. Apply deletions and mtime bumps before embedding so that on-disk
+    //    state converges monotonically toward `desired`.
+    if (plan.toDeleteIds.length > 0) {
+      await this.repository.deleteVectorsByIds(plan.toDeleteIds)
+    }
+    if (plan.toBumpMtime.length > 0) {
+      await this.repository.bumpMtimeByIds(plan.toBumpMtime)
+    }
+
+    if (plan.toEmbed.length === 0) {
+      await this.requestSave()
+      onProgress?.({
+        completedChunks: 0,
+        totalChunks: 0,
+        totalFiles: filesToChunkify.length,
+        completedFiles: completedFilesCount,
+        folderProgress,
+        newFilesCount,
+        updatedFilesCount,
+        removedFilesCount,
+      })
       return
     }
 
-    // 初始进度更新，包含文件夹信息
-    updateProgress?.({
-      completedChunks: 0,
-      totalChunks: contentChunks.length,
-      totalFiles: filesToIndex.length,
-      completedFiles: completedFilesCount,
-      folderProgress: folderProgress,
-      newFilesCount,
-      updatedFilesCount,
-      removedFilesCount,
+    // 8. Embed in batches with rate-limit aware retry.
+    await this.embedAndInsertBatches(plan.toEmbed, embeddingModel, {
+      signal,
+      maxConcurrency: config.embeddingConcurrency,
+      onProgress: (snapshot) =>
+        onProgress?.({
+          ...snapshot,
+          totalFiles: filesToChunkify.length,
+          completedFiles: completedFilesCount,
+          folderProgress,
+          newFilesCount,
+          updatedFilesCount,
+          removedFilesCount,
+        }),
+    })
+  }
+
+  /** Truncate one model's namespace (used by manual "remove index" actions). */
+  async clearAllVectors(embeddingModel: EmbeddingModelClient) {
+    await this.repository.truncateModel(embeddingModel.id)
+    await this.requestVacuum()
+    await this.requestSave()
+  }
+
+  async clearVectorsByModelIds(modelIds: string[]) {
+    await this.repository.clearVectorsByModelIds(modelIds)
+    await this.requestVacuum()
+    await this.requestSave()
+  }
+
+  async getEmbeddingStats(): Promise<EmbeddingDbStats[]> {
+    return await this.repository.getEmbeddingStats()
+  }
+
+  // ---------- internals ----------
+
+  private listIndexableFiles(config: ReconcileConfig): TFile[] {
+    let files = this.app.vault.getFiles().filter((f) => {
+      const ext = f.extension.toLowerCase()
+      if (ext === 'md') return true
+      if (config.indexPdf && ext === 'pdf') return true
+      return false
+    })
+    files = files.filter(
+      (file) =>
+        !config.excludePatterns.some((pattern) =>
+          minimatch(file.path, pattern),
+        ),
+    )
+    if (config.includePatterns.length > 0) {
+      files = files.filter((file) =>
+        config.includePatterns.some((pattern) => minimatch(file.path, pattern)),
+      )
+    }
+    return files
+  }
+
+  private async chunkifyFile(
+    file: TFile,
+    textSplitter: RecursiveCharacterTextSplitter,
+    chunkSize: number,
+    signal?: AbortSignal,
+    settings?: YoloSettingsLike | null,
+  ): Promise<DesiredChunk[]> {
+    if (file.extension?.toLowerCase() === 'pdf') {
+      return this.chunkifyPdf(file, chunkSize, signal, settings)
+    }
+
+    const fileContent = await this.app.vault.cachedRead(file)
+    const sanitized = fileContent.split('\u0000').join('')
+    const docs = await textSplitter.createDocuments([sanitized])
+
+    const chunks: DesiredChunk[] = []
+    for (const doc of docs) {
+      const startLine = doc.metadata.loc.lines.from as number
+      const endLine = doc.metadata.loc.lines.to as number
+      const meta: VectorMetaData = { startLine, endLine }
+      const contentHash = await sha256HexPrefix16(doc.pageContent)
+      chunks.push({
+        path: file.path,
+        content: doc.pageContent,
+        contentHash,
+        metadata: meta,
+        mtime: file.stat.mtime,
+      })
+    }
+    return chunks
+  }
+
+  private async chunkifyPdf(
+    file: TFile,
+    chunkSize: number,
+    signal?: AbortSignal,
+    settings?: YoloSettingsLike | null,
+  ): Promise<DesiredChunk[]> {
+    if (file.stat.size > PDF_INDEX_MAX_BYTES) {
+      console.warn(
+        `[YOLO] Skipping PDF (>${PDF_INDEX_MAX_BYTES} bytes): ${file.path}`,
+      )
+      return []
+    }
+
+    let pages: { page: number; text: string }[]
+    try {
+      const extracted = await extractPdfText(this.app, file, {
+        signal,
+        maxBinaryBytes: PDF_INDEX_MAX_BYTES,
+        maxPages: PDF_INDEX_MAX_PAGES,
+        settings: settings ?? null,
+      })
+      pages = extracted.pages
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw error
+      }
+      console.warn(
+        `[YOLO] PDF text extraction failed: ${file.path}`,
+        error instanceof Error ? error.message : error,
+      )
+      return []
+    }
+
+    const pageSplitter = new RecursiveCharacterTextSplitter({
+      chunkSize: Math.min(PDF_PAGE_CHUNK_CHAR_THRESHOLD, chunkSize),
+      chunkOverlap: 0,
     })
 
+    const chunks: DesiredChunk[] = []
+    for (const { page: pageNum, text } of pages) {
+      const trimmed = text.split('\u0000').join('').trim()
+      if (!trimmed) continue
+      const lineCount = Math.max(1, trimmed.split('\n').length)
+      if (trimmed.length <= PDF_PAGE_CHUNK_CHAR_THRESHOLD) {
+        const content = `[page ${pageNum}]\n${trimmed}`
+        const contentHash = await sha256HexPrefix16(content)
+        chunks.push({
+          path: file.path,
+          content,
+          contentHash,
+          metadata: { page: pageNum, startLine: 1, endLine: lineCount },
+          mtime: file.stat.mtime,
+        })
+      } else {
+        const docs = await pageSplitter.createDocuments([trimmed])
+        for (const doc of docs) {
+          const from = doc.metadata.loc.lines.from as number
+          const to = doc.metadata.loc.lines.to as number
+          const content = `[page ${pageNum}]\n${doc.pageContent}`
+          const contentHash = await sha256HexPrefix16(content)
+          chunks.push({
+            path: file.path,
+            content,
+            contentHash,
+            metadata: { page: pageNum, startLine: from, endLine: to },
+            mtime: file.stat.mtime,
+          })
+        }
+      }
+    }
+    return chunks
+  }
+
+  private async embedAndInsertBatches(
+    toEmbed: DesiredChunk[],
+    embeddingModel: EmbeddingModelClient,
+    options: {
+      signal?: AbortSignal
+      /**
+       * Max parallel embedding requests. Clamped to [1, 24]. Default 10.
+       * The adaptive batch-size shrink/grow stays within [1, maxConcurrency].
+       */
+      maxConcurrency?: number
+      onProgress?: (snapshot: {
+        completedChunks: number
+        totalChunks: number
+        currentFile?: string
+        waitingForRateLimit?: boolean
+      }) => void
+    },
+  ): Promise<void> {
+    const { signal, onProgress } = options
+    const totalChunks = toEmbed.length
     let completedChunks = 0
-    const batchChunks = chunkArray(contentChunks, 100)
     const failedChunks: {
       path: string
       metadata: VectorMetaData
       error: string
     }[] = []
+    const fileBoundaries: Array<{ path: string; endChunk: number }> = []
+    let cumulative = 0
+    for (const chunk of toEmbed) {
+      cumulative += 1
+      const last = fileBoundaries[fileBoundaries.length - 1]
+      if (last && last.path === chunk.path) {
+        last.endChunk = cumulative
+      } else {
+        fileBoundaries.push({ path: chunk.path, endChunk: cumulative })
+      }
+    }
+    let fileCursor = 0
+    let lastReportedFile: string | null = null
+    const currentFile = () => {
+      while (
+        fileCursor < fileBoundaries.length - 1 &&
+        completedChunks > fileBoundaries[fileCursor].endChunk
+      ) {
+        fileCursor += 1
+      }
+      return fileBoundaries[fileCursor]?.path
+    }
+    const nextReportedFile = () => {
+      const f = currentFile()
+      if (!f || f === lastReportedFile) return undefined
+      lastReportedFile = f
+      return f
+    }
 
-    // 增量保存：每处理 500 个 chunks 保存一次，防止中断时丢失进度
-    const INCREMENTAL_SAVE_THRESHOLD = 500
+    const MAX_BATCH_SIZE = Math.max(
+      1,
+      Math.min(24, Math.floor(options.maxConcurrency ?? 10)),
+    )
+    // Keep the adaptive floor at 10 when the ceiling allows, otherwise collapse
+    // to the ceiling so user-configured low values aren't auto-scaled up.
+    const MIN_BATCH_SIZE = Math.min(10, MAX_BATCH_SIZE)
+    let currentBatchSize = MAX_BATCH_SIZE
+    // Full DB snapshot checkpoint interval (chunks). requestSave() triggers
+    // a full pgClient.dumpDataDir + writeBinary, whose cost scales with total
+    // DB size — not with the 1500-chunk delta — so lowering this knob has
+    // O(DB size) write amplification and is not a sound way to bound the
+    // "embeddings already paid for but not yet persisted" loss. If that loss
+    // ever needs a real bound, do it with an incremental segment log, not by
+    // shortening this interval.
+    const INCREMENTAL_SAVE_THRESHOLD = 1500
     let chunksSinceLastSave = 0
 
+    const embedOne = async (
+      chunk: DesiredChunk,
+    ): Promise<InsertEmbedding | null> => {
+      if (signal?.aborted) return null
+      try {
+        return await backOff(
+          async () => {
+            if (signal?.aborted) {
+              throw new DOMException('Indexing cancelled by user', 'AbortError')
+            }
+            if (chunk.content.length === 0) {
+              throw new Error(`Chunk content is empty in file: ${chunk.path}`)
+            }
+            if (chunk.content.includes('\x00')) {
+              throw new Error(
+                `Chunk content contains null bytes in file: ${chunk.path}`,
+              )
+            }
+            const embedding = await embeddingModel.getEmbedding(chunk.content)
+            completedChunks += 1
+            onProgress?.({
+              completedChunks,
+              totalChunks,
+              currentFile: nextReportedFile(),
+            })
+            return {
+              path: chunk.path,
+              mtime: chunk.mtime,
+              content: chunk.content,
+              content_hash: chunk.contentHash,
+              model: embeddingModel.id,
+              dimension: embeddingModel.dimension,
+              embedding,
+              metadata: chunk.metadata,
+            }
+          },
+          {
+            numOfAttempts: 6,
+            startingDelay: 1500,
+            timeMultiple: 2,
+            maxDelay: 30000,
+            retry: (error) => {
+              if (signal?.aborted) return false
+              if (!isTransientRagIndexError(error)) return false
+              const status =
+                typeof error === 'object' &&
+                error !== null &&
+                'status' in error &&
+                typeof (error as { status?: unknown }).status === 'number'
+                  ? (error as { status: number }).status
+                  : undefined
+              const message =
+                error instanceof Error ? error.message.toLowerCase() : ''
+              const waiting = status === 429 || message.includes('rate limit')
+              if (waiting) {
+                const f = currentFile() ?? chunk.path
+                lastReportedFile = f
+                onProgress?.({
+                  completedChunks,
+                  totalChunks,
+                  currentFile: f,
+                  waitingForRateLimit: true,
+                })
+              }
+              return true
+            },
+          },
+        )
+      } catch (error) {
+        failedChunks.push({
+          path: chunk.path,
+          metadata: chunk.metadata,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        })
+        return null
+      }
+    }
+
     try {
-      for (const batchChunk of batchChunks) {
-        // 检查是否被取消
+      for (
+        let batchStart = 0;
+        batchStart < toEmbed.length;
+        batchStart += currentBatchSize
+      ) {
+        const batch = toEmbed.slice(batchStart, batchStart + currentBatchSize)
         if (signal?.aborted) {
-          // 保存已完成的工作后退出
           await this.requestSave()
           throw new DOMException('Indexing cancelled by user', 'AbortError')
         }
-
-        // 每个批次开始前让步给主线程，防止 UI 冻结
         await yieldToMain()
 
-        const embeddingChunks: (InsertEmbedding | null)[] = await Promise.all(
-          batchChunk.map(async (chunk) => {
-            // 在每个 chunk 处理前检查取消信号
-            if (signal?.aborted) {
-              return null
-            }
-
-            try {
-              return await backOff(
-                async () => {
-                  // 在 backOff 执行函数中也检查取消信号
-                  if (signal?.aborted) {
-                    throw new DOMException(
-                      'Indexing cancelled by user',
-                      'AbortError',
-                    )
-                  }
-
-                  if (chunk.content.length === 0) {
-                    throw new Error(
-                      `Chunk content is empty in file: ${chunk.path}`,
-                    )
-                  }
-                  if (chunk.content.includes('\x00')) {
-                    // this should never happen because we remove null bytes from the content
-                    throw new Error(
-                      `Chunk content contains null bytes in file: ${chunk.path}`,
-                    )
-                  }
-
-                  const embedding = await embeddingModel.getEmbedding(
-                    chunk.content,
-                  )
-                  completedChunks += 1
-
-                  updateProgress?.({
-                    completedChunks,
-                    totalChunks: contentChunks.length,
-                    totalFiles: filesToIndex.length,
-                    completedFiles: completedFilesCount,
-                    folderProgress: folderProgress,
-                    newFilesCount,
-                    updatedFilesCount,
-                    removedFilesCount,
-                  })
-
-                  return {
-                    path: chunk.path,
-                    mtime: chunk.mtime,
-                    content: chunk.content,
-                    model: embeddingModel.id,
-                    dimension: embeddingModel.dimension,
-                    embedding,
-                    metadata: chunk.metadata,
-                  }
-                },
-                {
-                  numOfAttempts: 8,
-                  startingDelay: 2000,
-                  timeMultiple: 2,
-                  maxDelay: 60000,
-                  retry: (error) => {
-                    // 如果已取消，不再重试
-                    if (signal?.aborted) {
-                      return false
-                    }
-                    if (
-                      error instanceof LLMRateLimitExceededException ||
-                      error.status === 429
-                    ) {
-                      updateProgress?.({
-                        completedChunks,
-                        totalChunks: contentChunks.length,
-                        totalFiles: filesToIndex.length,
-                        completedFiles: completedFilesCount,
-                        folderProgress: folderProgress,
-                        newFilesCount,
-                        updatedFilesCount,
-                        removedFilesCount,
-                        waitingForRateLimit: true,
-                      })
-                      return true
-                    }
-                    return false
-                  },
-                },
+        let validRows: InsertEmbedding[] = []
+        let attempt = 0
+        while (attempt < 2) {
+          attempt += 1
+          const results = await Promise.all(batch.map((c) => embedOne(c)))
+          validRows = results.filter((r): r is InsertEmbedding => r !== null)
+          if (validRows.length > 0) {
+            if (
+              validRows.length !== batch.length &&
+              currentBatchSize > MIN_BATCH_SIZE
+            ) {
+              currentBatchSize = Math.max(
+                MIN_BATCH_SIZE,
+                Math.floor(currentBatchSize / 2),
               )
-            } catch (error) {
-              failedChunks.push({
-                path: chunk.path,
-                metadata: chunk.metadata,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              })
-
-              return null
+            } else if (
+              validRows.length === batch.length &&
+              currentBatchSize < MAX_BATCH_SIZE
+            ) {
+              currentBatchSize = Math.min(MAX_BATCH_SIZE, currentBatchSize + 4)
             }
-          }),
-        )
+            break
+          }
+          if (attempt < 2) {
+            currentBatchSize = Math.max(
+              MIN_BATCH_SIZE,
+              Math.floor(currentBatchSize / 2),
+            )
+            await yieldToMain()
+          }
+        }
 
-        const validEmbeddingChunks = embeddingChunks.filter(
-          (chunk) => chunk !== null,
-        )
-
-        // 如果是因为取消导致的，保存已完成的工作并退出
         if (signal?.aborted) {
-          if (validEmbeddingChunks.length > 0) {
-            await this.repository.insertVectors(validEmbeddingChunks)
+          if (validRows.length > 0) {
+            await this.repository.insertVectors(validRows)
           }
           await this.requestSave()
           throw new DOMException('Indexing cancelled by user', 'AbortError')
         }
 
-        // If all chunks in this batch failed, stop processing
-        if (validEmbeddingChunks.length === 0 && batchChunk.length > 0) {
+        if (validRows.length === 0 && batch.length > 0) {
           throw new Error(
             'All chunks in batch failed to embed. Stopping indexing process.',
           )
         }
-        await this.repository.insertVectors(validEmbeddingChunks)
-
-        // 增量保存检查：每处理一定数量的 chunks 后保存，防止中断时丢失进度
-        chunksSinceLastSave += validEmbeddingChunks.length
+        await this.repository.insertVectors(validRows)
+        chunksSinceLastSave += validRows.length
         if (chunksSinceLastSave >= INCREMENTAL_SAVE_THRESHOLD) {
           await this.requestSave()
           chunksSinceLastSave = 0
         }
-
-        // 更新文件夹的 chunk 完成进度（全局 completedChunks 已在获取 embedding 时逐个增加）
-        // 更新每个文件夹的 chunk 完成进度
-        for (const chunk of validEmbeddingChunks) {
-          const folderPath = chunk.path.includes('/')
-            ? chunk.path.substring(0, chunk.path.lastIndexOf('/'))
-            : ''
-          const lineage = getSelfAndAncestors(folderPath)
-          if (folderProgress[folderPath]) {
-            folderProgress[folderPath].completedChunks++
-          }
-          for (const anc of lineage.slice(1)) {
-            if (folderProgress[anc]) {
-              folderProgress[anc].completedChunks++
-            }
-          }
-        }
-
-        // 更新进度
-        updateProgress?.({
+        onProgress?.({
           completedChunks,
-          totalChunks: contentChunks.length,
-          totalFiles: filesToIndex.length,
-          completedFiles: completedFilesCount,
-          folderProgress: folderProgress,
-          newFilesCount,
-          updatedFilesCount,
-          removedFilesCount,
+          totalChunks,
           waitingForRateLimit: false,
         })
+
+        batchStart += batch.length - currentBatchSize
       }
     } catch (error) {
-      // 如果是用户取消操作，直接重新抛出，不显示错误弹窗
       if (error instanceof DOMException && error.name === 'AbortError') {
         throw error
       }
-
       if (
         error instanceof LLMAPIKeyNotSetException ||
         error instanceof LLMAPIKeyInvalidException ||
         error instanceof LLMBaseUrlNotSetException
       ) {
-        new ErrorModal(this.app, 'Error', (error as Error).message, undefined, {
+        new ErrorModal(this.app, 'Error', error.message, undefined, {
           showSettingsButton: true,
         }).open()
       } else {
         const errorDetails =
-          `Failed to process ${failedChunks.length} file(s):\n\n` +
+          `Failed to process ${failedChunks.length} chunk(s):\n\n` +
           failedChunks
             .map((chunk) => `File: ${chunk.path}\nError: ${chunk.error}`)
             .join('\n\n')
-
         new ErrorModal(
           this.app,
           'Error: embedding failed',
           `The indexing process was interrupted because several files couldn't be processed.
 Please report this issue to the developer if it persists.`,
           `[Error Log]\n\n${errorDetails}`,
-          {
-            showReportBugButton: true,
-          },
+          { showReportBugButton: true },
         ).open()
       }
-      // 重新抛出错误，让调用方知道索引失败了
       throw error
     } finally {
       await this.requestSave()
     }
-  }
-
-  async clearAllVectors(embeddingModel: EmbeddingModelClient) {
-    await this.repository.clearAllVectors(embeddingModel)
-    await this.requestVacuum()
-    await this.requestSave()
-  }
-
-  private async deleteVectorsForDeletedFiles(
-    embeddingModel: EmbeddingModelClient,
-  ) {
-    const indexedFilePaths =
-      await this.repository.getIndexedFilePaths(embeddingModel)
-    for (const filePath of indexedFilePaths) {
-      if (!this.app.vault.getAbstractFileByPath(filePath)) {
-        await this.repository.deleteVectorsForMultipleFiles(
-          [filePath],
-          embeddingModel,
-        )
-      }
-    }
-  }
-
-  /**
-   * 获取过滤后的 Markdown 文件列表
-   * 应用 include/exclude 模式过滤
-   */
-  private getFilteredMarkdownFiles(
-    excludePatterns: string[],
-    includePatterns: string[],
-  ): TFile[] {
-    let files = this.app.vault.getMarkdownFiles()
-
-    files = files.filter((file) => {
-      return !excludePatterns.some((pattern) => minimatch(file.path, pattern))
-    })
-
-    if (includePatterns.length > 0) {
-      files = files.filter((file) => {
-        return includePatterns.some((pattern) => minimatch(file.path, pattern))
-      })
-    }
-
-    return files
-  }
-
-  /**
-   * 获取需要索引的文件，同时返回新文件和更新文件的统计
-   * 使用批量查询优化，避免 N+1 查询问题
-   */
-  private async getFilesToIndexWithStats({
-    embeddingModel,
-    excludePatterns,
-    includePatterns,
-  }: {
-    embeddingModel: EmbeddingModelClient
-    excludePatterns: string[]
-    includePatterns: string[]
-  }): Promise<{ files: TFile[]; newCount: number; updatedCount: number }> {
-    const allFiles = this.getFilteredMarkdownFiles(
-      excludePatterns,
-      includePatterns,
-    )
-
-    // 批量查询所有已索引文件的 mtime，一次数据库查询替代 N 次查询
-    const mtimeMap = await this.repository.getFileMtimes(embeddingModel)
-
-    const filesToIndex: TFile[] = []
-    let newCount = 0
-    let updatedCount = 0
-
-    // 创建让步控制器，每检查 50 个文件让步一次
-    const maybeYield = createYieldController(50)
-
-    for (const file of allFiles) {
-      await maybeYield()
-
-      const existingMtime = mtimeMap.get(file.path)
-
-      if (existingMtime === undefined) {
-        // 新文件：未被索引过
-        const fileContent = await this.app.vault.cachedRead(file)
-        if (fileContent.length > 0) {
-          filesToIndex.push(file)
-          newCount++
-        }
-      } else if (file.stat.mtime > existingMtime) {
-        // 更新的文件：mtime 比索引时更新
-        filesToIndex.push(file)
-        updatedCount++
-      }
-      // 否则文件未变化，跳过
-    }
-
-    return { files: filesToIndex, newCount, updatedCount }
-  }
-
-  async getEmbeddingStats(): Promise<EmbeddingDbStats[]> {
-    return await this.repository.getEmbeddingStats()
   }
 }

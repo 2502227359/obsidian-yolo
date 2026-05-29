@@ -1,6 +1,9 @@
 import { App } from 'obsidian'
 
-import { Mentionable, SerializedMentionable } from '../../types/mentionable'
+import type {
+  Mentionable,
+  SerializedMentionable,
+} from '../../types/mentionable'
 
 export function getBlockContentHash(content: string): string {
   let hash = 2166136261
@@ -25,15 +28,6 @@ export const serializeMentionable = (
         type: 'folder',
         folder: mentionable.folder.path,
       }
-    case 'vault':
-      return {
-        type: 'vault',
-      }
-    case 'current-file':
-      return {
-        type: 'current-file',
-        file: mentionable.file?.path ?? null,
-      }
     case 'block':
       return {
         type: 'block',
@@ -41,7 +35,19 @@ export const serializeMentionable = (
         file: mentionable.file.path,
         startLine: mentionable.startLine,
         endLine: mentionable.endLine,
+        pageNumber: mentionable.pageNumber,
         source: mentionable.source,
+        contentHash:
+          mentionable.contentHash ?? getBlockContentHash(mentionable.content),
+        contentCount: mentionable.contentCount,
+        contentUnit: mentionable.contentUnit,
+      }
+    case 'assistant-quote':
+      return {
+        type: 'assistant-quote',
+        conversationId: mentionable.conversationId,
+        messageId: mentionable.messageId,
+        content: mentionable.content,
         contentHash:
           mentionable.contentHash ?? getBlockContentHash(mentionable.content),
         contentCount: mentionable.contentCount,
@@ -59,6 +65,24 @@ export const serializeMentionable = (
         mimeType: mentionable.mimeType,
         data: mentionable.data,
       }
+    case 'pdf':
+      return {
+        type: 'pdf',
+        name: mentionable.name,
+        // rawData (base64 of original bytes) is the source-of-truth for new
+        // uploads; legacy mentionables only have `data` (extracted text).
+        // Persist whichever is present so reload/replay reproduces faithfully.
+        rawData: mentionable.rawData,
+        data: mentionable.data,
+        pageCount: mentionable.pageCount,
+      }
+    case 'model':
+      return {
+        type: 'model',
+        modelId: mentionable.modelId,
+        name: mentionable.name,
+        providerId: mentionable.providerId,
+      }
   }
 }
 
@@ -68,6 +92,12 @@ export const deserializeMentionable = (
 ): Mentionable | null => {
   try {
     switch (mentionable.type) {
+      default:
+        // Unknown/legacy types persisted in old conversations (e.g. 'vault'
+        // from the removed Vault similarity search feature, or 'current-file'
+        // from the removed focus-sync badge path) are silently dropped so
+        // they disappear on next save.
+        return null
       case 'file': {
         const filePath =
           typeof mentionable.file === 'string' ? mentionable.file : null
@@ -98,23 +128,6 @@ export const deserializeMentionable = (
           folder: folder,
         }
       }
-      case 'vault':
-        return {
-          type: 'vault',
-        }
-      case 'current-file': {
-        if (!mentionable.file || typeof mentionable.file !== 'string') {
-          return {
-            type: 'current-file',
-            file: null,
-          }
-        }
-        const file = app.vault.getFileByPath(mentionable.file)
-        return {
-          type: 'current-file',
-          file: file,
-        }
-      }
       case 'block': {
         const filePath =
           typeof mentionable.file === 'string' ? mentionable.file : null
@@ -136,7 +149,23 @@ export const deserializeMentionable = (
           file: file,
           startLine: mentionable.startLine,
           endLine: mentionable.endLine,
+          pageNumber: mentionable.pageNumber,
           source: mentionable.source,
+          contentHash:
+            mentionable.contentHash ?? getBlockContentHash(mentionable.content),
+          contentCount: mentionable.contentCount,
+          contentUnit: mentionable.contentUnit,
+        }
+      }
+      case 'assistant-quote': {
+        if (typeof mentionable.content !== 'string') {
+          return null
+        }
+        return {
+          type: 'assistant-quote',
+          conversationId: mentionable.conversationId,
+          messageId: mentionable.messageId,
+          content: mentionable.content,
           contentHash:
             mentionable.contentHash ?? getBlockContentHash(mentionable.content),
           contentCount: mentionable.contentCount,
@@ -157,6 +186,31 @@ export const deserializeMentionable = (
           data: mentionable.data,
         }
       }
+      case 'pdf': {
+        const rawData =
+          typeof mentionable.rawData === 'string' ? mentionable.rawData : null
+        const data =
+          typeof mentionable.data === 'string' ? mentionable.data : null
+        // Need at least one of: rawData (native path) or data (legacy text fallback).
+        if (!rawData && !data) {
+          return null
+        }
+        return {
+          type: 'pdf',
+          name: mentionable.name,
+          ...(rawData ? { rawData } : {}),
+          ...(data ? { data } : {}),
+          pageCount: mentionable.pageCount,
+        }
+      }
+      case 'model': {
+        return {
+          type: 'model',
+          modelId: mentionable.modelId,
+          name: mentionable.name,
+          providerId: mentionable.providerId,
+        }
+      }
     }
   } catch (e) {
     console.error('Error deserializing mentionable', e)
@@ -170,16 +224,28 @@ export function getMentionableKey(mentionable: SerializedMentionable): string {
       return `file:${mentionable.file}`
     case 'folder':
       return `folder:${mentionable.folder}`
-    case 'vault':
-      return 'vault'
-    case 'current-file':
-      return `current-file:${mentionable.file ?? 'current'}`
-    case 'block':
-      return `block:${mentionable.file}:${mentionable.startLine}:${mentionable.endLine}:${mentionable.contentHash ?? (typeof mentionable.content === 'string' ? getBlockContentHash(mentionable.content) : 'nohash')}`
+    case 'block': {
+      const pageTag =
+        mentionable.pageNumber !== undefined
+          ? `:p${mentionable.pageNumber}`
+          : ''
+      return `block:${mentionable.file}:${mentionable.startLine}:${mentionable.endLine}${pageTag}:${mentionable.contentHash ?? (typeof mentionable.content === 'string' ? getBlockContentHash(mentionable.content) : 'nohash')}`
+    }
+    case 'assistant-quote':
+      return `assistant-quote:${mentionable.conversationId}:${mentionable.messageId}:${mentionable.contentHash ?? (typeof mentionable.content === 'string' ? getBlockContentHash(mentionable.content) : 'nohash')}`
     case 'url':
       return `url:${mentionable.url}`
     case 'image':
       return `image:${mentionable.name}:${mentionable.data.length}:${mentionable.data.slice(-32)}`
+    case 'pdf': {
+      // Identity is keyed by whichever payload is present: rawData (new
+      // uploads) or the legacy `data` text (mentionables serialized before
+      // native PDF support). Both are persistent enough to dedupe with.
+      const payload = mentionable.rawData ?? mentionable.data ?? ''
+      return `pdf:${mentionable.name}:${payload.length}:${payload.slice(-32)}`
+    }
+    case 'model':
+      return `model:${mentionable.modelId}`
   }
 }
 
@@ -244,10 +310,22 @@ export function getBlockMentionableCountInfo(
   return { count, unit }
 }
 
+export type MentionableUnitLabels = Partial<
+  Record<MentionableBlockUnit, string>
+>
+
+function resolveUnitLabel(
+  unit: MentionableBlockUnit,
+  unitLabels?: MentionableUnitLabels,
+): string {
+  return unitLabels?.[unit] ?? unit
+}
+
 export function getMentionableName(
   mentionable: Mentionable,
   options?: {
-    unitLabel?: string
+    unitLabels?: MentionableUnitLabels
+    currentFileLabel?: string
   },
 ): string {
   switch (mentionable.type) {
@@ -255,20 +333,27 @@ export function getMentionableName(
       return mentionable.file.name
     case 'folder':
       return mentionable.folder.name
-    case 'vault':
-      return 'Vault'
-    case 'current-file':
-      return mentionable.file?.name ?? 'Current file'
     case 'block': {
-      const count =
-        mentionable.contentCount ??
-        getBlockMentionableCountInfo(mentionable.content).count
-      const unitLabel = options?.unitLabel ?? 'chars'
+      const info = getBlockMentionableCountInfo(mentionable.content)
+      const count = mentionable.contentCount ?? info.count
+      const unit = mentionable.contentUnit ?? info.unit
+      const unitLabel = resolveUnitLabel(unit, options?.unitLabels)
       return `${mentionable.file.name} (${count} ${unitLabel})`
+    }
+    case 'assistant-quote': {
+      const info = getBlockMentionableCountInfo(mentionable.content)
+      const count = mentionable.contentCount ?? info.count
+      const unit = mentionable.contentUnit ?? info.unit
+      const unitLabel = resolveUnitLabel(unit, options?.unitLabels)
+      return `Assistant quote (${count} ${unitLabel})`
     }
     case 'url':
       return mentionable.url
     case 'image':
+      return mentionable.name
+    case 'pdf':
+      return mentionable.name
+    case 'model':
       return mentionable.name
   }
 }

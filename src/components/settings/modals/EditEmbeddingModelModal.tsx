@@ -2,7 +2,9 @@ import { App, Notice } from 'obsidian'
 import React, { useState } from 'react'
 
 import { useLanguage } from '../../../contexts/language-context'
-import SmartComposerPlugin from '../../../main'
+import { extractEmbeddingVector } from '../../../core/llm/embedding-utils'
+import { getProviderClient } from '../../../core/llm/manager'
+import YoloPlugin from '../../../main'
 import { EmbeddingModel } from '../../../types/embedding-model.types'
 import { ObsidianButton } from '../../common/ObsidianButton'
 import { ObsidianSetting } from '../../common/ObsidianSetting'
@@ -10,12 +12,12 @@ import { ObsidianTextInput } from '../../common/ObsidianTextInput'
 import { ReactModal } from '../../common/ReactModal'
 
 type EditEmbeddingModelModalComponentProps = {
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
   model: EmbeddingModel
 }
 
 export class EditEmbeddingModelModal extends ReactModal<EditEmbeddingModelModalComponentProps> {
-  constructor(app: App, plugin: SmartComposerPlugin, model: EmbeddingModel) {
+  constructor(app: App, plugin: YoloPlugin, model: EmbeddingModel) {
     super({
       app: app,
       Component: EditEmbeddingModelModalComponent,
@@ -54,6 +56,8 @@ function EditEmbeddingModelModalComponent({
     dimension: model.dimension?.toString() || '',
   })
 
+  const [isSubmitting, setIsSubmitting] = useState(false)
+
   const handleSubmit = () => {
     if (!formData.model.trim()) {
       new Notice(t('common.error'))
@@ -64,11 +68,12 @@ function EditEmbeddingModelModalComponent({
       const dimension = formData.dimension
         ? parseInt(formData.dimension, 10)
         : undefined
-      if (formData.dimension && (isNaN(dimension!) || dimension! <= 0)) {
+      if (!dimension || isNaN(dimension) || dimension <= 0) {
         new Notice('Invalid dimension value')
         return
       }
 
+      setIsSubmitting(true)
       try {
         const settings = plugin.settings
         const embeddingModels = [...settings.embeddingModels]
@@ -79,7 +84,27 @@ function EditEmbeddingModelModalComponent({
           return
         }
 
-        // Update the model (keep the original ID, don't allow editing it for existing models)
+        const dimensionChanged = dimension !== model.dimension
+
+        if (dimensionChanged) {
+          const providerClient = getProviderClient({
+            settings,
+            providerId: model.providerId,
+          })
+          const probed = await providerClient.getEmbedding(
+            formData.model,
+            'test',
+            { dimensions: dimension },
+          )
+          const actualDimension = extractEmbeddingVector(probed).length
+          if (actualDimension !== dimension) {
+            new Notice(
+              `The model returned ${actualDimension} dimensions, but you requested ${dimension}. This model may not support variable dimensions.`,
+            )
+            return
+          }
+        }
+
         embeddingModels[modelIndex] = {
           ...embeddingModels[modelIndex],
           model: formData.model,
@@ -87,7 +112,9 @@ function EditEmbeddingModelModalComponent({
             formData.name && formData.name.trim().length > 0
               ? formData.name
               : formData.model,
-          dimension: dimension!,
+          dimension,
+          nativeDimension:
+            embeddingModels[modelIndex].nativeDimension ?? model.dimension,
         }
 
         await plugin.setSettings({
@@ -95,11 +122,19 @@ function EditEmbeddingModelModalComponent({
           embeddingModels,
         })
 
-        new Notice(t('common.success'))
+        if (dimensionChanged) {
+          new Notice(
+            'Dimension updated. Please rebuild the index for this model to refresh existing vectors.',
+          )
+        } else {
+          new Notice(t('common.success'))
+        }
         onClose()
       } catch (error) {
         console.error('Failed to update embedding model:', error)
-        new Notice(t('common.error'))
+        new Notice(error instanceof Error ? error.message : t('common.error'))
+      } finally {
+        setIsSubmitting(false)
       }
     }
 
@@ -148,8 +183,17 @@ function EditEmbeddingModelModalComponent({
       </ObsidianSetting>
 
       <ObsidianSetting>
-        <ObsidianButton text={t('common.save')} onClick={handleSubmit} cta />
-        <ObsidianButton text={t('common.cancel')} onClick={onClose} />
+        <ObsidianButton
+          text={isSubmitting ? t('common.probingDimension') : t('common.save')}
+          onClick={handleSubmit}
+          cta
+          disabled={isSubmitting}
+        />
+        <ObsidianButton
+          text={t('common.cancel')}
+          onClick={onClose}
+          disabled={isSubmitting}
+        />
       </ObsidianSetting>
     </>
   )

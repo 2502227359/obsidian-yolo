@@ -2,7 +2,76 @@ import { z } from 'zod'
 
 import { customParameterSchema } from './custom-parameter.types'
 
-const baseChatModelSchema = z.object({
+export const CHAT_MODEL_MODALITIES = ['text', 'vision', 'pdf'] as const
+export const chatModelModalitySchema = z.enum(CHAT_MODEL_MODALITIES)
+export type ChatModelModality = z.infer<typeof chatModelModalitySchema>
+
+const webSearchToggleSchema = z
+  .object({
+    webSearch: z
+      .object({
+        enabled: z.boolean(),
+      })
+      .optional(),
+  })
+  .optional()
+
+// OpenRouter hosted web search
+// (https://openrouter.ai/docs/guides/features/server-tools/web-search). Five
+// engines are supported: `auto` (default — native if available, else Exa),
+// `native` (model provider's built-in search), `exa`, `firecrawl` (BYOK in
+// the OpenRouter dashboard), and `parallel`.
+const openRouterWebSearchToggleSchema = z
+  .object({
+    webSearch: z
+      .object({
+        enabled: z.boolean(),
+        engine: z
+          .enum(['auto', 'native', 'exa', 'firecrawl', 'parallel'])
+          .optional(),
+        maxResults: z.number().int().min(1).max(25).optional(),
+      })
+      .optional(),
+  })
+  .optional()
+
+/**
+ * Built-in (a.k.a. hosted / server-side) tools provided by the model provider
+ * itself — not function-calling tools the agent runs. They share the same
+ * `tools` / `extra_body` slot in the request payload depending on the
+ * provider, and use provider-specific shapes (e.g. `{type:"web_search"}` for
+ * OpenAI, `{type:"openrouter:web_search"}` for OpenRouter, xAI Grok
+ * `search_parameters`).
+ * Configure which provider's built-in tools to enable via `builtinToolProvider`,
+ * and per-provider toggles via the matching sub-key.
+ *
+ * Provider–family alignment is now the user's responsibility: any model can
+ * point at any family (e.g. a non-OpenRouter gateway with OpenRouter tools),
+ * and downstream provider clients only forward families they understand —
+ * mismatches are silently ignored rather than rewritten to avoid changing user
+ * intent.
+ */
+// Gemini's native tool family is broader than just web search — `urlContext`
+// fetches content from URLs the user references. Both surface as separate
+// `googleSearch` / `urlContext` entries in Gemini's `tools` array (or as
+// synthetic function tools on openai-compatible gateways).
+const geminiBuiltinToolsSchema = z
+  .object({
+    webSearch: z.object({ enabled: z.boolean() }).optional(),
+    urlContext: z.object({ enabled: z.boolean() }).optional(),
+  })
+  .optional()
+
+export const builtinToolsConfigSchema = z
+  .object({
+    gpt: webSearchToggleSchema,
+    openrouter: openRouterWebSearchToggleSchema,
+    grok: webSearchToggleSchema,
+    gemini: geminiBuiltinToolsSchema,
+  })
+  .optional()
+
+export const chatModelSchema = z.object({
   providerId: z
     .string({
       required_error: 'provider ID is required',
@@ -21,122 +90,26 @@ const baseChatModelSchema = z.object({
   // Optional display name for UI. When absent, UI should fallback to showing `model`.
   name: z.string().optional(),
   enable: z.boolean().default(true).optional(),
-  isBaseModel: z.boolean().default(false).optional(),
-  reasoningType: z
-    .enum(['none', 'openai', 'gemini', 'anthropic', 'generic'])
-    .optional(),
+  reasoningType: z.enum(['none', 'openai', 'gemini', 'anthropic']).optional(),
   temperature: z.number().min(0).max(2).optional(),
   topP: z.number().min(0).max(1).optional(),
+  maxContextTokens: z.number().int().min(1).optional(),
   maxOutputTokens: z.number().int().min(1).optional(),
   customParameters: z.array(customParameterSchema).optional(),
+  modalities: z.array(chatModelModalitySchema).optional(),
+  // Which provider's built-in (hosted) tools to enable on this model.
+  // 'gemini' / 'gpt' / 'openrouter' map to the provider-native tool family in
+  // the request body. See `builtinTools` for per-family toggles.
+  builtinToolProvider: z
+    .enum(['none', 'gemini', 'gpt', 'openrouter', 'grok'])
+    .default('none')
+    .optional(),
+  builtinTools: builtinToolsConfigSchema,
+  web_search_options: z
+    .object({
+      search_context_size: z.string(),
+    })
+    .optional(),
 })
-
-export const chatModelSchema = z.discriminatedUnion('providerType', [
-  z.object({
-    providerType: z.literal('openai'),
-    ...baseChatModelSchema.shape,
-    reasoning: z
-      .object({
-        enabled: z.boolean(),
-        reasoning_effort: z.string().optional(),
-      })
-      .optional(),
-  }),
-  z.object({
-    providerType: z.literal('anthropic'),
-    ...baseChatModelSchema.shape,
-    thinking: z
-      .object({
-        enabled: z.boolean(),
-        budget_tokens: z.number(),
-      })
-      .optional(),
-  }),
-  z.object({
-    providerType: z.literal('gemini'),
-    ...baseChatModelSchema.shape,
-    thinking: z
-      .object({
-        enabled: z.boolean(),
-        // Google Gemini thinking tokens budget. 0=off (Flash/Flash-Lite), -1=dynamic.
-        thinking_budget: z.number(),
-      })
-      .default({ enabled: true, thinking_budget: -1 })
-      .optional(),
-    toolType: z.enum(['none', 'gemini']).default('none').optional(),
-  }),
-  z.object({
-    providerType: z.literal('groq'),
-    ...baseChatModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('openrouter'),
-    ...baseChatModelSchema.shape,
-    // Allow users to configure reasoning/thinking even via aggregators
-    reasoning: z
-      .object({
-        enabled: z.boolean(),
-        reasoning_effort: z.string().optional(),
-      })
-      .optional(),
-    thinking: z
-      .object({
-        enabled: z.boolean(),
-        thinking_budget: z.number(),
-      })
-      .optional(),
-  }),
-  z.object({
-    providerType: z.literal('ollama'),
-    ...baseChatModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('lm-studio'),
-    ...baseChatModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('deepseek'),
-    ...baseChatModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('perplexity'),
-    ...baseChatModelSchema.shape,
-    web_search_options: z
-      .object({
-        search_context_size: z.string(),
-      })
-      .optional(),
-  }),
-  z.object({
-    providerType: z.literal('mistral'),
-    ...baseChatModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('morph'),
-    ...baseChatModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('azure-openai'),
-    ...baseChatModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('openai-compatible'),
-    ...baseChatModelSchema.shape,
-    // Same here: keep user freedom to configure across any provider
-    reasoning: z
-      .object({
-        enabled: z.boolean(),
-        reasoning_effort: z.string().optional(),
-      })
-      .optional(),
-    thinking: z
-      .object({
-        enabled: z.boolean(),
-        thinking_budget: z.number(),
-      })
-      .optional(),
-    toolType: z.enum(['none', 'gemini']).default('none').optional(),
-  }),
-])
 
 export type ChatModel = z.infer<typeof chatModelSchema>

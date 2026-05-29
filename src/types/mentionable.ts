@@ -8,25 +8,48 @@ export type MentionableFolder = {
   type: 'folder'
   folder: TFolder
 }
-export type MentionableVault = {
-  type: 'vault'
-}
-export type MentionableCurrentFile = {
-  type: 'current-file'
-  file: TFile | null
-}
+
+export type CurrentFileViewState =
+  | {
+      kind: 'markdown-edit'
+      visibleStartLine: number // 1-indexed
+      visibleEndLine: number // 1-indexed, inclusive
+      cursorLine: number // 1-indexed
+      totalLines: number
+    }
+  | {
+      kind: 'pdf'
+      currentPage: number // 1-indexed
+      totalPages: number
+    }
+  | {
+      kind: 'other'
+      totalLines?: number
+    }
+
 export type MentionableBlockData = {
   content: string
   file: TFile
   startLine: number
   endLine: number
-  source?: 'selection'
+  pageNumber?: number // 1-indexed; present when selection originates from a PDF view
+  source?: 'selection' | 'selection-sync' | 'selection-pinned'
+  highlightId?: string // runtime-only; links this mention to its visual highlight; not persisted
   contentHash?: string
   contentCount?: number
   contentUnit?: 'characters' | 'words' | 'wordsCharacters'
 }
 export type MentionableBlock = MentionableBlockData & {
   type: 'block'
+}
+export type MentionableAssistantQuote = {
+  type: 'assistant-quote'
+  conversationId: string
+  messageId: string
+  content: string
+  contentHash?: string
+  contentCount?: number
+  contentUnit?: 'characters' | 'words' | 'wordsCharacters'
 }
 export type MentionableUrl = {
   type: 'url'
@@ -38,14 +61,34 @@ export type MentionableImage = {
   mimeType: string
   data: string // base64
 }
+export type MentionablePDF = {
+  type: 'pdf'
+  name: string
+  // Base64-encoded original PDF bytes. Canonical source-of-truth for native PDF
+  // adapters (Gemini / Anthropic). Optional only for legacy mentionables
+  // serialized before native PDF support — those carry text in `data` instead.
+  rawData?: string
+  // Legacy field: pre-extracted plain text (pages joined). For new uploads this
+  // stays undefined until something needs the text fallback. Kept as `data`
+  // (rather than renamed) so old chat history deserializes unchanged.
+  data?: string
+  pageCount?: number
+}
+export type MentionableModel = {
+  type: 'model'
+  modelId: string
+  name: string
+  providerId?: string
+}
 export type Mentionable =
   | MentionableFile
   | MentionableFolder
-  | MentionableVault
-  | MentionableCurrentFile
   | MentionableBlock
+  | MentionableAssistantQuote
   | MentionableUrl
   | MentionableImage
+  | MentionablePDF
+  | MentionableModel
 export type SerializedMentionableFile = {
   type: 'file'
   file: string
@@ -54,29 +97,37 @@ export type SerializedMentionableFolder = {
   type: 'folder'
   folder: string
 }
-export type SerializedMentionableVault = MentionableVault
-export type SerializedMentionableCurrentFile = {
-  type: 'current-file'
-  file: string | null
-}
 export type SerializedMentionableBlock = {
   type: 'block'
   content?: string
   file: string
   startLine: number
   endLine: number
-  source?: 'selection'
+  pageNumber?: number
+  source?: 'selection' | 'selection-sync' | 'selection-pinned'
+  contentHash?: string
+  contentCount?: number
+  contentUnit?: 'characters' | 'words' | 'wordsCharacters'
+}
+export type SerializedMentionableAssistantQuote = {
+  type: 'assistant-quote'
+  conversationId: string
+  messageId: string
+  content?: string
   contentHash?: string
   contentCount?: number
   contentUnit?: 'characters' | 'words' | 'wordsCharacters'
 }
 export type SerializedMentionableUrl = MentionableUrl
 export type SerializedMentionableImage = MentionableImage
+export type SerializedMentionablePDF = MentionablePDF
+export type SerializedMentionableModel = MentionableModel
 export type SerializedMentionable =
   | SerializedMentionableFile
   | SerializedMentionableFolder
-  | SerializedMentionableVault
-  | SerializedMentionableCurrentFile
   | SerializedMentionableBlock
+  | SerializedMentionableAssistantQuote
   | SerializedMentionableUrl
   | SerializedMentionableImage
+  | SerializedMentionablePDF
+  | SerializedMentionableModel

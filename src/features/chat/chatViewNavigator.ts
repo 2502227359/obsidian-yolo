@@ -1,161 +1,411 @@
-import { Editor, MarkdownView, TFile, TFolder } from 'obsidian'
+import {
+  Editor,
+  MarkdownView,
+  Platform,
+  TFile,
+  TFolder,
+  WorkspaceLeaf,
+} from 'obsidian'
 
 import { ChatView } from '../../ChatView'
-import { ChatProps } from '../../components/chat-view/Chat'
 import { CHAT_VIEW_TYPE } from '../../constants'
-import type SmartComposerPlugin from '../../main'
-import type { MentionableBlockData } from '../../types/mentionable'
+import type YoloPlugin from '../../main'
+import type {
+  MentionableBlockData,
+  MentionableImage,
+} from '../../types/mentionable'
 import { getMentionableBlockData } from '../../utils/obsidian'
 
+import {
+  ChatLeafPlacement,
+  PendingChatOpenPayload,
+} from './chatLeafSessionManager'
+
 type ChatViewNavigatorDeps = {
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
+}
+
+type OpenChatViewOptions = {
+  placement?: ChatLeafPlacement
+  openNewChat?: boolean
+  selectedBlock?: MentionableBlockData
+  initialConversationId?: string
+  prefillText?: string
+  forceNewLeaf?: boolean
+}
+
+type ResolveTargetChatLeafOptions = {
+  placement?: ChatLeafPlacement
+  allowCreate?: boolean
+  forceNewLeaf?: boolean
 }
 
 export class ChatViewNavigator {
-  private readonly plugin: SmartComposerPlugin
+  private readonly plugin: YoloPlugin
 
   constructor(deps: ChatViewNavigatorDeps) {
     this.plugin = deps.plugin
   }
 
-  async openChatView(openNewChat = false) {
-    const view = this.plugin.app.workspace.getActiveViewOfType(MarkdownView)
-    const editor = view?.editor
-    if (!view || !editor) {
-      await this.activateChatView(undefined, openNewChat)
-      return
+  private toPinnedSelectionBlock(
+    selectedBlock: MentionableBlockData,
+  ): MentionableBlockData {
+    return {
+      ...selectedBlock,
+      source: 'selection-pinned',
     }
-    const selectedBlockData = getMentionableBlockData(editor, view)
-    await this.activateChatView(
-      {
-        selectedBlock: selectedBlockData ?? undefined,
-      },
-      openNewChat,
-    )
   }
 
-  async activateChatView(chatProps?: ChatProps, openNewChat = false) {
-    // chatProps is consumed in ChatView.tsx
-    this.plugin.initialChatProps = chatProps
+  async openChatView(options: OpenChatViewOptions = {}) {
+    const view = this.plugin.app.workspace.getActiveViewOfType(MarkdownView)
+    const editor = view?.editor
+    const selectedBlock =
+      options.selectedBlock ??
+      (view && editor
+        ? (getMentionableBlockData(editor, view) ?? undefined)
+        : undefined)
 
-    const leaf = this.plugin.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)[0]
-    if (leaf && leaf.view instanceof ChatView) {
-      leaf.view.setInitialChatProps(chatProps)
+    const existingLeaf = this.resolveTargetChatLeaf({
+      placement: options.placement,
+      forceNewLeaf: options.forceNewLeaf,
+    })
+    const targetLeaf =
+      existingLeaf ??
+      (await this.createChatLeaf(options.placement ?? 'sidebar', {
+        selectedBlock,
+        initialConversationId: options.initialConversationId,
+        prefillText: options.prefillText,
+      }))
+
+    if (!targetLeaf || !(targetLeaf.view instanceof ChatView)) {
+      return
     }
 
-    await (leaf ?? this.plugin.app.workspace.getRightLeaf(false))?.setViewState(
-      {
-        type: CHAT_VIEW_TYPE,
-        active: true,
-      },
-    )
+    void this.persistLastChatPlacement(targetLeaf)
 
-    if (openNewChat && leaf && leaf.view instanceof ChatView) {
-      leaf.view.openNewChat(chatProps?.selectedBlock)
+    if (!existingLeaf) {
+      await this.activateChatLeaf(targetLeaf)
+      return
     }
 
-    const leafToReveal =
-      leaf ?? this.plugin.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)[0]
-    if (leafToReveal) {
-      await this.plugin.app.workspace.revealLeaf(leafToReveal)
+    if (options.initialConversationId) {
+      await this.activateChatLeaf(targetLeaf)
+      await targetLeaf.view.loadConversation(options.initialConversationId)
+      if (options.prefillText) {
+        targetLeaf.view.insertTextToInput(options.prefillText)
+        targetLeaf.view.focusMessage()
+      }
+      return
     }
+
+    if (options.openNewChat) {
+      await this.activateChatLeaf(targetLeaf)
+      targetLeaf.view.openNewChat(selectedBlock)
+      if (options.prefillText) {
+        targetLeaf.view.insertTextToInput(options.prefillText)
+      }
+      targetLeaf.view.focusMessage()
+      return
+    }
+
+    await this.activateChatLeaf(targetLeaf)
+  }
+
+  private async persistLastChatPlacement(leaf: WorkspaceLeaf): Promise<void> {
+    const placement =
+      this.plugin.getChatLeafSessionManager().getLeafPlacement(leaf) ??
+      this.plugin.getChatLeafSessionManager().inferLeafPlacement(leaf)
+    const current = this.plugin.settings.chatOptions.lastChatPlacement
+    if (current === placement) return
+
+    try {
+      await this.plugin.setSettings({
+        ...this.plugin.settings,
+        chatOptions: {
+          ...this.plugin.settings.chatOptions,
+          lastChatPlacement: placement,
+        },
+      })
+    } catch (error: unknown) {
+      console.error('Failed to persist lastChatPlacement', error)
+    }
+  }
+
+  async openChatInSidebar(openNewChat = false) {
+    await this.openChatView({
+      placement: 'sidebar',
+      openNewChat,
+    })
+  }
+
+  async openChatInSplit(openNewChat = false) {
+    await this.openChatView({
+      placement: 'split',
+      openNewChat,
+      forceNewLeaf: openNewChat,
+    })
+  }
+
+  async openChatInTab(openNewChat = false) {
+    await this.openChatView({
+      placement: 'tab',
+      openNewChat,
+      forceNewLeaf: openNewChat,
+    })
+  }
+
+  async openChatInWindow(openNewChat = false) {
+    await this.openChatView({
+      placement: 'window',
+      openNewChat,
+      forceNewLeaf: openNewChat,
+    })
+  }
+
+  async openCurrentOrSidebarNewChat() {
+    const activeLeaf =
+      this.plugin.app.workspace.getActiveViewOfType(ChatView)?.leaf ?? null
+    if (activeLeaf?.view instanceof ChatView) {
+      await this.activateChatLeaf(activeLeaf)
+      activeLeaf.view.openNewChat()
+      activeLeaf.view.focusMessage()
+      return
+    }
+
+    await this.openChatView({
+      placement: 'sidebar',
+      openNewChat: true,
+    })
   }
 
   async addSelectionToChat(editor: Editor, view: MarkdownView) {
     const data = getMentionableBlockData(editor, view)
     if (!data) return
 
-    const leaves = this.plugin.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)
-    if (leaves.length === 0 || !(leaves[0].view instanceof ChatView)) {
-      await this.activateChatView({
+    await this.addSelectionBlockToChat(data)
+  }
+
+  async addSelectionBlockToChat(selectedBlock: MentionableBlockData) {
+    const data: MentionableBlockData = {
+      ...selectedBlock,
+      source: 'selection-pinned',
+    }
+
+    const existingLeaf = this.resolveTargetChatLeaf()
+    const targetLeaf =
+      existingLeaf ??
+      (await this.createChatLeaf('sidebar', {
         selectedBlock: data,
-      })
+      }))
+    if (!targetLeaf || !(targetLeaf.view instanceof ChatView)) {
       return
     }
 
-    // bring leaf to foreground (uncollapse sidebar if it's collapsed)
-    await this.plugin.app.workspace.revealLeaf(leaves[0])
-
-    const chatView = leaves[0].view
-    chatView.addSelectionToChat(data)
-    chatView.focusMessage()
+    await this.activateChatLeaf(targetLeaf)
+    if (!existingLeaf) {
+      return
+    }
+    targetLeaf.view.addSelectionToChat(data)
+    targetLeaf.view.focusMessage()
   }
 
   async openChatWithSelectionAndPrefill(
     selectedBlock: MentionableBlockData,
     text: string,
+    assistantId?: string,
   ) {
-    const leaves = this.plugin.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)
-    if (leaves.length === 0 || !(leaves[0].view instanceof ChatView)) {
-      await this.activateChatView({
-        selectedBlock,
-      })
-      const newLeaves =
-        this.plugin.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)
-      if (newLeaves.length === 0 || !(newLeaves[0].view instanceof ChatView)) {
-        return
-      }
-      const chatView = newLeaves[0].view
-      if (text) {
-        chatView.insertTextToInput(text)
-      }
-      chatView.focusMessage()
+    const pinnedSelection = this.toPinnedSelectionBlock(selectedBlock)
+    const existingLeaf = this.resolveTargetChatLeaf()
+    const targetLeaf =
+      existingLeaf ??
+      (await this.createChatLeaf('sidebar', {
+        selectedBlock: pinnedSelection,
+        prefillText: text,
+        assistantId,
+      }))
+    if (!targetLeaf || !(targetLeaf.view instanceof ChatView)) {
       return
     }
 
-    await this.plugin.app.workspace.revealLeaf(leaves[0])
-
-    const chatView = leaves[0].view
-    chatView.syncSelectionToChat(selectedBlock)
-    if (text) {
-      chatView.insertTextToInput(text)
+    await this.activateChatLeaf(targetLeaf)
+    if (!existingLeaf) {
+      return
     }
-    chatView.focusMessage()
+    targetLeaf.view.applySelectionToMainInput(pinnedSelection, text, {
+      assistantId,
+    })
+  }
+
+  async openChatWithSelectionAndSend(
+    selectedBlock: MentionableBlockData,
+    text: string,
+    assistantId?: string,
+  ) {
+    const pinnedSelection = this.toPinnedSelectionBlock(selectedBlock)
+    const existingLeaf = this.resolveTargetChatLeaf()
+    const targetLeaf =
+      existingLeaf ??
+      (await this.createChatLeaf('sidebar', {
+        selectedBlock: pinnedSelection,
+        prefillText: text,
+        autoSend: true,
+        assistantId,
+      }))
+    if (!targetLeaf || !(targetLeaf.view instanceof ChatView)) {
+      return
+    }
+
+    await this.activateChatLeaf(targetLeaf)
+    if (!existingLeaf) {
+      return
+    }
+    targetLeaf.view.applySelectionToMainInput(pinnedSelection, text, {
+      submit: true,
+      assistantId,
+    })
+  }
+
+  async addImageToChat(image: MentionableImage) {
+    const existingLeaf = this.resolveTargetChatLeaf()
+    const targetLeaf =
+      existingLeaf ??
+      (await this.createChatLeaf('sidebar', {
+        imageToAdd: image,
+      }))
+    if (!targetLeaf || !(targetLeaf.view instanceof ChatView)) {
+      return
+    }
+
+    await this.activateChatLeaf(targetLeaf)
+    if (!existingLeaf) {
+      // Fresh leaf: applyDeferredPayload (via waitForChatRef) handles injection.
+      return
+    }
+    targetLeaf.view.addImageToChat(image)
+    targetLeaf.view.focusMessage()
   }
 
   async addFileToChat(file: TFile) {
-    const leaves = this.plugin.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)
-    if (leaves.length === 0 || !(leaves[0].view instanceof ChatView)) {
-      await this.activateChatView()
-      // Get the newly created chat view
-      const newLeaves =
-        this.plugin.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)
-      if (newLeaves.length > 0 && newLeaves[0].view instanceof ChatView) {
-        const chatView = newLeaves[0].view
-        chatView.addFileToChat(file)
-        chatView.focusMessage()
-      }
+    const existingLeaf = this.resolveTargetChatLeaf()
+    const targetLeaf =
+      existingLeaf ??
+      (await this.createChatLeaf('sidebar', {
+        fileToAdd: file,
+      }))
+    if (!targetLeaf || !(targetLeaf.view instanceof ChatView)) {
       return
     }
 
-    // bring leaf to foreground (uncollapse sidebar if it's collapsed)
-    await this.plugin.app.workspace.revealLeaf(leaves[0])
-
-    const chatView = leaves[0].view
-    chatView.addFileToChat(file)
-    chatView.focusMessage()
+    await this.activateChatLeaf(targetLeaf)
+    if (!existingLeaf) {
+      return
+    }
+    targetLeaf.view.addFileToChat(file)
+    targetLeaf.view.focusMessage()
   }
 
   async addFolderToChat(folder: TFolder) {
-    const leaves = this.plugin.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)
-    if (leaves.length === 0 || !(leaves[0].view instanceof ChatView)) {
-      await this.activateChatView()
-      // Get the newly created chat view
-      const newLeaves =
-        this.plugin.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)
-      if (newLeaves.length > 0 && newLeaves[0].view instanceof ChatView) {
-        const chatView = newLeaves[0].view
-        chatView.addFolderToChat(folder)
-        chatView.focusMessage()
-      }
+    const existingLeaf = this.resolveTargetChatLeaf()
+    const targetLeaf =
+      existingLeaf ??
+      (await this.createChatLeaf('sidebar', {
+        folderToAdd: folder,
+      }))
+    if (!targetLeaf || !(targetLeaf.view instanceof ChatView)) {
       return
     }
 
-    // bring leaf to foreground (uncollapse sidebar if it's collapsed)
-    await this.plugin.app.workspace.revealLeaf(leaves[0])
+    await this.activateChatLeaf(targetLeaf)
+    if (!existingLeaf) {
+      return
+    }
+    targetLeaf.view.addFolderToChat(folder)
+    targetLeaf.view.focusMessage()
+  }
 
-    const chatView = leaves[0].view
-    chatView.addFolderToChat(folder)
-    chatView.focusMessage()
+  resolveTargetChatLeaf(
+    options: ResolveTargetChatLeafOptions = {},
+  ): WorkspaceLeaf | null {
+    if (options.forceNewLeaf) {
+      return null
+    }
+
+    return this.plugin
+      .getChatLeafSessionManager()
+      .resolveTargetLeaf({ placement: options.placement })
+  }
+
+  async ensureChatLeaf(
+    options: ResolveTargetChatLeafOptions = {},
+  ): Promise<WorkspaceLeaf | null> {
+    const existingLeaf = this.resolveTargetChatLeaf(options)
+    if (existingLeaf) {
+      return existingLeaf
+    }
+
+    if (options.allowCreate === false) {
+      return null
+    }
+
+    return await this.createChatLeaf(options.placement ?? 'sidebar')
+  }
+
+  private async activateChatLeaf(leaf: WorkspaceLeaf): Promise<void> {
+    await this.plugin.app.workspace.revealLeaf(leaf)
+    this.plugin.getChatLeafSessionManager().touchLeafInteracted(leaf)
+  }
+
+  private async createChatLeaf(
+    placement: ChatLeafPlacement,
+    payload?: PendingChatOpenPayload,
+  ): Promise<WorkspaceLeaf | null> {
+    const leaf = this.createLeafForPlacement(placement)
+    if (!leaf) {
+      return null
+    }
+
+    this.plugin.getChatLeafSessionManager().setPendingPayload(leaf, {
+      ...payload,
+      placement,
+    })
+
+    await leaf.setViewState({
+      type: CHAT_VIEW_TYPE,
+      active: true,
+    })
+
+    if (!(leaf.view instanceof ChatView)) {
+      return null
+    }
+
+    this.plugin.getChatLeafSessionManager().registerLeaf(leaf, placement)
+    return leaf
+  }
+
+  private createLeafForPlacement(
+    placement: ChatLeafPlacement,
+  ): WorkspaceLeaf | null {
+    switch (placement) {
+      case 'sidebar':
+        return this.plugin.app.workspace.getRightLeaf(false)
+      case 'split': {
+        const workspace = this.plugin.app.workspace
+        const baseLeaf =
+          workspace.getMostRecentLeaf(workspace.rootSplit) ??
+          workspace.getActiveViewOfType(MarkdownView)?.leaf ??
+          workspace.getLeaf(false)
+
+        return workspace.createLeafBySplit(baseLeaf, 'vertical')
+      }
+      case 'tab':
+        return this.plugin.app.workspace.getLeaf('tab')
+      case 'window':
+        if (!Platform.isDesktop) {
+          return this.plugin.app.workspace.getLeaf('tab')
+        }
+        return this.plugin.app.workspace.getLeaf('window')
+      default:
+        return this.plugin.app.workspace.getRightLeaf(false)
+    }
   }
 }

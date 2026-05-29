@@ -25,6 +25,37 @@ export type ResponseUsage = {
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
+  /**
+   * Input tokens served from an ephemeral prompt cache (Anthropic only, for now).
+   * Included inside `prompt_tokens`; exposed separately for cost/hit-rate display.
+   */
+  cache_read_input_tokens?: number
+  /**
+   * Input tokens written to the ephemeral prompt cache this request (Anthropic only).
+   * Included inside `prompt_tokens`; carries a write premium on the bill.
+   */
+  cache_creation_input_tokens?: number
+}
+
+export type GeminiAssistantPart =
+  | {
+      type: 'text'
+      text: string
+      thought?: boolean
+      thoughtSignature?: string
+    }
+  | {
+      type: 'functionCall'
+      id?: string
+      name: string
+      args?: Record<string, unknown>
+      thoughtSignature?: string
+    }
+
+export type ProviderMetadata = {
+  gemini?: {
+    parts: GeminiAssistantPart[]
+  }
 }
 
 type NonStreamingChoice = {
@@ -35,6 +66,7 @@ type NonStreamingChoice = {
     role: string
     annotations?: Annotation[]
     tool_calls?: ToolCall[]
+    providerMetadata?: ProviderMetadata
   }
   error?: Error
 }
@@ -47,6 +79,7 @@ type StreamingChoice = {
     role?: string
     annotations?: Annotation[]
     tool_calls?: ToolCallDelta[]
+    providerMetadata?: ProviderMetadata
   }
   error?: Error
 }
@@ -70,6 +103,9 @@ type Error = {
 export type ToolCall = {
   id?: string
   type: 'function'
+  metadata?: {
+    thoughtSignature?: string
+  }
   function: {
     arguments?: string
     name: string
@@ -80,6 +116,9 @@ export type ToolCallDelta = {
   index: number
   id?: string
   type?: 'function'
+  metadata?: {
+    thoughtSignature?: string
+  }
   function?: {
     arguments?: string
     name?: string

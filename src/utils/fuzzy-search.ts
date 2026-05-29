@@ -1,23 +1,19 @@
 import fuzzysort from 'fuzzysort'
 import { App, TFile, TFolder } from 'obsidian'
 
-import {
-  MentionableFile,
-  MentionableFolder,
-  MentionableVault,
-} from '../types/mentionable'
+import { MentionableFile, MentionableFolder } from '../types/mentionable'
 
+import { IMAGE_FILE_EXTENSIONS } from './llm/image'
 import { calculateFileDistance, getOpenFiles } from './obsidian'
 
-export type SearchableMentionable =
-  | MentionableFile
-  | MentionableFolder
-  | MentionableVault
+/** Extensions included in @ mention fuzzy search (vault files). */
+export const MENTION_SEARCHABLE_EXTENSIONS = new Set([
+  'md',
+  'pdf',
+  ...IMAGE_FILE_EXTENSIONS,
+])
 
-type VaultSearchItem = {
-  type: 'vault'
-  path: string
-}
+export type SearchableMentionable = MentionableFile | MentionableFolder
 
 type FileWithMetadata = {
   type: 'file'
@@ -37,7 +33,7 @@ type FolderWithMetadata = {
   distance: number | null
 }
 
-type SearchItem = FolderWithMetadata | FileWithMetadata | VaultSearchItem
+type SearchItem = FolderWithMetadata | FileWithMetadata
 
 function scoreFnWithBoost({
   searchItem,
@@ -79,13 +75,6 @@ function scoreFnWithBoost({
       if (distance !== null && distance > 0 && distance <= 5) {
         const nearbyBoost = 1 + 0.5 / Math.max(distance - 1, 1)
         boost = Math.max(boost, nearbyBoost)
-      }
-
-      break
-    }
-    case 'vault': {
-      if (score === 1) {
-        boost = 3
       }
 
       break
@@ -174,10 +163,11 @@ export function fuzzySearch(app: App, query: string): SearchableMentionable[] {
   const currentFile = app.workspace.getActiveFile()
   const openFiles = getOpenFiles(app)
 
-  const allSupportedFiles = app.vault.getFiles().filter((file) => {
-    const extension = file.extension
-    return extension === 'md'
-  })
+  const allSupportedFiles = app.vault
+    .getFiles()
+    .filter((file) =>
+      MENTION_SEARCHABLE_EXTENSIONS.has(file.extension.toLowerCase()),
+    )
 
   const allFilesWithMetadata: SearchItem[] = allSupportedFiles.map((file) => ({
     type: 'file',
@@ -203,15 +193,9 @@ export function fuzzySearch(app: App, query: string): SearchableMentionable[] {
     distance: currentFile ? calculateFileDistance(currentFile, folder) : null,
   }))
 
-  const vaultItem: VaultSearchItem = {
-    type: 'vault',
-    path: 'vault',
-  }
-
   const searchItems: SearchItem[] = [
     ...allFilesWithMetadata,
     ...allFoldersWithMetadata,
-    vaultItem,
   ]
 
   if (!query) {
@@ -245,10 +229,6 @@ function searchItemToMentionable(item: SearchItem): SearchableMentionable {
       return {
         type: 'folder',
         folder: item.folder,
-      }
-    case 'vault':
-      return {
-        type: 'vault',
       }
   }
 }

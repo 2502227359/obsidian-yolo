@@ -1,0 +1,155 @@
+/* 任务清单面板：作为 .yolo-chat-input-overlay 的子项，浮在输入框上方，可折叠。
+ * 定位与层级由 .yolo-chat-input-overlay 统一负责，本组件只关心自身样式。
+ * 布局：header（摘要+折叠按钮） → body（列表）
+ * 折叠动画：grid-template-rows 0fr ↔ 1fr，无需测量高度
+ */
+
+.yolo-todo-panel {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m, 8px);
+  background: var(--background-primary);
+  font-size: var(--font-ui-small);
+  overflow: hidden;
+  /* 入场动画：从输入框上沿向上"冒出来"。每次组件从 null 切到渲染都会重跑
+   * （首次出现、清空后再出现、切会话/分支等），不需要 React 端配合。 */
+  animation: yolo-todo-panel-appear 220ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+@keyframes yolo-todo-panel-appear {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 选择器写成 `button.yolo-todo-panel__header` 是为了对抗 Obsidian
+ * `app.css` 里的 `button:not(.clickable-icon) { box-shadow: var(--input-shadow) }`
+ * ——必须保持等同或更高特异度，否则会画出一条贴在 header 底部的投影线。 */
+button.yolo-todo-panel__header {
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-2);
+  width: 100%;
+  padding: var(--size-2-2) var(--size-4-2);
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  outline: 0;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  text-align: left;
+}
+
+.yolo-todo-panel__header-icon {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.yolo-todo-panel__summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.yolo-todo-panel__caret {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  transition: transform 220ms ease;
+}
+
+.yolo-todo-panel--collapsed .yolo-todo-panel__caret {
+  transform: rotate(-90deg);
+}
+
+.yolo-todo-panel__body {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 240ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.yolo-todo-panel--collapsed .yolo-todo-panel__body {
+  grid-template-rows: 0fr;
+}
+
+.yolo-todo-panel__body-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.yolo-todo-panel__list {
+  list-style: none;
+  margin: 0;
+  padding: var(--size-2-2) var(--size-4-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2-1);
+}
+
+.yolo-todo-panel__item {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-2);
+  padding: var(--size-2-1) 0;
+  color: var(--text-normal);
+  line-height: 1.4;
+}
+
+.yolo-todo-panel__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+}
+
+.yolo-todo-panel__item--in_progress .yolo-todo-panel__icon {
+  color: var(--interactive-accent);
+}
+
+.yolo-todo-panel__item--completed .yolo-todo-panel__icon {
+  color: var(--text-faint);
+}
+
+.yolo-todo-panel__index {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.yolo-todo-panel__text {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.yolo-todo-panel__item--in_progress .yolo-todo-panel__text {
+  color: var(--text-normal);
+  font-weight: var(--font-medium);
+}
+
+.yolo-todo-panel__item--completed .yolo-todo-panel__text {
+  color: var(--text-faint);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.yolo-todo-panel__icon-spin {
+  animation: yolo-todo-panel-spin 1.4s linear infinite;
+}
+
+@keyframes yolo-todo-panel-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

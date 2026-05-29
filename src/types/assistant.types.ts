@@ -1,7 +1,5 @@
 import { z } from 'zod'
 
-import { customParameterSchema } from './custom-parameter.types'
-
 // Assistant icon type definition
 export const assistantIconSchema = z.object({
   type: z.enum(['lucide', 'emoji']),
@@ -28,6 +26,41 @@ export type AssistantSkillPreference = z.infer<
   typeof assistantSkillPreferenceSchema
 >
 
+export const assistantToolApprovalModeSchema = z.enum([
+  'full_access',
+  'require_approval',
+])
+
+export type AssistantToolApprovalMode = z.infer<
+  typeof assistantToolApprovalModeSchema
+>
+
+export const assistantToolDisclosureModeSchema = z.enum(['always', 'on_demand'])
+
+export type AssistantToolDisclosureMode = z.infer<
+  typeof assistantToolDisclosureModeSchema
+>
+
+export const assistantToolPreferenceSchema = z.object({
+  enabled: z.boolean().optional(),
+  approvalMode: assistantToolApprovalModeSchema.optional(),
+  disclosureMode: assistantToolDisclosureModeSchema.optional(),
+})
+
+export type AssistantToolPreference = z.infer<
+  typeof assistantToolPreferenceSchema
+>
+
+export const assistantWorkspaceScopeSchema = z.object({
+  enabled: z.boolean().default(false),
+  include: z.array(z.string()).default([]),
+  exclude: z.array(z.string()).default([]),
+})
+
+export type AssistantWorkspaceScope = z.infer<
+  typeof assistantWorkspaceScopeSchema
+>
+
 // Assistant type definition
 export const assistantSchema = z.object({
   id: z.string(),
@@ -37,18 +70,18 @@ export const assistantSchema = z.object({
   icon: assistantIconSchema.optional(),
   persona: agentPersonaSchema.optional(),
   modelId: z.string().optional(),
-  temperature: z.number().min(0).max(2).optional(),
-  topP: z.number().min(0).max(1).optional(),
-  maxOutputTokens: z.number().int().min(1).optional(),
-  maxContextMessages: z.number().int().min(1).max(100).optional(),
-  customParameters: z.array(customParameterSchema).optional(),
   enableTools: z.boolean().optional(),
   includeBuiltinTools: z.boolean().optional(),
   enabledToolNames: z.array(z.string()).optional(),
+  toolPreferences: z
+    .record(z.string(), assistantToolPreferenceSchema)
+    .optional(),
   enabledSkills: z.array(z.string()).optional(),
   skillPreferences: z
     .record(z.string(), assistantSkillPreferenceSchema)
     .optional(),
+  workspaceScope: assistantWorkspaceScopeSchema.optional(),
+  enableProjectInstructions: z.boolean().optional(),
   createdAt: z.number().optional(),
   updatedAt: z.number().optional(),
 })

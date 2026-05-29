@@ -4,12 +4,19 @@ import type { Editor, MarkdownView } from 'obsidian'
 
 import { ApplyReviewOverlay } from '../../../components/apply-view/ApplyReviewOverlay'
 import { InlineDiffReviewOverlay } from '../../../components/apply-view/InlineDiffReviewOverlay'
-import type { ApplyViewActions } from '../../../components/apply-view/ApplyViewRoot'
-import type SmartComposerPlugin from '../../../main'
-import type { ApplyViewState } from '../../../types/apply-view.types'
+import type { ApplyViewActions } from '../../../components/apply-view/types'
+import type YoloPlugin from '../../../main'
+import type {
+  ApplyViewCallbacks,
+  ApplyViewState,
+} from '../../../types/apply-view.types'
+
+import { buildInlineReviewBlocks, countModifiedBlocks } from './review-model'
+
+const INLINE_DIFF_REVIEW_THRESHOLD = 3
 
 type DiffReviewControllerDeps = {
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
   getActiveMarkdownView: () => MarkdownView | null
   getEditorView: (editor: Editor) => EditorView | null
 }
@@ -95,6 +102,8 @@ export class DiffReviewController {
   private activeOverlay: { mount: () => void; destroy: () => void } | null =
     null
   private activeActions: ApplyViewActions | null = null
+  private activeReviewCallbacks: ApplyViewCallbacks | null = null
+  private activeReviewSettled = false
 
   constructor(deps: DiffReviewControllerDeps) {
     this.deps = deps
@@ -118,6 +127,12 @@ export class DiffReviewController {
 
   closeReview(): void {
     if (!this.activeView) return
+
+    if (!this.activeReviewSettled) {
+      this.activeReviewCallbacks?.onCancel?.()
+    }
+    this.activeReviewCallbacks = null
+    this.activeReviewSettled = false
 
     this.activeOverlay?.destroy()
     this.activeOverlay = null
@@ -162,30 +177,63 @@ export class DiffReviewController {
           }
         : state
 
-    this.activeOverlay =
-      reviewState.reviewMode === 'selection-focus'
-        ? new InlineDiffReviewOverlay({
-            plugin: this.deps.plugin,
-            view,
-            state: reviewState,
-            onClose: () => this.closeReview(),
-            onActionsReady: (actions) => {
-              this.activeActions = actions
-            },
-          })
-        : new ApplyReviewOverlay({
-            plugin: this.deps.plugin,
-            view,
-            state: {
-              ...reviewState,
-              reviewMode: 'full',
-            },
-            onClose: () => this.closeReview(),
-            onActionsReady: (actions) => {
-              this.activeActions = actions
-            },
-          })
+    const wrappedCallbacks = this.wrapReviewCallbacks(reviewState.callbacks)
+    const reviewStateWithCallbacks: ApplyViewState = {
+      ...reviewState,
+      callbacks: wrappedCallbacks,
+    }
+    this.activeReviewCallbacks = wrappedCallbacks
+    this.activeReviewSettled = false
+
+    const modifiedBlockCount = countModifiedBlocks(
+      buildInlineReviewBlocks(
+        reviewStateWithCallbacks.originalContent,
+        reviewStateWithCallbacks.newContent,
+      ),
+    )
+
+    const shouldUseInlineSelectionReview =
+      reviewStateWithCallbacks.reviewMode === 'selection-focus' &&
+      modifiedBlockCount <= INLINE_DIFF_REVIEW_THRESHOLD
+
+    this.activeOverlay = shouldUseInlineSelectionReview
+      ? new InlineDiffReviewOverlay({
+          plugin: this.deps.plugin,
+          view,
+          state: reviewStateWithCallbacks,
+          onClose: () => this.closeReview(),
+          onActionsReady: (actions) => {
+            this.activeActions = actions
+          },
+        })
+      : new ApplyReviewOverlay({
+          plugin: this.deps.plugin,
+          view,
+          state: {
+            ...reviewStateWithCallbacks,
+            reviewMode: 'full',
+          },
+          onClose: () => this.closeReview(),
+          onActionsReady: (actions) => {
+            this.activeActions = actions
+          },
+        })
     this.activeOverlay.mount()
+  }
+
+  private wrapReviewCallbacks(
+    callbacks: ApplyViewCallbacks | undefined,
+  ): ApplyViewCallbacks {
+    return {
+      onComplete: (result) => {
+        this.activeReviewSettled = true
+        callbacks?.onComplete?.(result)
+      },
+      onCancel: () => {
+        this.activeReviewSettled = true
+        callbacks?.onCancel?.()
+      },
+    }
   }
 
   private hasValidSelectionRange(

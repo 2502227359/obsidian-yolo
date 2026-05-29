@@ -10,7 +10,9 @@ export const calculateLLMCost = ({
   model: ChatModel
   usage: ResponseUsage
 }): number | null => {
-  switch (model.providerType) {
+  const providerKey = model.providerId.split('/')[0] ?? model.providerId
+
+  switch (providerKey) {
     case 'openai': {
       const modelPricing = OPENAI_PRICES[model.model]
       if (!modelPricing) return null
@@ -19,6 +21,12 @@ export const calculateLLMCost = ({
           usage.completion_tokens * modelPricing.output) /
         1_000_000
       )
+    }
+    case 'chatgpt-oauth': {
+      return 0
+    }
+    case 'qwen-oauth': {
+      return 0
     }
     case 'anthropic': {
       const modelPricing = ANTHROPIC_PRICES[model.model]

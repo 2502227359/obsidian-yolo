@@ -4,6 +4,7 @@ import {
   ToolChoice as AnthropicToolChoice,
   Base64ImageSource,
   ContentBlockParam,
+  DocumentBlockParam,
   ImageBlockParam,
   MessageCreateParamsNonStreaming,
   MessageCreateParamsStreaming,
@@ -27,35 +28,117 @@ import {
   ResponseUsage,
   ToolCall,
 } from '../../types/llm/response'
-import { LLMProvider } from '../../types/provider.types'
+import { LLMProvider, RequestTransportMode } from '../../types/provider.types'
+import {
+  REASONING_META,
+  resolveRequestReasoningLevel,
+} from '../../types/reasoning'
+import { getToolCallArgumentsObject } from '../../types/tool-call.types'
 import { parseImageDataUrl } from '../../utils/llm/image'
 import { toProviderHeadersRecord } from '../../utils/llm/provider-headers'
 
+import { applyAnthropicPromptCache } from './anthropicPromptCache'
 import { BaseLLMProvider } from './base'
 import {
   LLMAPIKeyInvalidException,
   LLMAPIKeyNotSetException,
 } from './exception'
+import { ModelRequestPolicy, resolveSdkMaxRetries } from './requestPolicy'
+import {
+  AutoPromotedTransportMode,
+  createRequestTransportMemoryKey,
+  resolveRequestTransportMode,
+  runWithRequestTransport,
+  runWithRequestTransportForStream,
+} from './requestTransport'
+import { createTransportClients } from './transportClients'
 
-export class AnthropicProvider extends BaseLLMProvider<
-  Extract<LLMProvider, { type: 'anthropic' }>
-> {
-  private client: Anthropic
+export class AnthropicProvider extends BaseLLMProvider<LLMProvider> {
+  private browserClient: Anthropic
+  private obsidianClient: Anthropic
+  private nodeClient: Anthropic
+  private requestTransportMode: RequestTransportMode
+  private requestTransportMemoryKey: string
+  private onAutoPromoteTransportMode?: (mode: AutoPromotedTransportMode) => void
+
+  private promoteTransportMode = (mode: AutoPromotedTransportMode) => {
+    if (this.requestTransportMode === mode) {
+      return
+    }
+
+    this.provider.additionalSettings = {
+      ...(this.provider.additionalSettings ?? {}),
+      requestTransportMode: mode,
+    }
+    this.requestTransportMode = mode
+    this.onAutoPromoteTransportMode?.(mode)
+  }
+
+  private isPromptCachingEnabled(): boolean {
+    const raw = this.provider.additionalSettings?.promptCaching
+    return raw === true
+  }
 
   private static readonly DEFAULT_MAX_TOKENS = 8192
 
-  constructor(provider: Extract<LLMProvider, { type: 'anthropic' }>) {
+  /**
+   * max_tokens must cover thinking tokens too. For bounded levels (low/medium/high/extra-high)
+   * add the budget from REASONING_META on top of DEFAULT_MAX_TOKENS so visible output isn't truncated.
+   */
+  private static resolveMaxTokens(
+    requested: number | undefined,
+    level: ReturnType<typeof resolveRequestReasoningLevel>,
+  ): number {
+    if (typeof requested === 'number') return requested
+    if (level && level !== 'off' && level !== 'auto') {
+      return AnthropicProvider.DEFAULT_MAX_TOKENS + REASONING_META[level].budget
+    }
+    return AnthropicProvider.DEFAULT_MAX_TOKENS
+  }
+
+  constructor(
+    provider: LLMProvider,
+    options?: {
+      onAutoPromoteTransportMode?: (mode: AutoPromotedTransportMode) => void
+      requestPolicy?: ModelRequestPolicy
+    },
+  ) {
     super(provider)
+    this.onAutoPromoteTransportMode = options?.onAutoPromoteTransportMode
     const defaultHeaders = toProviderHeadersRecord(provider.customHeaders)
+    this.requestTransportMemoryKey = createRequestTransportMemoryKey({
+      providerType: provider.presetType,
+      providerId: provider.id,
+      baseUrl: provider.baseUrl,
+    })
+    this.requestTransportMode = resolveRequestTransportMode({
+      additionalSettings: provider.additionalSettings,
+      hasCustomBaseUrl: !!provider.baseUrl,
+      memoryKey: this.requestTransportMemoryKey,
+    })
     const clientOptions = {
       apiKey: provider.apiKey,
       baseURL: provider.baseUrl
-        ? provider.baseUrl.replace(/\/+$/, '')
+        ? provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')
         : undefined, // use default
       dangerouslyAllowBrowser: true,
+      maxRetries: resolveSdkMaxRetries({
+        requestPolicy: options?.requestPolicy,
+        requestTransportMode: this.requestTransportMode,
+      }),
+      timeout: options?.requestPolicy?.timeoutMs,
       ...(defaultHeaders ? { defaultHeaders } : {}),
     }
-    this.client = new Anthropic(clientOptions)
+    const clients = createTransportClients(
+      (transportFetch) =>
+        new Anthropic({
+          ...clientOptions,
+          fetch: transportFetch,
+        }),
+    )
+    this.browserClient = clients.browserClient
+    this.obsidianClient = clients.obsidianClient
+    this.nodeClient = clients.nodeClient
   }
 
   async generateResponse(
@@ -63,11 +146,7 @@ export class AnthropicProvider extends BaseLLMProvider<
     request: LLMRequestNonStreaming,
     options?: LLMOptions,
   ): Promise<LLMResponseNonStreaming> {
-    if (model.providerType !== 'anthropic') {
-      throw new Error('Model is not a Anthropic model')
-    }
-
-    if (!this.client.apiKey) {
+    if (!this.provider.apiKey) {
       throw new LLMAPIKeyNotSetException(
         `Provider ${this.provider.id} API key is missing. Please set it in settings menu.`,
       )
@@ -78,40 +157,74 @@ export class AnthropicProvider extends BaseLLMProvider<
     )
 
     try {
-      const payloadBase: MessageCreateParamsNonStreaming = {
+      const level = resolveRequestReasoningLevel(model, request.reasoningLevel)
+      const payloadBase: MessageCreateParamsNonStreaming &
+        Record<string, unknown> = {
         model: request.model,
-        messages: request.messages
-          .map((m) => AnthropicProvider.parseRequestMessage(m))
-          .filter((m): m is MessageParam => m !== null),
+        messages: AnthropicProvider.mergeAdjacentUserMessages(
+          request.messages
+            .map((m) => this.parseRequestMessage(m))
+            .filter((m): m is MessageParam => m !== null),
+        ),
         system: systemMessage,
-        thinking: model.thinking?.enabled
-          ? {
-              type: 'enabled',
-              budget_tokens: model.thinking.budget_tokens,
-            }
-          : undefined,
         tools: request.tools?.map((t) => AnthropicProvider.parseRequestTool(t)),
         tool_choice: request.tool_choice
           ? AnthropicProvider.parseRequestToolChoice(request.tool_choice)
           : undefined,
-        max_tokens:
-          request.max_tokens ??
-          (model.thinking?.enabled
-            ? model.thinking?.budget_tokens +
-              AnthropicProvider.DEFAULT_MAX_TOKENS
-            : AnthropicProvider.DEFAULT_MAX_TOKENS),
+        max_tokens: AnthropicProvider.resolveMaxTokens(
+          request.max_tokens,
+          level,
+        ),
         temperature: request.temperature,
         top_p: request.top_p,
+      }
+
+      if (level !== undefined) {
+        switch (level) {
+          case 'off':
+            payloadBase.thinking = { type: 'disabled' }
+            break
+          case 'auto':
+            payloadBase.thinking = {
+              type: 'adaptive',
+              display: 'summarized',
+            } as unknown as MessageCreateParamsNonStreaming['thinking']
+            break
+          default:
+            payloadBase.thinking = {
+              type: 'adaptive',
+              display: 'summarized',
+            } as unknown as MessageCreateParamsNonStreaming['thinking']
+            payloadBase.output_config = {
+              effort: REASONING_META[level].effort,
+            }
+        }
       }
 
       const payload = this.applyCustomModelParameters<
         MessageCreateParamsNonStreaming & Record<string, unknown>
       >(model, {
-        ...payloadBase,
+        ...(this.isPromptCachingEnabled()
+          ? applyAnthropicPromptCache(payloadBase)
+          : payloadBase),
       })
 
-      const response = await this.client.messages.create(payload, {
-        signal: options?.signal,
+      const response = await runWithRequestTransport({
+        mode: this.requestTransportMode,
+        memoryKey: this.requestTransportMemoryKey,
+        onAutoPromoteTransportMode: this.promoteTransportMode,
+        runBrowser: () =>
+          this.browserClient.messages.create(payload, {
+            signal: options?.signal,
+          }),
+        runObsidian: () =>
+          this.obsidianClient.messages.create(payload, {
+            signal: options?.signal,
+          }),
+        runNode: () =>
+          this.nodeClient.messages.create(payload, {
+            signal: options?.signal,
+          }),
       })
 
       return AnthropicProvider.parseNonStreamingResponse(response)
@@ -160,11 +273,7 @@ https://github.com/glowingjade/obsidian-smart-composer/issues/286`,
     request: LLMRequestStreaming,
     options?: LLMOptions,
   ): Promise<AsyncIterable<LLMResponseStreaming>> {
-    if (model.providerType !== 'anthropic') {
-      throw new Error('Model is not a Anthropic model')
-    }
-
-    if (!this.client.apiKey) {
+    if (!this.provider.apiKey) {
       throw new LLMAPIKeyNotSetException(
         `Provider ${this.provider.id} API key is missing. Please set it in settings menu.`,
       )
@@ -175,42 +284,79 @@ https://github.com/glowingjade/obsidian-smart-composer/issues/286`,
     )
 
     try {
-      const payloadBase: MessageCreateParamsStreaming = {
+      const level = resolveRequestReasoningLevel(model, request.reasoningLevel)
+      const payloadBase: MessageCreateParamsStreaming &
+        Record<string, unknown> = {
         model: request.model,
-        messages: request.messages
-          .map((m) => AnthropicProvider.parseRequestMessage(m))
-          .filter((m): m is MessageParam => m !== null),
+        messages: AnthropicProvider.mergeAdjacentUserMessages(
+          request.messages
+            .map((m) => this.parseRequestMessage(m))
+            .filter((m): m is MessageParam => m !== null),
+        ),
         system: systemMessage,
-        thinking: model.thinking?.enabled
-          ? {
-              type: 'enabled',
-              budget_tokens: model.thinking.budget_tokens,
-            }
-          : undefined,
         tools: request.tools?.map((t) => AnthropicProvider.parseRequestTool(t)),
         tool_choice: request.tool_choice
           ? AnthropicProvider.parseRequestToolChoice(request.tool_choice)
           : undefined,
-        max_tokens:
-          request.max_tokens ??
-          (model.thinking?.enabled
-            ? model.thinking?.budget_tokens +
-              AnthropicProvider.DEFAULT_MAX_TOKENS
-            : AnthropicProvider.DEFAULT_MAX_TOKENS),
+        max_tokens: AnthropicProvider.resolveMaxTokens(
+          request.max_tokens,
+          level,
+        ),
         temperature: request.temperature,
         top_p: request.top_p,
         stream: true,
       }
 
+      if (level !== undefined) {
+        switch (level) {
+          case 'off':
+            payloadBase.thinking = { type: 'disabled' }
+            break
+          case 'auto':
+            payloadBase.thinking = {
+              type: 'adaptive',
+              display: 'summarized',
+            } as unknown as MessageCreateParamsStreaming['thinking']
+            break
+          default:
+            payloadBase.thinking = {
+              type: 'adaptive',
+              display: 'summarized',
+            } as unknown as MessageCreateParamsStreaming['thinking']
+            payloadBase.output_config = {
+              effort: REASONING_META[level].effort,
+            }
+        }
+      }
+
       const payload = this.applyCustomModelParameters<
         MessageCreateParamsStreaming & Record<string, unknown>
       >(model, {
-        ...payloadBase,
+        ...(this.isPromptCachingEnabled()
+          ? applyAnthropicPromptCache(payloadBase)
+          : payloadBase),
       })
 
-      const stream = (await this.client.messages.create(payload, {
+      const stream = (await runWithRequestTransportForStream({
+        mode: this.requestTransportMode,
+        memoryKey: this.requestTransportMemoryKey,
+        onAutoPromoteTransportMode: this.promoteTransportMode,
         signal: options?.signal,
-        stream: true,
+        createBrowserStream: (signal) =>
+          this.browserClient.messages.create(payload, {
+            signal: signal ?? options?.signal,
+            stream: true,
+          }),
+        createObsidianStream: (signal) =>
+          this.obsidianClient.messages.create(payload, {
+            signal: signal ?? options?.signal,
+            stream: true,
+          }),
+        createNodeStream: (signal) =>
+          this.nodeClient.messages.create(payload, {
+            signal: signal ?? options?.signal,
+            stream: true,
+          }),
       })) as unknown as AsyncIterable<MessageStreamEvent>
 
       return this.streamResponseGenerator(stream)
@@ -269,12 +415,24 @@ https://github.com/glowingjade/obsidian-smart-composer/issues/286`,
       if (chunk.type === 'message_start') {
         messageId = chunk.message.id
         model = chunk.message.model
+        const cacheRead =
+          chunk.message.usage.cache_read_input_tokens ?? undefined
+        const cacheCreation =
+          chunk.message.usage.cache_creation_input_tokens ?? undefined
+        const billedInputTokens =
+          chunk.message.usage.input_tokens +
+          (cacheRead ?? 0) +
+          (cacheCreation ?? 0)
         usage = {
-          prompt_tokens: chunk.message.usage.input_tokens,
+          prompt_tokens: billedInputTokens,
           completion_tokens: chunk.message.usage.output_tokens,
-          total_tokens:
-            chunk.message.usage.input_tokens +
-            chunk.message.usage.output_tokens,
+          total_tokens: billedInputTokens + chunk.message.usage.output_tokens,
+          ...(cacheRead !== undefined
+            ? { cache_read_input_tokens: cacheRead }
+            : {}),
+          ...(cacheCreation !== undefined
+            ? { cache_creation_input_tokens: cacheCreation }
+            : {}),
         }
       } else if (
         chunk.type === 'content_block_start' ||
@@ -291,10 +449,39 @@ https://github.com/glowingjade/obsidian-smart-composer/issues/286`,
       } else if (chunk.type === 'message_delta') {
         // Anthropic streams `message_delta.usage.output_tokens` as the current
         // cumulative output token count, not an incremental delta.
+        //
+        // Newer Anthropic API revisions (and most third-party proxies) finalize
+        // cache accounting in `message_delta.usage` rather than `message_start`,
+        // and also re-send `input_tokens` there. SDK v0.39's MessageDeltaUsage
+        // type only declares `output_tokens`, so we reach through at runtime.
+        const rawUsage = chunk.usage as unknown as {
+          input_tokens?: number | null
+          output_tokens: number
+          cache_read_input_tokens?: number | null
+          cache_creation_input_tokens?: number | null
+        }
+        const cacheRead =
+          rawUsage.cache_read_input_tokens ?? usage.cache_read_input_tokens
+        const cacheCreation =
+          rawUsage.cache_creation_input_tokens ??
+          usage.cache_creation_input_tokens
+        const freshInputTokens =
+          rawUsage.input_tokens ??
+          usage.prompt_tokens -
+            (usage.cache_read_input_tokens ?? 0) -
+            (usage.cache_creation_input_tokens ?? 0)
+        const billedInputTokens =
+          freshInputTokens + (cacheRead ?? 0) + (cacheCreation ?? 0)
         usage = {
-          prompt_tokens: usage.prompt_tokens,
-          completion_tokens: chunk.usage.output_tokens,
-          total_tokens: usage.prompt_tokens + chunk.usage.output_tokens,
+          prompt_tokens: billedInputTokens,
+          completion_tokens: rawUsage.output_tokens,
+          total_tokens: billedInputTokens + rawUsage.output_tokens,
+          ...(cacheRead !== undefined && cacheRead !== null
+            ? { cache_read_input_tokens: cacheRead }
+            : {}),
+          ...(cacheCreation !== undefined && cacheCreation !== null
+            ? { cache_creation_input_tokens: cacheCreation }
+            : {}),
         }
       }
     }
@@ -309,12 +496,41 @@ https://github.com/glowingjade/obsidian-smart-composer/issues/286`,
     }
   }
 
-  static parseRequestMessage(message: RequestMessage): MessageParam | null {
+  // Anthropic 协议要求 role 严格交替（user / assistant）。当 assistant 一次返回
+  // 多个 tool_use 时，下一轮的多条 tool 结果必须打包到同一条 user message 的
+  // content[] 里；否则上游会以
+  // "`tool_use` ids were found without `tool_result` blocks immediately after"
+  // 报 400。这里把映射后相邻的 user 消息合并。
+  protected static mergeAdjacentUserMessages(
+    messages: MessageParam[],
+  ): MessageParam[] {
+    const merged: MessageParam[] = []
+    for (const message of messages) {
+      const prev = merged[merged.length - 1]
+      if (prev && prev.role === 'user' && message.role === 'user') {
+        const prevContent = Array.isArray(prev.content)
+          ? prev.content
+          : [{ type: 'text' as const, text: prev.content }]
+        const nextContent = Array.isArray(message.content)
+          ? message.content
+          : [{ type: 'text' as const, text: message.content }]
+        merged[merged.length - 1] = {
+          role: 'user',
+          content: [...prevContent, ...nextContent],
+        }
+      } else {
+        merged.push(message)
+      }
+    }
+    return merged
+  }
+
+  protected parseRequestMessage(message: RequestMessage): MessageParam | null {
     switch (message.role) {
       case 'user': {
         if (Array.isArray(message.content)) {
           const content = message.content.map(
-            (part): TextBlockParam | ImageBlockParam => {
+            (part): TextBlockParam | ImageBlockParam | DocumentBlockParam => {
               switch (part.type) {
                 case 'text':
                   return { type: 'text', text: part.text }
@@ -332,6 +548,19 @@ https://github.com/glowingjade/obsidian-smart-composer/issues/286`,
                     },
                   }
                 }
+                case 'document': {
+                  // Native PDF support via Anthropic's document block. The
+                  // 'pdf' modality gate upstream guarantees this only reaches
+                  // models that advertise native PDF support.
+                  return {
+                    type: 'document',
+                    source: {
+                      type: 'base64',
+                      media_type: part.mediaType,
+                      data: part.data,
+                    },
+                  }
+                }
               }
             },
           )
@@ -342,22 +571,11 @@ https://github.com/glowingjade/obsidian-smart-composer/issues/286`,
       case 'assistant': {
         const anthropicToolCalls = message.tool_calls?.map(
           (toolCall): ContentBlockParam => {
-            const parsedArgs = (() => {
-              if (toolCall.arguments && toolCall.arguments.length > 0) {
-                try {
-                  return JSON.parse(toolCall.arguments) as unknown
-                } catch {
-                  return {}
-                }
-              }
-              return {}
-            })()
-
             return {
               type: 'tool_use' as const,
               id: toolCall.id,
               name: toolCall.name,
-              input: parsedArgs,
+              input: getToolCallArgumentsObject(toolCall.arguments) ?? {},
             }
           },
         )
@@ -427,6 +645,12 @@ https://github.com/glowingjade/obsidian-smart-composer/issues/286`,
         }
       })
 
+    const cacheRead = response.usage.cache_read_input_tokens ?? undefined
+    const cacheCreation =
+      response.usage.cache_creation_input_tokens ?? undefined
+    const billedInputTokens =
+      response.usage.input_tokens + (cacheRead ?? 0) + (cacheCreation ?? 0)
+
     return {
       id: response.id,
       choices: [
@@ -443,10 +667,15 @@ https://github.com/glowingjade/obsidian-smart-composer/issues/286`,
       model: response.model,
       object: 'chat.completion',
       usage: {
-        prompt_tokens: response.usage.input_tokens,
+        prompt_tokens: billedInputTokens,
         completion_tokens: response.usage.output_tokens,
-        total_tokens:
-          response.usage.input_tokens + response.usage.output_tokens,
+        total_tokens: billedInputTokens + response.usage.output_tokens,
+        ...(cacheRead !== undefined
+          ? { cache_read_input_tokens: cacheRead }
+          : {}),
+        ...(cacheCreation !== undefined
+          ? { cache_creation_input_tokens: cacheCreation }
+          : {}),
       },
     }
   }
@@ -617,7 +846,11 @@ https://github.com/glowingjade/obsidian-smart-composer/issues/286`,
     throw new Error(`Unsupported tool choice: ${JSON.stringify(toolChoice)}`)
   }
 
-  getEmbedding(_model: string, _text: string): Promise<number[]> {
+  getEmbedding(
+    _model: string,
+    _text: string,
+    _options?: { dimensions?: number },
+  ): Promise<number[]> {
     return Promise.reject(
       new Error(
         `Provider ${this.provider.id} does not support embeddings. Please use a different provider.`,

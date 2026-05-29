@@ -1,45 +1,62 @@
 import { Check, CopyIcon, Loader2, Play } from 'lucide-react'
-import { PropsWithChildren, useId, useMemo, useState } from 'react'
+import {
+  PropsWithChildren,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 
 import { useApp } from '../../contexts/app-context'
 import { useLanguage } from '../../contexts/language-context'
 import {
-  isPureSearchReplaceScript,
-  parseSearchReplaceBlocks,
-} from '../../utils/chat/searchReplace'
+  getStreamingTextEditPlanPreviewContent,
+  getTextEditPlanPreviewContent,
+  isTextEditPlanStreamingCandidate,
+  parseTextEditPlan,
+} from '../../core/edits/textEditPlan'
 import { openMarkdownFile } from '../../utils/obsidian'
+import DotLoader from '../common/DotLoader'
 
 import { ObsidianMarkdown } from './ObsidianMarkdown'
+
+const PLAN_CONTENT_TRANSITION_MS = 260
+
+const trimLeadingBlankLines = (value: string): string => {
+  return value.replace(/^(?:\r?\n)+/, '')
+}
 
 export default function MarkdownCodeComponent({
   onApply,
   isApplying,
   activeApplyRequestKey,
-  language,
   filename,
+  generationState,
   children,
 }: PropsWithChildren<{
   onApply: (
     blockToApply: string,
-    mode: 'quick' | 'precise',
     applyRequestKey: string,
+    targetFilePath?: string,
   ) => void
   isApplying: boolean
   activeApplyRequestKey: string | null
-  language?: string
   filename?: string
+  generationState?: 'streaming' | 'completed' | 'aborted' | 'error'
 }>) {
   const app = useApp()
   const { t } = useLanguage()
   const applyRequestKeyBase = useId()
 
   const [copied, setCopied] = useState(false)
-  const quickApplyRequestKey = `${applyRequestKeyBase}:quick`
-  const preciseApplyRequestKey = `${applyRequestKeyBase}:precise`
-  const isQuickApplying =
-    isApplying && activeApplyRequestKey === quickApplyRequestKey
-  const isPreciseApplying =
-    isApplying && activeApplyRequestKey === preciseApplyRequestKey
+  const [isTransitioningToContent, setIsTransitioningToContent] =
+    useState(false)
+  const applyRequestKey = `${applyRequestKeyBase}:apply`
+  const isBlockApplying =
+    isApplying && activeApplyRequestKey === applyRequestKey
+  const transitionTimeoutRef = useRef<number | null>(null)
+  const previousStreamingStatusVisibleRef = useRef(false)
 
   const codeContent = useMemo(() => {
     if (typeof children === 'string') {
@@ -74,27 +91,93 @@ export default function MarkdownCodeComponent({
     return ''
   }, [children])
 
+  const parsedPlan = useMemo(() => {
+    return parseTextEditPlan(codeContent, {
+      requireDocumentType: true,
+    })
+  }, [codeContent])
+
+  const isStreamingPlanCandidate =
+    (generationState === 'streaming' ||
+      generationState === 'aborted' ||
+      generationState === 'error') &&
+    isTextEditPlanStreamingCandidate(codeContent)
+
+  const streamingPreviewContent = useMemo(() => {
+    if (!isStreamingPlanCandidate || parsedPlan) {
+      return ''
+    }
+
+    return getStreamingTextEditPlanPreviewContent(codeContent)
+  }, [codeContent, isStreamingPlanCandidate, parsedPlan])
+
+  const isStreamingPlanStatusVisible =
+    generationState === 'streaming' &&
+    isStreamingPlanCandidate &&
+    !parsedPlan &&
+    streamingPreviewContent.length === 0
+
   const previewContent = useMemo(() => {
-    if (!filename || !isPureSearchReplaceScript(codeContent)) {
+    if (streamingPreviewContent.length > 0) {
+      return streamingPreviewContent
+    }
+
+    if (!parsedPlan) {
       return codeContent
     }
 
-    const blocks = parseSearchReplaceBlocks(codeContent)
-    if (blocks.length === 0) {
-      return codeContent
+    const rendered = getTextEditPlanPreviewContent(parsedPlan)
+    return rendered || ''
+  }, [codeContent, parsedPlan, streamingPreviewContent])
+
+  const streamingStatusLabel = useMemo(() => {
+    return t('chat.codeBlock.locatingTarget', '正在定位待替换内容...')
+  }, [t])
+
+  useEffect(() => {
+    const wasStreamingStatusVisible = previousStreamingStatusVisibleRef.current
+
+    if (transitionTimeoutRef.current !== null) {
+      window.clearTimeout(transitionTimeoutRef.current)
+      transitionTimeoutRef.current = null
     }
 
-    const rendered = blocks
-      .map((block) => block.replace)
-      .filter((text) => text.trim().length > 0)
-      .join('\n\n')
+    if (isStreamingPlanStatusVisible) {
+      setIsTransitioningToContent(false)
+    } else if (wasStreamingStatusVisible) {
+      setIsTransitioningToContent(true)
+      transitionTimeoutRef.current = window.setTimeout(() => {
+        setIsTransitioningToContent(false)
+        transitionTimeoutRef.current = null
+      }, PLAN_CONTENT_TRANSITION_MS)
+    }
 
-    return rendered || codeContent
-  }, [codeContent, filename])
+    previousStreamingStatusVisibleRef.current = isStreamingPlanStatusVisible
+
+    return () => {
+      if (transitionTimeoutRef.current !== null) {
+        window.clearTimeout(transitionTimeoutRef.current)
+        transitionTimeoutRef.current = null
+      }
+    }
+  }, [isStreamingPlanStatusVisible])
+
+  const shouldOverlayPlanPanels =
+    isStreamingPlanStatusVisible || isTransitioningToContent
+  const renderedPreviewContent =
+    parsedPlan && previewContent.length === 0
+      ? t('chat.codeBlock.emptyPlanPreview', 'This plan removes content')
+      : previewContent
 
   const handleCopy = async () => {
+    const copyPayload = parsedPlan
+      ? trimLeadingBlankLines(previewContent)
+      : streamingPreviewContent.length > 0
+        ? trimLeadingBlankLines(streamingPreviewContent)
+        : codeContent
+
     try {
-      await navigator.clipboard.writeText(codeContent)
+      await navigator.clipboard.writeText(copyPayload)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     } catch (err) {
@@ -109,20 +192,21 @@ export default function MarkdownCodeComponent({
   }
 
   return (
-    <div className="smtcmp-code-block">
-      <div className="smtcmp-code-block-header">
+    <div className="yolo-code-block">
+      <div className="yolo-code-block-header">
         {filename && (
-          <div
-            className="smtcmp-code-block-header-filename"
+          <button
+            type="button"
+            className="yolo-code-block-header-filename"
             onClick={handleOpenFile}
           >
             {filename}
-          </div>
+          </button>
         )}
-        <div className="smtcmp-code-block-header-button-container">
+        <div className="yolo-code-block-header-button-container">
           <button
             type="button"
-            className="clickable-icon smtcmp-code-block-header-button"
+            className="clickable-icon yolo-code-block-header-button"
             onClick={() => {
               void handleCopy()
             }}
@@ -141,58 +225,73 @@ export default function MarkdownCodeComponent({
           </button>
           <button
             type="button"
-            className="clickable-icon smtcmp-code-block-header-button"
+            className="clickable-icon yolo-code-block-header-button"
             onClick={
-              isApplying && !isQuickApplying
+              parsedPlan && isApplying && !isBlockApplying
                 ? undefined
                 : () => {
-                    onApply(codeContent, 'quick', quickApplyRequestKey)
+                    if (!parsedPlan) {
+                      return
+                    }
+                    onApply(codeContent, applyRequestKey, filename)
                   }
             }
-            aria-disabled={isApplying && !isQuickApplying}
+            aria-disabled={parsedPlan ? isApplying && !isBlockApplying : true}
+            hidden={!parsedPlan}
           >
-            {isQuickApplying ? (
+            {isBlockApplying ? (
               <>
-                <Loader2 className="smtcmp-spinner" size={14} />
+                <Loader2 className="yolo-spinner" size={14} />
                 <span>{t('chat.codeBlock.stopApplying', 'Stop apply')}</span>
               </>
             ) : (
               <>
                 <Play size={10} />
-                <span>{t('chat.codeBlock.applyQuick', 'Apply (fast)')}</span>
-              </>
-            )}
-          </button>
-          <button
-            type="button"
-            className="clickable-icon smtcmp-code-block-header-button"
-            onClick={
-              isApplying && !isPreciseApplying
-                ? undefined
-                : () => {
-                    onApply(codeContent, 'precise', preciseApplyRequestKey)
-                  }
-            }
-            aria-disabled={isApplying && !isPreciseApplying}
-          >
-            {isPreciseApplying ? (
-              <>
-                <Loader2 className="smtcmp-spinner" size={14} />
-                <span>{t('chat.codeBlock.stopApplying', 'Stop apply')}</span>
-              </>
-            ) : (
-              <>
-                <Play size={10} />
-                <span>
-                  {t('chat.codeBlock.applyPrecise', 'Apply (precise)')}
-                </span>
+                <span>{t('chat.codeBlock.apply', 'Apply')}</span>
               </>
             )}
           </button>
         </div>
       </div>
-      <div className="smtcmp-code-block-obsidian-markdown">
-        <ObsidianMarkdown content={previewContent} scale="sm" />
+      <div
+        className={`yolo-code-block-obsidian-markdown${
+          shouldOverlayPlanPanels ? ' is-plan-transitioning' : ''
+        }`}
+      >
+        {(isStreamingPlanStatusVisible || isTransitioningToContent) && (
+          <div
+            className={`yolo-plan-preview-panel yolo-plan-preview-panel--streaming${
+              isTransitioningToContent ? ' is-exiting' : ''
+            }`}
+            aria-live="polite"
+          >
+            <div className="yolo-plan-streaming-preview">
+              <div className="yolo-plan-streaming-preview-header">
+                <span className="yolo-plan-streaming-preview-status-dot" />
+                <span className="yolo-plan-streaming-preview-title">
+                  {streamingStatusLabel}
+                </span>
+                <DotLoader
+                  variant="dots"
+                  className="yolo-plan-streaming-preview-loader"
+                />
+              </div>
+              <div className="yolo-plan-streaming-preview-body" aria-hidden>
+                <span className="yolo-plan-streaming-preview-line is-wide" />
+                <span className="yolo-plan-streaming-preview-line is-short" />
+              </div>
+            </div>
+          </div>
+        )}
+        {(!isStreamingPlanStatusVisible || isTransitioningToContent) && (
+          <div
+            className={`yolo-plan-preview-panel yolo-plan-preview-panel--resolved${
+              isTransitioningToContent ? ' is-entering' : ''
+            }`}
+          >
+            <ObsidianMarkdown content={renderedPreviewContent} scale="sm" />
+          </div>
+        )}
       </div>
     </div>
   )

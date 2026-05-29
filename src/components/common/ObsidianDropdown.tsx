@@ -31,6 +31,7 @@ export function ObsidianDropdown({
   const [dropdownComponent, setDropdownComponent] =
     useState<DropdownComponent | null>(null)
   const onChangeRef = useRef(onChange)
+  const isSyncingRef = useRef(false)
 
   useEffect(() => {
     if (setting) {
@@ -59,13 +60,19 @@ export function ObsidianDropdown({
 
   useEffect(() => {
     if (!dropdownComponent) return
-    dropdownComponent.onChange((v) => onChangeRef.current(v))
+    dropdownComponent.onChange((v) => {
+      if (isSyncingRef.current) {
+        return
+      }
+      onChangeRef.current(v)
+    })
   }, [dropdownComponent])
 
   useEffect(() => {
     if (!dropdownComponent) return
 
     const selectEl = dropdownComponent.selectEl
+    isSyncingRef.current = true
     selectEl.empty()
 
     if (groupedOptions && groupedOptions.length > 0) {
@@ -73,12 +80,12 @@ export function ObsidianDropdown({
         if (!group || group.options.length === 0) return
         const optgroupEl = document.createElement('optgroup')
         optgroupEl.label = group.label
-        optgroupEl.classList.add('smtcmp-obsidian-dropdown-optgroup')
+        optgroupEl.classList.add('yolo-obsidian-dropdown-optgroup')
         group.options.forEach(({ value: optionValue, label: optionLabel }) => {
           const optionEl = document.createElement('option')
           optionEl.value = optionValue
           optionEl.textContent = optionLabel
-          optionEl.classList.add('smtcmp-obsidian-dropdown-option')
+          optionEl.classList.add('yolo-obsidian-dropdown-option')
           optgroupEl.appendChild(optionEl)
         })
         selectEl.appendChild(optgroupEl)
@@ -89,6 +96,9 @@ export function ObsidianDropdown({
 
     dropdownComponent.setValue(value)
     selectEl.disabled = !!disabled
+    queueMicrotask(() => {
+      isSyncingRef.current = false
+    })
   }, [dropdownComponent, options, groupedOptions, value, disabled])
 
   return <div ref={containerRef} />

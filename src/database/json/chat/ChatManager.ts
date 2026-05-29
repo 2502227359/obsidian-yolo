@@ -2,25 +2,47 @@ import { App, normalizePath } from 'obsidian'
 import path from 'path-browserify'
 import { v4 as uuidv4 } from 'uuid'
 
+import { ensureJsonDbRootDir } from '../../../core/paths/yoloManagedData'
+import { getYoloJsonDbRootDir } from '../../../core/paths/yoloPaths'
 import { AbstractJsonRepository } from '../base'
-import { CHAT_DIR, ROOT_DIR } from '../constants'
+import { CHAT_DIR } from '../constants'
 import { EmptyChatTitleException } from '../exception'
 
+import { deleteEditReviewSnapshotStore } from './editReviewSnapshotStore'
+import { deletePromptSnapshotStore } from './promptSnapshotStore'
 import {
   CHAT_SCHEMA_VERSION,
   ChatConversation,
   ChatConversationMetadata,
 } from './types'
-import { deletePromptSnapshotStore } from './promptSnapshotStore'
 
 export class ChatManager extends AbstractJsonRepository<
   ChatConversation,
   ChatConversationMetadata
 > {
   private static readonly INDEX_FILE_NAME = 'chat_index.json'
+  private readonly settings?: {
+    yolo?: {
+      baseDir?: string
+    }
+  } | null
 
-  constructor(app: App) {
-    super(app, `${ROOT_DIR}/${CHAT_DIR}`)
+  constructor(
+    app: App,
+    settings?: {
+      yolo?: {
+        baseDir?: string
+      }
+    } | null,
+  ) {
+    const normalizedSettings = settings ?? null
+    super(app, `${getYoloJsonDbRootDir(settings)}/${CHAT_DIR}`, {
+      prepareDataDir: async () => {
+        const rootDir = await ensureJsonDbRootDir(app, normalizedSettings)
+        return normalizePath(`${rootDir}/${CHAT_DIR}`)
+      },
+    })
+    this.settings = normalizedSettings
   }
 
   protected generateFileName(chat: ChatConversation): string {
@@ -145,7 +167,8 @@ export class ChatManager extends AbstractJsonRepository<
     if (!targetMetadata) return false
 
     await this.delete(targetMetadata.fileName)
-    await deletePromptSnapshotStore(this.app, id)
+    await deletePromptSnapshotStore(this.app, id, this.settings)
+    await deleteEditReviewSnapshotStore(this.app, id, this.settings)
     await this.removeFromIndex(id)
     return true
   }
@@ -173,7 +196,7 @@ export class ChatManager extends AbstractJsonRepository<
       const parsed = JSON.parse(content) as ChatConversationMetadata[]
       return Array.isArray(parsed) ? parsed : null
     } catch (error) {
-      console.error('[Smart Composer] Failed to read chat index', error)
+      console.error('[YOLO] Failed to read chat index', error)
       return null
     }
   }

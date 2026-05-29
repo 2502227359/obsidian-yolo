@@ -4,61 +4,148 @@ import {
   Editor,
   MarkdownView,
   Notice,
+  Platform,
   Plugin,
   TFile,
   TFolder,
+  getLanguage,
   normalizePath,
 } from 'obsidian'
-import { getLanguage } from 'obsidian'
 
 import { ChatView } from './ChatView'
-import { ChatProps } from './components/chat-view/Chat'
 import { InstallerUpdateRequiredModal } from './components/modals/InstallerUpdateRequiredModal'
 import { CHAT_VIEW_TYPE } from './constants'
+import { BAKED_PLUGIN_VERSION } from './constants/bakedVersion'
+import { createAgentConversationPersistence } from './core/agent/conversationPersistence'
 import { ensureDefaultAssistantInSettings } from './core/agent/default-assistant'
-import { AgentService } from './core/agent/service'
+import { AgentConversationRunSummary, AgentService } from './core/agent/service'
+import {
+  clearChatGPTOAuthService,
+  getChatGPTOAuthService as getChatGPTOAuthServiceRuntime,
+  initializeChatGPTOAuthRuntime,
+} from './core/auth/chatgptOAuthRuntime'
+import {
+  clearGeminiOAuthService,
+  getGeminiOAuthService as getGeminiOAuthServiceRuntime,
+  initializeGeminiOAuthRuntime,
+} from './core/auth/geminiOAuthRuntime'
+import {
+  clearQwenOAuthService,
+  getQwenOAuthService as getQwenOAuthServiceRuntime,
+  initializeQwenOAuthRuntime,
+} from './core/auth/qwenOAuthRuntime'
+import {
+  BackgroundActivity,
+  BackgroundActivityAction,
+  BackgroundActivityRegistry,
+} from './core/background/backgroundActivityRegistry'
+import { setLLMDebugCaptureEnabled } from './core/llm/debugCapture'
+import { clearRequestTransportMemory } from './core/llm/requestTransport'
 import { McpCoordinator } from './core/mcp/mcpCoordinator'
 import type { McpManager } from './core/mcp/mcpManager'
+import { AgentNotificationCoordinator } from './core/notifications/agentNotificationCoordinator'
+import { NotificationService } from './core/notifications/notificationService'
+import {
+  type YoloDataMeta,
+  extractYoloDataMeta,
+  readVaultDataJson,
+  relocateYoloManagedData,
+  removeVaultDataJson,
+  stampYoloDataMeta,
+} from './core/paths/yoloManagedData'
 import { RagAutoUpdateService } from './core/rag/ragAutoUpdateService'
 import { RagCoordinator } from './core/rag/ragCoordinator'
 import type { RAGEngine } from './core/rag/ragEngine'
+import {
+  RagIndexBusyError,
+  RagIndexRunSnapshot,
+  RagIndexService,
+} from './core/rag/ragIndexService'
+import {
+  type UpdateCheckResult,
+  checkForUpdate,
+} from './core/update/updateChecker'
 import { DatabaseManager } from './database/DatabaseManager'
 import { PGLiteAbortedException } from './database/exception'
+import { ChatManager } from './database/json/chat/ChatManager'
+import { pruneImageCache } from './database/json/chat/imageCacheStore'
+import { prunePdfTextCache } from './database/json/chat/pdfTextCacheStore'
 import type { VectorManager } from './database/modules/vector/VectorManager'
+import { PGliteRuntimeManager } from './database/runtime/PGliteRuntimeManager'
+import { PGLITE_RUNTIME_VERSION } from './database/runtime/pgliteRuntimeMetadata'
+import {
+  ChatLeafPlacement,
+  ChatLeafSessionManager,
+} from './features/chat/chatLeafSessionManager'
 import { ChatViewNavigator } from './features/chat/chatViewNavigator'
+import { NewTabEmptyStateEnhancer } from './features/chat/newTabEmptyStateEnhancer'
+import { ExportConfigModal } from './features/config-transfer/components/ExportConfigModal'
+import { ImportConfigModal } from './features/config-transfer/components/ImportConfigModal'
 import { DiffReviewController } from './features/editor/diff-review/diffReviewController'
+import {
+  buildFullReviewBlocks,
+  countModifiedBlocks,
+} from './features/editor/diff-review/review-model'
 import type { InlineSuggestionGhostPayload } from './features/editor/inline-suggestion/inlineSuggestion'
 import { InlineSuggestionController } from './features/editor/inline-suggestion/inlineSuggestionController'
+import type { QuickAskSelectionScope } from './features/editor/quick-ask/quickAsk.types'
+import type { QuickAskLaunchMode } from './features/editor/quick-ask/quickAsk.types'
 import { QuickAskController } from './features/editor/quick-ask/quickAskController'
+import { resolveSelectionChatActions } from './features/editor/selection-chat/resolveSelectionChatActions'
 import { SelectionChatController } from './features/editor/selection-chat/selectionChatController'
+import { selectionHighlightController } from './features/editor/selection-highlight/selectionHighlightController'
 import {
   SmartSpaceController,
   SmartSpaceDraftState,
 } from './features/editor/smart-space/smartSpaceController'
 import { TabCompletionController } from './features/editor/tab-completion/tabCompletionController'
 import { WriteAssistController } from './features/editor/write-assist/writeAssistController'
+import { enablePdfScreenshotFeature } from './features/pdf-screenshot'
+import { isUntitledConversationTitle } from './hooks/useChatHistory'
 import { Language, createTranslationFunction } from './i18n'
 import {
-  SmartComposerSettings,
-  smartComposerSettingsSchema,
+  YoloSettings,
+  yoloSettingsSchema,
 } from './settings/schema/setting.types'
-import { parseSmartComposerSettings } from './settings/schema/settings'
-import { SmartComposerSettingTab } from './settings/SettingTab'
+import {
+  normalizeYoloSettingsReferences,
+  parseYoloSettings,
+} from './settings/schema/settings'
+import { YoloSettingTab } from './settings/SettingTab'
 import type { ApplyViewState } from './types/apply-view.types'
 import { ConversationOverrideSettings } from './types/conversation-settings.types'
-import type { Mentionable } from './types/mentionable'
+import type {
+  Mentionable,
+  MentionableBlockData,
+  MentionableImage,
+} from './types/mentionable'
 import { MentionableFile, MentionableFolder } from './types/mentionable'
+import { applyKnownMaxContextTokensToChatModels } from './utils/llm/model-capability-registry'
+import { getMentionableBlockData } from './utils/obsidian'
 import { ensureBufferByteLengthCompat } from './utils/runtime/ensureBufferByteLengthCompat'
 
-export default class SmartComposerPlugin extends Plugin {
-  settings: SmartComposerSettings
-  initialChatProps?: ChatProps // TODO: change this to use view state like ApplyView
-  settingsChangeListeners: ((newSettings: SmartComposerSettings) => void)[] = []
+const STARTUP_GRACE_MS = 30 * 1000
+
+export default class YoloPlugin extends Plugin {
+  settings: YoloSettings
+  settingsChangeListeners: ((newSettings: YoloSettings) => void)[] = []
+  private deviceId: string | null = null
+  private currentSettingsMeta: YoloDataMeta | null = null
+  updateCheckResult: UpdateCheckResult | null = null
+  private hasCheckedForUpdate = false
+  private updateBannerDismissed = false
+  private updateCheckListeners: (() => void)[] = []
+  installationIncompleteDetail: {
+    bakedVersion: string
+    manifestVersion: string
+  } | null = null
+  private installationIncompleteBannerDismissed = false
+  private installationIncompleteListeners: (() => void)[] = []
   mcpManager: McpManager | null = null
   dbManager: DatabaseManager | null = null
   private dbManagerInitPromise: Promise<DatabaseManager> | null = null
   private timeoutIds: ReturnType<typeof setTimeout>[] = [] // Use ReturnType instead of number
-  private pgliteResourcePath?: string
+  private pgliteRuntimeManager: PGliteRuntimeManager | null = null
   private isContinuationInProgress = false
   private activeAbortControllers: Set<AbortController> = new Set()
   private tabCompletionController: TabCompletionController | null = null
@@ -68,9 +155,16 @@ export default class SmartComposerPlugin extends Plugin {
   private smartSpaceController: SmartSpaceController | null = null
   // Selection chat state
   private selectionChatController: SelectionChatController | null = null
+  // Obsidian command IDs (un-namespaced) registered for selection-chat shortcuts.
+  // Tracked so we can drop stale commands when the user edits the action list.
+  private registeredSelectionChatCommandIds: string[] = []
+  private selectionChatCommandsFingerprint: string | null = null
   private chatViewNavigator: ChatViewNavigator | null = null
+  private chatLeafSessionManager: ChatLeafSessionManager | null = null
+  private newTabEmptyStateEnhancer: NewTabEmptyStateEnhancer | null = null
   private ragAutoUpdateService: RagAutoUpdateService | null = null
   private ragCoordinator: RagCoordinator | null = null
+  private ragIndexService: RagIndexService | null = null
   private mcpCoordinator: McpCoordinator | null = null
   private writeAssistController: WriteAssistController | null = null
   // Model list cache for provider model fetching
@@ -79,6 +173,26 @@ export default class SmartComposerPlugin extends Plugin {
   // Quick Ask state
   private quickAskController: QuickAskController | null = null
   private agentService: AgentService | null = null
+  private agentNotificationCoordinator: AgentNotificationCoordinator | null =
+    null
+  private backgroundActivityRegistry: BackgroundActivityRegistry | null = null
+  private backgroundStatusBarItem: HTMLElement | null = null
+  private backgroundStatusBarRing: HTMLElement | null = null
+  private backgroundStatusBarLabel: HTMLElement | null = null
+  private backgroundStatusPanel: HTMLElement | null = null
+  private backgroundStatusPanelList: HTMLElement | null = null
+  private backgroundStatusPanelEmpty: HTMLElement | null = null
+  private latestBackgroundActivities = new Map<string, BackgroundActivity>()
+  private backgroundStatusPanelRenderVersion = 0
+  private backgroundStatusPanelItems = new Map<
+    string,
+    {
+      item: HTMLElement
+      title: HTMLElement
+      detail: HTMLElement
+      indicator: HTMLElement
+    }
+  >()
 
   getSmartSpaceDraftState(): SmartSpaceDraftState {
     return this.smartSpaceDraftState
@@ -88,9 +202,28 @@ export default class SmartComposerPlugin extends Plugin {
     this.smartSpaceDraftState = state
   }
 
+  getChatLeafSessionManager(): ChatLeafSessionManager {
+    if (!this.chatLeafSessionManager) {
+      this.chatLeafSessionManager = new ChatLeafSessionManager(this.app)
+    }
+    return this.chatLeafSessionManager
+  }
+
+  private getModelListCacheKey(
+    providerId: string,
+    scope: 'chat' | 'embedding',
+  ): string {
+    return `${providerId}::${scope}`
+  }
+
   // Get cached model list for a provider
-  getCachedModelList(providerId: string): string[] | null {
-    const cached = this.modelListCache.get(providerId)
+  getCachedModelList(
+    providerId: string,
+    scope: 'chat' | 'embedding' = 'chat',
+  ): string[] | null {
+    const cached = this.modelListCache.get(
+      this.getModelListCacheKey(providerId, scope),
+    )
     if (cached) {
       return cached.models
     }
@@ -98,8 +231,12 @@ export default class SmartComposerPlugin extends Plugin {
   }
 
   // Set model list cache for a provider
-  setCachedModelList(providerId: string, models: string[]): void {
-    this.modelListCache.set(providerId, {
+  setCachedModelList(
+    providerId: string,
+    models: string[],
+    scope: 'chat' | 'embedding' = 'chat',
+  ): void {
+    this.modelListCache.set(this.getModelListCacheKey(providerId, scope), {
       models,
       timestamp: Date.now(),
     })
@@ -110,45 +247,147 @@ export default class SmartComposerPlugin extends Plugin {
     this.modelListCache.clear()
   }
 
-  private resolvePgliteResourcePath(): string {
-    if (!this.pgliteResourcePath) {
-      // manifest.dir 已经包含完整的插件目录路径（相对于 vault）
-      // 例如：.obsidian/plugins/obsidian-smart-composer 或 .obsidian/plugins/yolo
-      const pluginDir = this.manifest.dir
-      if (pluginDir) {
-        this.pgliteResourcePath = normalizePath(`${pluginDir}/vendor/pglite`)
-      } else {
-        // 如果 manifest.dir 不存在，使用 manifest.id 作为后备
-        const configDir = this.app.vault.configDir
-        this.pgliteResourcePath = normalizePath(
-          `${configDir}/plugins/${this.manifest.id}/vendor/pglite`,
-        )
+  getChatGPTOAuthService(providerId = 'chatgpt-oauth') {
+    return (
+      getChatGPTOAuthServiceRuntime(providerId) ??
+      initializeChatGPTOAuthRuntime(this.app, this.manifest.id, providerId)
+    )
+  }
+
+  async getChatGPTOAuthStatus(providerId = 'chatgpt-oauth'): Promise<{
+    connected: boolean
+    accountId?: string
+    expiresAt?: number
+  }> {
+    const credential =
+      await this.getChatGPTOAuthService(providerId).getUsableCredential()
+    if (!credential) {
+      return { connected: false }
+    }
+
+    return {
+      connected: true,
+      ...(credential.accountId ? { accountId: credential.accountId } : {}),
+      expiresAt: credential.expiresAt,
+    }
+  }
+
+  async disconnectChatGPTOAuthAccount(
+    providerId = 'chatgpt-oauth',
+  ): Promise<void> {
+    await this.getChatGPTOAuthService(providerId).clearCredential()
+  }
+
+  clearChatGPTOAuthRuntime(providerId: string): void {
+    clearChatGPTOAuthService(providerId)
+  }
+
+  getGeminiOAuthService(providerId = 'gemini-oauth') {
+    return (
+      getGeminiOAuthServiceRuntime(providerId) ??
+      initializeGeminiOAuthRuntime(this.app, this.manifest.id, providerId)
+    )
+  }
+
+  async getGeminiOAuthStatus(providerId = 'gemini-oauth'): Promise<{
+    connected: boolean
+    email?: string
+    expiresAt?: number
+    projectId?: string
+  }> {
+    const credential =
+      await this.getGeminiOAuthService(providerId).getUsableCredential()
+    if (!credential) {
+      return { connected: false }
+    }
+
+    return {
+      connected: true,
+      ...(credential.email ? { email: credential.email } : {}),
+      ...(credential.managedProjectId || credential.projectId
+        ? {
+            projectId: credential.managedProjectId ?? credential.projectId,
+          }
+        : {}),
+      expiresAt: credential.expiresAt,
+    }
+  }
+
+  async disconnectGeminiOAuthAccount(
+    providerId = 'gemini-oauth',
+  ): Promise<void> {
+    await this.getGeminiOAuthService(providerId).clearCredential()
+  }
+
+  clearGeminiOAuthRuntime(providerId: string): void {
+    clearGeminiOAuthService(providerId)
+  }
+
+  getQwenOAuthService(providerId = 'qwen-oauth') {
+    return (
+      getQwenOAuthServiceRuntime(providerId) ??
+      initializeQwenOAuthRuntime(this.app, this.manifest.id, providerId)
+    )
+  }
+
+  async getQwenOAuthStatus(providerId = 'qwen-oauth'): Promise<{
+    connected: boolean
+    expiresAt?: number
+    resourceUrl?: string
+  }> {
+    const credential =
+      await this.getQwenOAuthService(providerId).getUsableCredential()
+    if (!credential) {
+      return { connected: false }
+    }
+
+    return {
+      connected: true,
+      resourceUrl: credential.resourceUrl,
+      expiresAt: credential.expiresAt,
+    }
+  }
+
+  async disconnectQwenOAuthAccount(providerId = 'qwen-oauth'): Promise<void> {
+    await this.getQwenOAuthService(providerId).clearCredential()
+  }
+
+  clearQwenOAuthRuntime(providerId: string): void {
+    clearQwenOAuthService(providerId)
+  }
+
+  private syncOAuthRuntimesFromSettings(
+    settings: Pick<YoloSettings, 'providers'> = this.settings,
+  ): void {
+    for (const provider of settings.providers) {
+      if (provider.presetType === 'chatgpt-oauth') {
+        this.getChatGPTOAuthService(provider.id)
+      }
+      if (provider.presetType === 'gemini-oauth') {
+        this.getGeminiOAuthService(provider.id)
+      }
+      if (provider.presetType === 'qwen-oauth') {
+        this.getQwenOAuthService(provider.id)
       }
     }
-    return this.pgliteResourcePath
+  }
+
+  getPGliteRuntimeManager(): PGliteRuntimeManager {
+    if (!this.pgliteRuntimeManager) {
+      this.pgliteRuntimeManager = new PGliteRuntimeManager({
+        app: this.app,
+        pluginId: this.manifest.id,
+        pluginDir: this.manifest.dir
+          ? normalizePath(this.manifest.dir)
+          : undefined,
+        runtimeVersion: PGLITE_RUNTIME_VERSION,
+      })
+    }
+
+    return this.pgliteRuntimeManager
   }
 
   // Compute a robust panel anchor position just below the caret line
-  private getCaretPanelPosition(
-    editor: Editor,
-    dy = 8,
-  ): { x: number; y: number } | undefined {
-    try {
-      const view = this.getEditorView(editor)
-      if (!view) return undefined
-      const head = view.state.selection.main.head
-      const rect = view.coordsAtPos(head)
-      if (!rect) return undefined
-      const base = typeof rect.bottom === 'number' ? rect.bottom : rect.top
-      if (typeof base !== 'number') return undefined
-      const y = base + dy
-      return { x: rect.left, y }
-    } catch {
-      // ignore
-    }
-    return undefined
-  }
-
   private getSmartSpaceController(): SmartSpaceController {
     if (!this.smartSpaceController) {
       this.smartSpaceController = new SmartSpaceController({
@@ -194,18 +433,62 @@ export default class SmartComposerPlugin extends Plugin {
   }
 
   // Quick Ask methods
-  private closeQuickAsk() {
-    this.getQuickAskController().close()
+  private showQuickAsk(editor: Editor, view: EditorView) {
+    const selectionOptions = this.getQuickAskSelectionOptions(editor)
+    if (selectionOptions) {
+      this.getQuickAskController().showWithOptions(
+        editor,
+        view,
+        selectionOptions,
+      )
+      return
+    }
+
+    this.getQuickAskController().show(editor, view)
   }
 
-  private showQuickAsk(editor: Editor, view: EditorView) {
-    this.getQuickAskController().show(editor, view)
+  private getQuickAskSelectionOptions(editor: Editor) {
+    const selectedText = editor.getSelection()
+    if (!selectedText || selectedText.trim().length === 0) {
+      return undefined
+    }
+
+    const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView)
+    if (!markdownView) {
+      return undefined
+    }
+
+    const data = getMentionableBlockData(editor, markdownView)
+    if (!data) {
+      return undefined
+    }
+
+    const mentionable = {
+      type: 'block',
+      ...data,
+      source: 'selection',
+    } as const
+
+    return {
+      initialMentionables: [mentionable],
+      editContextText: selectedText,
+      editSelectionFrom: editor.getCursor('from'),
+      selectionScope: {
+        mentionable,
+        selectionFrom: editor.getCursor('from'),
+      } satisfies QuickAskSelectionScope,
+    }
   }
 
   private showQuickAskWithAutoSend(
     editor: Editor,
     view: EditorView,
-    options: { prompt: string; mentionables: Mentionable[] },
+    options: {
+      prompt: string
+      mentionables: Mentionable[]
+      selectionScope?: QuickAskSelectionScope
+      initialAssistantId?: string
+    },
   ) {
     this.getQuickAskController().showWithAutoSend(editor, view, options)
   }
@@ -215,11 +498,14 @@ export default class SmartComposerPlugin extends Plugin {
     view: EditorView,
     options: {
       initialPrompt?: string
-      initialMode?: 'ask' | 'edit' | 'edit-direct'
+      initialMentionables?: Mentionable[]
+      initialMode?: QuickAskLaunchMode
       initialInput?: string
       editContextText?: string
       editSelectionFrom?: { line: number; ch: number }
+      selectionScope?: QuickAskSelectionScope
       autoSend?: boolean
+      initialAssistantId?: string
     },
   ) {
     this.getQuickAskController().showWithOptions(editor, view, options)
@@ -242,10 +528,37 @@ export default class SmartComposerPlugin extends Plugin {
           this.showQuickAskWithOptions(editor, view, options),
         showQuickAskWithAutoSend: (editor, view, options) =>
           this.showQuickAskWithAutoSend(editor, view, options),
-        openChatWithSelectionAndPrefill: async (selectedBlock, text) => {
+        showQuickAskFromPdf: (args) =>
+          this.getQuickAskController().showFromPdf(args),
+        pruneOrphanedQuickAskPdfInstance: (activePdfLeaves) =>
+          this.getQuickAskController().pruneOrphanedPdfInstance(
+            activePdfLeaves,
+          ),
+        openChatWithSelectionAndPrefill: async (
+          selectedBlock,
+          text,
+          assistantId,
+        ) => {
           await this.getChatViewNavigator().openChatWithSelectionAndPrefill(
             selectedBlock,
             text,
+            assistantId,
+          )
+        },
+        addSelectionToSidebarChat: async (selectedBlock) => {
+          await this.getChatViewNavigator().addSelectionBlockToChat(
+            selectedBlock,
+          )
+        },
+        openChatWithSelectionAndSend: async (
+          selectedBlock,
+          text,
+          assistantId,
+        ) => {
+          await this.getChatViewNavigator().openChatWithSelectionAndSend(
+            selectedBlock,
+            text,
+            assistantId,
           )
         },
         isSmartSpaceOpen: () => this.smartSpaceController?.isOpen() ?? false,
@@ -256,6 +569,71 @@ export default class SmartComposerPlugin extends Plugin {
 
   private initializeSelectionChat() {
     this.getSelectionChatController().initialize()
+  }
+
+  /**
+   * Mirror the user's Cursor Chat 快捷指令 list into Obsidian commands so they
+   * can be assigned hotkeys or surfaced by third-party menu/launcher plugins.
+   * Each call fully rebuilds the set: previously-registered command IDs are
+   * removed first, then the current resolved list is re-registered. Action IDs
+   * are uuid-stable, so user-bound hotkeys persist across label/instruction
+   * edits.
+   */
+  private syncSelectionChatCommands() {
+    const actions = resolveSelectionChatActions(
+      this.settings,
+      (key, fallback) => this.t(key, fallback),
+    )
+    const fingerprint = JSON.stringify(
+      actions.map((a) => [
+        a.id,
+        a.label,
+        a.instruction,
+        a.mode,
+        a.rewriteBehavior,
+        a.assistantId,
+      ]),
+    )
+    if (fingerprint === this.selectionChatCommandsFingerprint) {
+      return
+    }
+    this.selectionChatCommandsFingerprint = fingerprint
+
+    const commandsApi = (
+      this.app as unknown as {
+        commands: { removeCommand: (id: string) => void }
+      }
+    ).commands
+    const pluginId = this.manifest.id
+
+    for (const id of this.registeredSelectionChatCommandIds) {
+      commandsApi.removeCommand(`${pluginId}:${id}`)
+    }
+    this.registeredSelectionChatCommandIds = []
+
+    for (const action of actions) {
+      const commandId = `selection-chat-action:${action.id}`
+      this.addCommand({
+        id: commandId,
+        name: `[Cursor Chat] ${action.label}`,
+        editorCallback: (editor: Editor) => {
+          const selected = editor.getSelection()
+          if (!selected || selected.trim().length === 0) {
+            new Notice('请先选中文本')
+            return
+          }
+          void this.getSelectionChatController().executeAction(
+            action.id,
+            editor,
+            action.instruction,
+            action.mode,
+            action.rewriteBehavior,
+            action.assistantId,
+          )
+        },
+      })
+      this.registeredSelectionChatCommandIds.push(commandId)
+    }
   }
 
   private getChatViewNavigator(): ChatViewNavigator {
@@ -270,11 +648,44 @@ export default class SmartComposerPlugin extends Plugin {
       this.ragAutoUpdateService = new RagAutoUpdateService({
         getSettings: () => this.settings,
         setSettings: (settings) => this.setSettings(settings),
-        getRagEngine: () => this.getRagCoordinator().getRagEngine(),
-        t: (key, fallback) => this.t(key, fallback),
+        runIndex: (request) =>
+          this.getRagIndexService().runIndex({
+            mode: 'sync',
+            scope: request,
+            trigger: 'auto',
+            retryPolicy: 'transient',
+          }),
+        markRetryScheduled: (input) =>
+          this.getRagIndexService().markRetryScheduled({
+            mode: 'sync',
+            retryAt: input.retryAt,
+            failureMessage: input.failureMessage,
+          }),
+        clearRetryScheduled: () =>
+          this.getRagIndexService().clearRetryScheduled(),
       })
     }
     return this.ragAutoUpdateService
+  }
+
+  private getRagIndexService(): RagIndexService {
+    if (!this.ragIndexService) {
+      this.ragIndexService = new RagIndexService({
+        app: this.app,
+        getRagEngine: () => this.getRagCoordinator().getRagEngine(),
+        activityRegistry: this.getBackgroundActivityRegistry(),
+        isRagEnabled: () => !!this.settings?.ragOptions?.enabled,
+        t: (key, fallback) => this.t(key, fallback),
+      })
+    }
+    return this.ragIndexService
+  }
+
+  private getBackgroundActivityRegistry(): BackgroundActivityRegistry {
+    if (!this.backgroundActivityRegistry) {
+      this.backgroundActivityRegistry = new BackgroundActivityRegistry()
+    }
+    return this.backgroundActivityRegistry
   }
 
   private getRagCoordinator(): RagCoordinator {
@@ -282,6 +693,7 @@ export default class SmartComposerPlugin extends Plugin {
       this.ragCoordinator = new RagCoordinator({
         app: this.app,
         getSettings: () => this.settings,
+        ensureRuntimeReady: () => this.getPGliteRuntimeManager().ensureReady(),
         getDbManager: () => this.getDbManager(),
       })
     }
@@ -293,9 +705,11 @@ export default class SmartComposerPlugin extends Plugin {
       this.mcpCoordinator = new McpCoordinator({
         app: this.app,
         getSettings: () => this.settings,
+        openApplyReview: (state) => this.openApplyReview(state),
         registerSettingsListener: (
-          listener: (settings: SmartComposerSettings) => void,
+          listener: (settings: YoloSettings) => void,
         ) => this.addSettingsChangeListener(listener),
+        getRagEngine: () => this.getRAGEngine(),
       })
     }
     return this.mcpCoordinator
@@ -308,39 +722,19 @@ export default class SmartComposerPlugin extends Plugin {
   private getActiveConversationOverrides():
     | ConversationOverrideSettings
     | undefined {
-    const leaves = this.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)
-    for (const leaf of leaves) {
-      const view = leaf.view
-      if (
-        view instanceof ChatView &&
-        typeof view.getCurrentConversationOverrides === 'function'
-      ) {
-        return view.getCurrentConversationOverrides()
-      }
+    const leaf = this.getChatViewNavigator().resolveTargetChatLeaf({
+      allowCreate: false,
+    })
+    if (!(leaf?.view instanceof ChatView)) {
+      return undefined
     }
-    return undefined
-  }
-
-  private getActiveConversationModelId(): string | undefined {
-    const leaves = this.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)
-    for (const leaf of leaves) {
-      const view = leaf.view
-      if (
-        view instanceof ChatView &&
-        typeof view.getCurrentConversationModelId === 'function'
-      ) {
-        const modelId = view.getCurrentConversationModelId()
-        if (modelId) return modelId
-      }
-    }
-    return undefined
+    return leaf.view.getCurrentConversationOverrides()
   }
 
   private resolveContinuationParams(overrides?: ConversationOverrideSettings): {
     temperature?: number
     topP?: number
     stream: boolean
-    useVaultSearch: boolean
   } {
     const continuation = this.settings.continuationOptions ?? {}
 
@@ -366,14 +760,7 @@ export default class SmartComposerPlugin extends Plugin {
           ? overrides.stream
           : true
 
-    const useVaultSearch =
-      typeof continuation.useVaultSearch === 'boolean'
-        ? continuation.useVaultSearch
-        : typeof overrides?.useVaultSearch === 'boolean'
-          ? overrides.useVaultSearch
-          : Boolean(this.settings.ragOptions?.enabled)
-
-    return { temperature, topP, stream, useVaultSearch }
+    return { temperature, topP, stream }
   }
 
   private resolveObsidianLanguage(): Language {
@@ -383,6 +770,50 @@ export default class SmartComposerPlugin extends Plugin {
     if (rawLanguage.startsWith('zh')) return 'zh'
     if (rawLanguage.startsWith('it')) return 'it'
     return 'en'
+  }
+
+  private warnIfInstallationIncomplete() {
+    const baked = BAKED_PLUGIN_VERSION
+    const runtime = this.manifest.version
+    if (baked && runtime && baked !== runtime) {
+      console.error(
+        `[YOLO] Version mismatch: main.js=${baked}, manifest=${runtime}. ` +
+          `Likely an incomplete update download.`,
+      )
+      this.installationIncompleteDetail = {
+        bakedVersion: baked,
+        manifestVersion: runtime,
+      }
+      this.notifyInstallationIncompleteListeners()
+    }
+  }
+
+  isInstallationIncompleteBannerDismissed(): boolean {
+    return this.installationIncompleteBannerDismissed
+  }
+
+  dismissInstallationIncompleteBanner(): void {
+    this.installationIncompleteBannerDismissed = true
+    this.notifyInstallationIncompleteListeners()
+  }
+
+  addInstallationIncompleteListener(listener: () => void): () => void {
+    this.installationIncompleteListeners.push(listener)
+    return () => {
+      this.installationIncompleteListeners =
+        this.installationIncompleteListeners.filter((l) => l !== listener)
+    }
+  }
+
+  private notifyInstallationIncompleteListeners(): void {
+    for (const listener of this.installationIncompleteListeners) {
+      listener()
+    }
+  }
+
+  /** Re-notify banner subscribers when chat opens (aligned with checkForUpdateOnce). */
+  refreshInstallationIncompleteBanner(): void {
+    this.notifyInstallationIncompleteListeners()
   }
 
   get t() {
@@ -409,9 +840,596 @@ export default class SmartComposerPlugin extends Plugin {
 
   getAgentService(): AgentService {
     if (!this.agentService) {
-      this.agentService = new AgentService()
+      const { persistConversationMessages } =
+        createAgentConversationPersistence(this.app, () => this.settings)
+      this.agentService = new AgentService({
+        getSettings: () => this.settings,
+        persistConversationMessages,
+      })
+      // Start listening for async external agent task-completed events (desktop-only, no-op on mobile)
+      this.agentService.startExternalAgentResultListener()
     }
     return this.agentService
+  }
+
+  private getAgentNotificationCoordinator(): AgentNotificationCoordinator {
+    if (!this.agentNotificationCoordinator) {
+      const notificationService = new NotificationService({
+        getOptions: () => this.settings.notificationOptions,
+      })
+      this.agentNotificationCoordinator = new AgentNotificationCoordinator({
+        agentService: this.getAgentService(),
+        notificationService,
+        translate: (key, fallback) => this.t(key, fallback),
+      })
+    }
+    return this.agentNotificationCoordinator
+  }
+
+  private setupBackgroundActivityStatusBar(): void {
+    const statusBarItem = this.addStatusBarItem()
+    statusBarItem.addClass('mod-clickable')
+    statusBarItem.addClass('yolo-background-activity-status-bar')
+    statusBarItem.hide()
+
+    const ring = document.createElement('span')
+    ring.className = 'yolo-background-activity-status-bar-ring'
+
+    const label = document.createElement('span')
+    label.className = 'yolo-background-activity-status-bar-label'
+
+    const panel = document.createElement('div')
+    panel.className = 'yolo-background-activity-status-panel'
+    panel.setAttribute('aria-hidden', 'true')
+    panel.hidden = true
+
+    const panelHeader = document.createElement('div')
+    panelHeader.className = 'yolo-background-activity-status-panel-header'
+    panelHeader.setText(
+      this.t('statusBar.backgroundStatusPanelTitle', '后台任务'),
+    )
+
+    const panelList = document.createElement('div')
+    panelList.className = 'yolo-background-activity-status-panel-list'
+
+    const panelEmpty = document.createElement('div')
+    panelEmpty.className = 'yolo-background-activity-status-panel-empty'
+    panelEmpty.setText(
+      this.t(
+        'statusBar.backgroundStatusPanelEmpty',
+        '当前没有正在运行的后台任务',
+      ),
+    )
+
+    panel.append(panelHeader, panelList, panelEmpty)
+    statusBarItem.append(label, ring, panel)
+
+    this.backgroundStatusBarItem = statusBarItem
+    this.backgroundStatusBarRing = ring
+    this.backgroundStatusBarLabel = label
+    this.backgroundStatusPanel = panel
+    this.backgroundStatusPanelList = panelList
+    this.backgroundStatusPanelEmpty = panelEmpty
+
+    this.registerDomEvent(statusBarItem, 'click', (event) => {
+      if (
+        this.backgroundStatusPanel &&
+        event.target instanceof Node &&
+        this.backgroundStatusPanel.contains(event.target)
+      ) {
+        return
+      }
+      void this.toggleBackgroundStatusPanel()
+    })
+
+    this.registerDomEvent(document, 'click', (event) => {
+      if (
+        !this.isBackgroundStatusPanelOpen() ||
+        !this.backgroundStatusBarItem ||
+        !(event.target instanceof Node)
+      ) {
+        return
+      }
+
+      if (!this.backgroundStatusBarItem.contains(event.target)) {
+        this.closeBackgroundStatusPanel()
+      }
+    })
+
+    this.registerDomEvent(document, 'keydown', (event) => {
+      if (event.key === 'Escape') {
+        this.closeBackgroundStatusPanel()
+      }
+    })
+
+    const unsubscribeActivities =
+      this.getBackgroundActivityRegistry().subscribe((activities) => {
+        this.updateBackgroundStatusBar(activities)
+      })
+    const unsubscribeAgentSummaries =
+      this.getAgentService().subscribeToRunSummaries((summaries) => {
+        this.syncAgentBackgroundActivities(summaries)
+      })
+    // 异步派遣的子进程是 desktop-only，懒加载注册表后再订阅。
+    let unsubscribeAsyncTasks: (() => void) | null = null
+    if (Platform.isDesktopApp) {
+      void import('./core/agent/external-cli/async-task-registry').then(
+        ({ asyncTaskRegistry }) => {
+          unsubscribeAsyncTasks = asyncTaskRegistry.subscribe((records) => {
+            this.syncAsyncExternalAgentBackgroundActivities(records)
+          })
+        },
+      )
+    }
+
+    this.register(() => {
+      unsubscribeActivities()
+      unsubscribeAgentSummaries()
+      unsubscribeAsyncTasks?.()
+      this.backgroundStatusBarItem = null
+      this.backgroundStatusBarRing = null
+      this.backgroundStatusBarLabel = null
+      this.backgroundStatusPanel = null
+      this.backgroundStatusPanelList = null
+      this.backgroundStatusPanelEmpty = null
+      this.backgroundStatusPanelRenderVersion += 1
+      this.backgroundStatusPanelItems.clear()
+      this.latestBackgroundActivities.clear()
+      this.backgroundActivityRegistry?.clear()
+      this.backgroundActivityRegistry = null
+    })
+  }
+
+  private syncAsyncExternalAgentBackgroundActivities(
+    records: import('./core/agent/external-cli/async-task-registry').AsyncTaskRecord[],
+  ): void {
+    const registry = this.getBackgroundActivityRegistry()
+    const nextActivityIds = new Set<string>()
+
+    for (const record of records) {
+      if (record.status !== 'running') continue
+      const id = `external-agent:${record.taskId}`
+      nextActivityIds.add(id)
+      registry.upsert({
+        id,
+        kind: 'agent',
+        title: record.title,
+        detail: record.provider,
+        status: 'running',
+        updatedAt: record.createdAt,
+        ...(record.conversationId
+          ? {
+              action: {
+                type: 'open-agent-conversation',
+                conversationId: record.conversationId,
+              },
+            }
+          : {}),
+      })
+    }
+
+    for (const activityId of this.latestBackgroundActivities.keys()) {
+      if (!activityId.startsWith('external-agent:')) continue
+      if (nextActivityIds.has(activityId)) continue
+      registry.remove(activityId)
+    }
+  }
+
+  private syncAgentBackgroundActivities(
+    summaries: Map<string, AgentConversationRunSummary>,
+  ): void {
+    const registry = this.getBackgroundActivityRegistry()
+    const nextActivityIds = new Set<string>()
+
+    for (const summary of summaries.values()) {
+      if (!summary.isRunning && !summary.isWaitingApproval) {
+        continue
+      }
+
+      const id = `agent:${summary.conversationId}`
+      nextActivityIds.add(id)
+      registry.upsert({
+        id,
+        kind: 'agent',
+        title: this.t(
+          'statusBar.agentStatusFallbackConversationTitle',
+          '运行中的对话',
+        ),
+        detail: summary.isWaitingApproval
+          ? this.t('statusBar.agentStatusWaitingApproval', '待审批')
+          : this.t('statusBar.agentStatusRunning', '运行中'),
+        status: summary.isWaitingApproval ? 'waiting' : 'running',
+        updatedAt: Date.now(),
+        action: {
+          type: 'open-agent-conversation',
+          conversationId: summary.conversationId,
+        },
+      })
+    }
+
+    for (const activityId of this.latestBackgroundActivities.keys()) {
+      if (!activityId.startsWith('agent:')) {
+        continue
+      }
+      if (nextActivityIds.has(activityId)) {
+        continue
+      }
+      registry.remove(activityId)
+    }
+  }
+
+  private updateBackgroundStatusBar(
+    activities: Map<string, BackgroundActivity>,
+  ): void {
+    if (
+      !this.backgroundStatusBarItem ||
+      !this.backgroundStatusBarRing ||
+      !this.backgroundStatusBarLabel
+    ) {
+      return
+    }
+
+    this.latestBackgroundActivities = new Map(activities)
+    const visibleActivities = Array.from(activities.values()).filter(
+      (activity) =>
+        activity.status === 'running' ||
+        activity.status === 'waiting' ||
+        activity.status === 'failed',
+    )
+
+    if (visibleActivities.length === 0) {
+      this.clearBackgroundStatusPanelItems()
+      this.closeBackgroundStatusPanel()
+      this.backgroundStatusBarItem.hide()
+      this.backgroundStatusBarLabel.setText('')
+      this.backgroundStatusBarItem.removeAttribute('aria-label')
+      this.backgroundStatusBarItem.removeAttribute('title')
+      return
+    }
+
+    const label = this.buildBackgroundStatusBarLabel(visibleActivities)
+    const statusBarTone = visibleActivities.some(
+      (activity) =>
+        activity.status === 'running' || activity.status === 'waiting',
+    )
+      ? visibleActivities.some((activity) => activity.status === 'waiting') &&
+        !visibleActivities.some((activity) => activity.status === 'running')
+        ? 'is-waiting'
+        : 'is-running'
+      : 'is-failed'
+
+    this.backgroundStatusBarLabel.setText(label)
+    this.backgroundStatusBarItem.removeAttribute('title')
+    this.backgroundStatusBarItem.setAttribute(
+      'aria-label',
+      this.t(
+        'statusBar.backgroundStatusAriaLabel',
+        '后台任务状态，点击查看详情',
+      ),
+    )
+    this.backgroundStatusBarRing.classList.remove(
+      'is-running',
+      'is-waiting',
+      'is-failed',
+    )
+    this.backgroundStatusBarRing.classList.add(statusBarTone)
+    this.backgroundStatusBarItem.show()
+
+    if (this.isBackgroundStatusPanelOpen()) {
+      void this.renderBackgroundStatusPanel()
+    }
+  }
+
+  private buildBackgroundStatusBarLabel(
+    activities: BackgroundActivity[],
+  ): string {
+    const runningActivities = activities.filter(
+      (activity) =>
+        activity.status === 'running' || activity.status === 'waiting',
+    )
+    const failedActivities = activities.filter(
+      (activity) => activity.status === 'failed',
+    )
+    const agentActivities = runningActivities.filter(
+      (activity) => activity.kind === 'agent',
+    )
+    const waitingApprovalCount = runningActivities.filter(
+      (activity) => activity.status === 'waiting',
+    ).length
+
+    if (
+      runningActivities.length > 0 &&
+      agentActivities.length === runningActivities.length
+    ) {
+      return waitingApprovalCount > 0
+        ? this.t(
+            'statusBar.agentRunningWithApproval',
+            '当前有 {count} 个 agent 正在运行（{approvalCount} 个待审批）',
+          )
+            .replace('{count}', String(agentActivities.length))
+            .replace('{approvalCount}', String(waitingApprovalCount))
+        : this.t(
+            'statusBar.agentRunning',
+            '当前有 {count} 个 agent 正在运行',
+          ).replace('{count}', String(agentActivities.length))
+    }
+
+    if (runningActivities.length === 1 && failedActivities.length === 0) {
+      const [activity] = runningActivities
+      if (activity.kind === 'rag-index') {
+        return this.t('statusBar.ragAutoUpdateRunning', '知识库正在后台更新')
+      }
+    }
+
+    if (runningActivities.length > 0) {
+      return this.t(
+        'statusBar.backgroundTasksRunning',
+        '当前有 {count} 个后台任务正在运行',
+      ).replace('{count}', String(runningActivities.length))
+    }
+
+    return this.t(
+      'statusBar.backgroundTasksNeedAttention',
+      '有后台任务需要关注',
+    )
+  }
+
+  private isBackgroundStatusPanelOpen(): boolean {
+    return this.backgroundStatusPanel?.hidden === false
+  }
+
+  private openBackgroundStatusPanel(): void {
+    if (!this.backgroundStatusPanel || this.isBackgroundStatusPanelOpen()) {
+      return
+    }
+
+    this.backgroundStatusPanel.hidden = false
+    this.backgroundStatusPanel.setAttribute('aria-hidden', 'false')
+
+    window.requestAnimationFrame(() => {
+      this.backgroundStatusPanel?.addClass('is-open')
+    })
+  }
+
+  private closeBackgroundStatusPanel(): void {
+    if (!this.backgroundStatusPanel || !this.isBackgroundStatusPanelOpen()) {
+      return
+    }
+
+    this.backgroundStatusPanel.removeClass('is-open')
+    this.backgroundStatusPanel.setAttribute('aria-hidden', 'true')
+    window.setTimeout(() => {
+      if (this.backgroundStatusPanel?.hasClass('is-open')) {
+        return
+      }
+      if (this.backgroundStatusPanel) {
+        this.backgroundStatusPanel.hidden = true
+      }
+    }, 180)
+  }
+
+  private async toggleBackgroundStatusPanel(): Promise<void> {
+    if (this.isBackgroundStatusPanelOpen()) {
+      this.closeBackgroundStatusPanel()
+      return
+    }
+
+    const hasEntries = await this.renderBackgroundStatusPanel()
+    if (!hasEntries) {
+      return
+    }
+
+    this.openBackgroundStatusPanel()
+  }
+
+  private async renderBackgroundStatusPanel(): Promise<boolean> {
+    if (!this.backgroundStatusPanelList || !this.backgroundStatusPanelEmpty) {
+      return false
+    }
+
+    const renderVersion = ++this.backgroundStatusPanelRenderVersion
+    const activities = Array.from(this.latestBackgroundActivities.values())
+      .filter(
+        (activity) =>
+          activity.status === 'running' ||
+          activity.status === 'waiting' ||
+          activity.status === 'failed',
+      )
+      .sort((left, right) => {
+        const priority = (activity: BackgroundActivity) => {
+          if (activity.status === 'waiting') return 0
+          if (activity.status === 'running') return 1
+          if (activity.status === 'failed') return 2
+          return 3
+        }
+        const priorityDelta = priority(left) - priority(right)
+        if (priorityDelta !== 0) {
+          return priorityDelta
+        }
+        return left.id.localeCompare(right.id)
+      })
+
+    if (activities.length === 0) {
+      this.clearBackgroundStatusPanelItems()
+      this.backgroundStatusPanelEmpty.hidden = false
+      return false
+    }
+
+    const chatManager = new ChatManager(this.app, this.settings)
+    const metadataList = await chatManager.listChats()
+    if (
+      renderVersion !== this.backgroundStatusPanelRenderVersion ||
+      !this.backgroundStatusPanelList ||
+      !this.backgroundStatusPanelEmpty
+    ) {
+      return this.latestBackgroundActivities.size > 0
+    }
+
+    const metadataById = new Map<string, { title?: string }>(
+      metadataList.map((item) => [item.id, { title: item.title }]),
+    )
+    const nextActivityIds = new Set<string>()
+    let insertBeforeNode = this.backgroundStatusPanelList.firstChild
+
+    for (const activity of activities) {
+      nextActivityIds.add(activity.id)
+      const title = this.resolveBackgroundActivityTitle(activity, metadataById)
+      const detail = this.resolveBackgroundActivityDetail(activity)
+      const itemRecord =
+        this.backgroundStatusPanelItems.get(activity.id) ??
+        this.createBackgroundStatusPanelItem(activity.id, activity.action)
+
+      if (itemRecord.title.getText() !== title) {
+        itemRecord.title.setText(title)
+      }
+      if (itemRecord.title.getAttribute('title') !== title) {
+        itemRecord.title.setAttribute('title', title)
+      }
+      if (itemRecord.detail.getText() !== detail) {
+        itemRecord.detail.setText(detail)
+      }
+      itemRecord.detail.hidden = detail.length === 0
+      itemRecord.indicator.classList.remove(
+        'is-running',
+        'is-waiting',
+        'is-failed',
+      )
+      itemRecord.indicator.classList.add(`is-${activity.status}`)
+
+      if (itemRecord.item !== insertBeforeNode) {
+        this.backgroundStatusPanelList.insertBefore(
+          itemRecord.item,
+          insertBeforeNode,
+        )
+      }
+      insertBeforeNode = itemRecord.item.nextSibling
+    }
+
+    for (const [activityId, itemRecord] of this.backgroundStatusPanelItems) {
+      if (nextActivityIds.has(activityId)) {
+        continue
+      }
+      itemRecord.item.remove()
+      this.backgroundStatusPanelItems.delete(activityId)
+    }
+
+    this.backgroundStatusPanelEmpty.hidden = true
+    return true
+  }
+
+  private createBackgroundStatusPanelItem(
+    activityId: string,
+    action?: BackgroundActivityAction,
+  ): {
+    item: HTMLElement
+    title: HTMLElement
+    detail: HTMLElement
+    indicator: HTMLElement
+  } {
+    const item = createDiv({
+      cls: 'yolo-background-activity-status-panel-item',
+    })
+    item.setAttribute('role', 'button')
+    item.setAttribute('tabindex', '0')
+
+    const row = item.createDiv({
+      cls: 'yolo-background-activity-status-panel-item-row',
+    })
+    const copy = row.createDiv({
+      cls: 'yolo-background-activity-status-panel-item-copy',
+    })
+    const title = copy.createDiv({
+      cls: 'yolo-background-activity-status-panel-item-title',
+    })
+    const detail = copy.createDiv({
+      cls: 'yolo-background-activity-status-panel-item-detail',
+    })
+    const indicator = row.createDiv({
+      cls: 'yolo-background-activity-status-panel-item-indicator',
+    })
+
+    const openAction = () => {
+      this.closeBackgroundStatusPanel()
+      if (!action) {
+        return
+      }
+      if (action.type === 'open-agent-conversation') {
+        void this.openChatView({
+          placement: 'split',
+          initialConversationId: action.conversationId,
+          forceNewLeaf: true,
+        })
+        return
+      }
+      if (action.type === 'open-knowledge-settings') {
+        this.openKnowledgeSettings()
+      }
+    }
+
+    this.registerDomEvent(item, 'click', (event) => {
+      event.stopPropagation()
+      openAction()
+    })
+
+    this.registerDomEvent(item, 'keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault()
+        event.stopPropagation()
+        openAction()
+      }
+    })
+
+    const record = {
+      item,
+      title,
+      detail,
+      indicator,
+    }
+    this.backgroundStatusPanelItems.set(activityId, record)
+    return record
+  }
+
+  private clearBackgroundStatusPanelItems(): void {
+    this.backgroundStatusPanelList?.empty()
+    this.backgroundStatusPanelItems.clear()
+  }
+
+  private resolveBackgroundActivityTitle(
+    activity: BackgroundActivity,
+    metadataById: Map<string, { title?: string }>,
+  ): string {
+    if (
+      activity.action?.type === 'open-agent-conversation' &&
+      activity.action.conversationId
+    ) {
+      const metadata = metadataById.get(activity.action.conversationId)
+      return this.resolveAgentConversationTitle(metadata?.title)
+    }
+    return activity.title
+  }
+
+  private resolveBackgroundActivityDetail(
+    activity: BackgroundActivity,
+  ): string {
+    return activity.detail?.trim() ?? ''
+  }
+
+  private openKnowledgeSettings(): void {
+    // @ts-expect-error: setting property exists in Obsidian's App but is not typed
+    this.app.setting.open()
+    // @ts-expect-error: setting property exists in Obsidian's App but is not typed
+    this.app.setting.openTabById(this.manifest.id)
+  }
+
+  private resolveAgentConversationTitle(title: string | undefined): string {
+    if (!isUntitledConversationTitle(title)) {
+      return title!.trim()
+    }
+
+    return this.t(
+      'statusBar.agentStatusFallbackConversationTitle',
+      '运行中的对话',
+    )
   }
 
   private getEditorView(editor: Editor | null | undefined): EditorView | null {
@@ -433,10 +1451,6 @@ export default class SmartComposerPlugin extends Plugin {
     }
     const maybeEditor = editor as Editor & { cm?: EditorView }
     return maybeEditor.cm instanceof EditorView
-  }
-
-  private ensureInlineSuggestionExtension(view: EditorView) {
-    this.getInlineSuggestionController().ensureInlineSuggestionExtension(view)
   }
 
   private setInlineSuggestionGhost(
@@ -469,6 +1483,7 @@ export default class SmartComposerPlugin extends Plugin {
       const inlineSuggestionController = this.getInlineSuggestionController()
       this.tabCompletionController = new TabCompletionController({
         getSettings: () => this.settings,
+        setSettings: (newSettings) => this.setSettings(newSettings),
         getEditorView: (editor) => this.getEditorView(editor),
         getActiveMarkdownView: () =>
           this.app.workspace.getActiveViewOfType(MarkdownView),
@@ -480,6 +1495,10 @@ export default class SmartComposerPlugin extends Plugin {
           this.app.workspace.getActiveFile()?.basename?.trim() ?? '',
         setInlineSuggestionGhost: (view, payload) =>
           inlineSuggestionController.setInlineSuggestionGhost(view, payload),
+        showTabLoadingDots: (view, from) =>
+          inlineSuggestionController.showTabLoadingDots(view, from),
+        hideTabLoadingDots: (view) =>
+          inlineSuggestionController.hideTabLoadingDots(view),
         clearInlineSuggestion: () =>
           inlineSuggestionController.clearInlineSuggestion(),
         setActiveInlineSuggestion: (suggestion) =>
@@ -516,9 +1535,24 @@ export default class SmartComposerPlugin extends Plugin {
     return this.diffReviewController
   }
 
-  async openApplyReview(state: ApplyViewState): Promise<void> {
+  async openApplyReview(state: ApplyViewState): Promise<boolean> {
+    // If the diff that the overlay would display has zero modified blocks,
+    // skip the overlay entirely — otherwise the UI renders "0/0" with every
+    // button disabled and no auto-close path, stranding the user.
+    const reviewBlocks = buildFullReviewBlocks(
+      state.originalContent,
+      state.newContent,
+    )
+    if (countModifiedBlocks(reviewBlocks) === 0) {
+      if (state.originalContent !== state.newContent) {
+        await this.app.vault.modify(state.file, state.newContent)
+      }
+      state.callbacks?.onComplete?.({ finalContent: state.newContent })
+      return true
+    }
+
     const opened = this.getDiffReviewController().openReview(state)
-    if (opened) return
+    if (opened) return true
 
     const markdownLeaves = this.app.workspace.getLeavesOfType('markdown')
     const targetLeaf = markdownLeaves.find((leaf) => {
@@ -533,15 +1567,16 @@ export default class SmartComposerPlugin extends Plugin {
         targetLeaf.view,
         state,
       )
-      if (openedInTarget) return
+      if (openedInTarget) return true
     }
 
     const leaf = this.app.workspace.getLeaf(false)
     await leaf?.openFile(state.file, { active: true })
     const openedAfterFocus = this.getDiffReviewController().openReview(state)
-    if (openedAfterFocus) return
+    if (openedAfterFocus) return true
 
     new Notice('请先打开目标文件后再应用修改。')
+    return false
   }
 
   private getWriteAssistController(): WriteAssistController {
@@ -549,12 +1584,12 @@ export default class SmartComposerPlugin extends Plugin {
       this.writeAssistController = new WriteAssistController({
         app: this.app,
         getSettings: () => this.settings,
+        setSettings: (newSettings) => this.setSettings(newSettings),
         t: (key, fallback) => this.t(key, fallback),
         getActiveConversationOverrides: () =>
           this.getActiveConversationOverrides(),
         resolveContinuationParams: (overrides) =>
           this.resolveContinuationParams(overrides),
-        getRagEngine: () => this.getRAGEngine(),
         getEditorView: (editor) => this.getEditorView(editor),
         closeSmartSpace: () => this.closeSmartSpace(),
         registerTimeout: (callback, timeout) =>
@@ -568,8 +1603,6 @@ export default class SmartComposerPlugin extends Plugin {
         },
         cancelAllAiTasks: () => this.cancelAllAiTasks(),
         clearInlineSuggestion: () => this.clearInlineSuggestion(),
-        ensureInlineSuggestionExtension: (view) =>
-          this.ensureInlineSuggestionExtension(view),
         setInlineSuggestionGhost: (view, payload) =>
           this.setInlineSuggestionGhost(view, payload),
         showThinkingIndicator: (view, from, label, snippet) =>
@@ -617,28 +1650,123 @@ export default class SmartComposerPlugin extends Plugin {
 
   async onload() {
     ensureBufferByteLengthCompat()
+    clearRequestTransportMemory()
 
     await this.loadSettings()
+    await this.migrateLegacyVaultMirrorIfNeeded()
+    this.warnIfInstallationIncomplete()
+    this.syncOAuthRuntimesFromSettings()
+
+    // Prune stale image cache entries (>30 days) on startup
+    void pruneImageCache(this.app, 30, this.settings)
+    void prunePdfTextCache(this.app, 30, this.settings)
+    await this.getRagIndexService().initialize()
+    this.app.workspace.onLayoutReady(() => {
+      if (!this.settings?.ragOptions?.enabled) return
+      const snapshot = this.getRagIndexSnapshot()
+      if (
+        snapshot.status !== 'retry_scheduled' ||
+        snapshot.retryPolicy !== 'transient'
+      ) {
+        return
+      }
+      const hasValidEmbeddingModel =
+        !!this.settings?.embeddingModelId &&
+        this.settings.embeddingModels.some(
+          (m) => m.id === this.settings.embeddingModelId,
+        )
+      if (
+        hasValidEmbeddingModel &&
+        this.settings.ragOptions.autoUpdateEnabled &&
+        snapshot.trigger === 'auto'
+      ) {
+        this.getRagAutoUpdateService().restoreRetryScheduled(
+          snapshot.retryAt,
+          STARTUP_GRACE_MS,
+        )
+      } else if (hasValidEmbeddingModel && snapshot.trigger === 'manual') {
+        this.getRagIndexService().restoreRetryScheduledRun(STARTUP_GRACE_MS)
+      }
+    })
 
     this.registerView(CHAT_VIEW_TYPE, (leaf) => new ChatView(leaf, this))
 
+    this.newTabEmptyStateEnhancer = new NewTabEmptyStateEnhancer(this)
+    this.newTabEmptyStateEnhancer.enable()
+
+    enablePdfScreenshotFeature(this)
+
+    this.registerEditorExtension(selectionHighlightController.createExtension())
     this.registerEditorExtension(this.createSmartSpaceTriggerExtension())
     this.registerEditorExtension(this.createQuickAskTriggerExtension())
+    this.registerEditorExtension(
+      this.getInlineSuggestionController().createExtension(),
+    )
     this.registerEditorExtension(
       this.getTabCompletionController().createTriggerExtension(),
     )
 
     // This creates an icon in the left ribbon.
     this.addRibbonIcon('wand-sparkles', this.t('commands.openChat'), () => {
-      void this.openChatView()
+      void this.openChatView({ placement: this.resolveRibbonPlacement() })
     })
 
-    // This adds a simple command that can be triggered anywhere
+    this.setupBackgroundActivityStatusBar()
+    this.getAgentNotificationCoordinator().start()
+    this.register(() => {
+      this.agentNotificationCoordinator?.stop()
+      this.agentNotificationCoordinator = null
+    })
+
     this.addCommand({
       id: 'open-new-chat',
-      name: this.t('commands.openChat'),
+      name: this.t('commands.openChatSidebar'),
       callback: () => {
-        void this.openChatView(true)
+        void this.openChatView({ placement: 'sidebar' })
+      },
+    })
+
+    this.addCommand({
+      id: 'new-chat-current-view',
+      name: this.t('commands.newChatCurrentView'),
+      callback: () => {
+        void this.openCurrentOrSidebarNewChat()
+      },
+    })
+
+    this.addCommand({
+      id: 'open-chat-tab',
+      name: this.t('commands.openNewChatTab'),
+      callback: () => {
+        void this.openChatView({
+          placement: 'tab',
+          openNewChat: true,
+          forceNewLeaf: true,
+        })
+      },
+    })
+
+    this.addCommand({
+      id: 'open-chat-split',
+      name: this.t('commands.openNewChatSplit'),
+      callback: () => {
+        void this.openChatView({
+          placement: 'split',
+          openNewChat: true,
+          forceNewLeaf: true,
+        })
+      },
+    })
+
+    this.addCommand({
+      id: 'open-chat-window',
+      name: this.t('commands.openNewChatWindow'),
+      callback: () => {
+        void this.openChatView({
+          placement: 'window',
+          openNewChat: true,
+          forceNewLeaf: true,
+        })
       },
     })
 
@@ -729,74 +1857,64 @@ export default class SmartComposerPlugin extends Plugin {
     // Auto update: listen to vault file changes and schedule incremental index updates
     this.registerEvent(
       this.app.vault.on('create', (file) =>
-        this.getRagAutoUpdateService().onVaultFileChanged(file),
+        this.getRagAutoUpdateService().onVaultFileChanged(file, 'create'),
       ),
     )
     this.registerEvent(
       this.app.vault.on('modify', (file) =>
-        this.getRagAutoUpdateService().onVaultFileChanged(file),
+        this.getRagAutoUpdateService().onVaultFileChanged(file, 'modify'),
       ),
     )
     this.registerEvent(
       this.app.vault.on('delete', (file) =>
-        this.getRagAutoUpdateService().onVaultFileChanged(file),
+        this.getRagAutoUpdateService().onVaultFileChanged(file, 'delete'),
       ),
     )
     this.registerEvent(
       this.app.vault.on('rename', (file, oldPath) => {
         const service = this.getRagAutoUpdateService()
-        service.onVaultFileChanged(file)
-        if (oldPath) service.onVaultPathChanged(oldPath)
+        service.onVaultFileChanged(file, 'rename')
+        if (oldPath)
+          service.onVaultPathChanged(oldPath, {
+            requiresFullScan: file instanceof TFolder,
+          })
       }),
     )
+    this.registerDomEvent(window, 'blur', () => {
+      this.getRagAutoUpdateService().onWindowBlur()
+    })
 
     this.addCommand({
       id: 'rebuild-vault-index',
       name: this.t('commands.rebuildVaultIndex'),
       callback: async () => {
-        // 预检查 PGlite 资源
-        try {
-          const dbManager = await this.getDbManager()
-          const resourceCheck = dbManager.checkPGliteResources()
-
-          if (!resourceCheck.available) {
-            new Notice(
-              this.t(
-                'notices.pgliteUnavailable',
-                'PGlite resources unavailable. Please reinstall the plugin.',
-              ),
-              5000,
-            )
-            return
-          }
-        } catch (error) {
-          console.warn('Failed to check PGlite resources:', error)
-          // 继续执行，让实际的加载逻辑处理错误
-        }
-
         const notice = new Notice(this.t('notices.rebuildingIndex'), 0)
         try {
-          const ragEngine = await this.getRAGEngine()
-          await ragEngine.updateVaultIndex(
-            { reindexAll: true },
-            (queryProgress) => {
-              if (queryProgress.type === 'indexing') {
-                const { completedChunks, totalChunks } =
-                  queryProgress.indexProgress
-                notice.setMessage(
-                  `Indexing chunks: ${completedChunks} / ${totalChunks}${
-                    queryProgress.indexProgress.waitingForRateLimit
-                      ? '\n(waiting for rate limit to reset)'
-                      : ''
-                  }`,
-                )
-              }
+          await this.getRagIndexService().runIndex({
+            mode: 'rebuild',
+            scope: { kind: 'all' },
+            trigger: 'manual',
+            retryPolicy: 'transient',
+            onProgress: (progress) => {
+              notice.setMessage(
+                `Indexing chunks: ${progress.completedChunks} / ${progress.totalChunks}${
+                  progress.waitingForRateLimit
+                    ? '\n(waiting for rate limit to reset)'
+                    : ''
+                }`,
+              )
             },
-          )
+          })
           notice.setMessage(this.t('notices.rebuildComplete'))
         } catch (error) {
-          console.error(error)
-          notice.setMessage(this.t('notices.rebuildFailed'))
+          if (error instanceof RagIndexBusyError) {
+            notice.setMessage(
+              this.t('statusBar.ragAutoUpdateRunning', '知识库索引正在运行'),
+            )
+          } else {
+            console.error(error)
+            notice.setMessage(this.t('notices.rebuildFailed'))
+          }
         } finally {
           this.registerTimeout(() => {
             notice.hide()
@@ -811,27 +1929,31 @@ export default class SmartComposerPlugin extends Plugin {
       callback: async () => {
         const notice = new Notice(this.t('notices.updatingIndex'), 0)
         try {
-          const ragEngine = await this.getRAGEngine()
-          await ragEngine.updateVaultIndex(
-            { reindexAll: false },
-            (queryProgress) => {
-              if (queryProgress.type === 'indexing') {
-                const { completedChunks, totalChunks } =
-                  queryProgress.indexProgress
-                notice.setMessage(
-                  `Indexing chunks: ${completedChunks} / ${totalChunks}${
-                    queryProgress.indexProgress.waitingForRateLimit
-                      ? '\n(waiting for rate limit to reset)'
-                      : ''
-                  }`,
-                )
-              }
+          await this.getRagIndexService().runIndex({
+            mode: 'sync',
+            scope: { kind: 'all' },
+            trigger: 'manual',
+            retryPolicy: 'none',
+            onProgress: (progress) => {
+              notice.setMessage(
+                `Indexing chunks: ${progress.completedChunks} / ${progress.totalChunks}${
+                  progress.waitingForRateLimit
+                    ? '\n(waiting for rate limit to reset)'
+                    : ''
+                }`,
+              )
             },
-          )
+          })
           notice.setMessage(this.t('notices.indexUpdated'))
         } catch (error) {
-          console.error(error)
-          notice.setMessage(this.t('notices.indexUpdateFailed'))
+          if (error instanceof RagIndexBusyError) {
+            notice.setMessage(
+              this.t('statusBar.ragAutoUpdateRunning', '知识库索引正在运行'),
+            )
+          } else {
+            console.error(error)
+            notice.setMessage(this.t('notices.indexUpdateFailed'))
+          }
         } finally {
           this.registerTimeout(() => {
             notice.hide()
@@ -839,19 +1961,41 @@ export default class SmartComposerPlugin extends Plugin {
         }
       },
     })
+
+    this.addCommand({
+      id: 'export-settings',
+      name: this.t('commands.exportSettings', '导出插件配置'),
+      callback: () => {
+        new ExportConfigModal(this.app, this).open()
+      },
+    })
+
+    this.addCommand({
+      id: 'import-settings',
+      name: this.t('commands.importSettings', '导入插件配置'),
+      callback: () => {
+        new ImportConfigModal(this.app, this).open()
+      },
+    })
+
     // This adds a settings tab so the user can configure various aspects of the plugin
-    this.addSettingTab(new SmartComposerSettingTab(this.app, this))
+    this.addSettingTab(new YoloSettingTab(this.app, this))
 
     // removed templates JSON migration
 
     // Handle tab completion trigger
     this.registerEvent(
-      this.app.workspace.on('active-leaf-change', () => {
+      this.app.workspace.on('active-leaf-change', (leaf) => {
         try {
+          if (leaf?.view instanceof ChatView) {
+            this.getChatLeafSessionManager().touchLeafActive(leaf)
+          }
           const view = this.app.workspace.getActiveViewOfType(MarkdownView)
           const editor = view?.editor
-          if (!editor) return
-          this.handleTabCompletionEditorChange(editor)
+          if (editor) {
+            this.handleTabCompletionEditorChange(editor)
+          }
+          this.selectionChatController?.handleActiveLeafChange(leaf ?? null)
           // Update selection manager with new editor container
           this.initializeSelectionChat()
         } catch (err) {
@@ -862,6 +2006,7 @@ export default class SmartComposerPlugin extends Plugin {
 
     // Initialize selection chat
     this.initializeSelectionChat()
+    this.syncSelectionChatCommands()
 
     // Listen for settings changes to reinitialize Selection Chat
     this.addSettingsChangeListener((newSettings) => {
@@ -873,6 +2018,7 @@ export default class SmartComposerPlugin extends Plugin {
         // Re-initialize when the setting changes
         this.initializeSelectionChat()
       }
+      this.syncSelectionChatCommands()
     })
   }
 
@@ -883,6 +2029,7 @@ export default class SmartComposerPlugin extends Plugin {
     this.selectionChatController?.destroy()
     this.selectionChatController = null
     this.chatViewNavigator = null
+    this.newTabEmptyStateEnhancer = null
     this.inlineSuggestionController?.clearInlineSuggestion()
     this.inlineSuggestionController?.destroy()
     this.inlineSuggestionController = null
@@ -897,6 +2044,8 @@ export default class SmartComposerPlugin extends Plugin {
     this.timeoutIds = []
 
     // RagEngine cleanup
+    this.ragIndexService?.cleanup()
+    this.ragIndexService = null
     this.ragCoordinator?.cleanup()
     this.ragCoordinator = null
 
@@ -915,26 +2064,393 @@ export default class SmartComposerPlugin extends Plugin {
     this.mcpManager = null
     this.ragAutoUpdateService?.cleanup()
     this.ragAutoUpdateService = null
+    this.agentService?.stopExternalAgentResultListener()
     this.agentService?.abortAll()
     this.agentService = null
+    // 终止所有活跃的外部 CLI 子进程（desktop-only，mobile 为空操作）
+    void import('./core/agent/external-cli/index').then(
+      ({ killAllActiveExternalCli }) => killAllActiveExternalCli(),
+    )
+    // 终止所有异步派遣任务，标记为 killed_by_shutdown
+    void import('./core/agent/external-cli/async-task-registry').then(
+      ({ asyncTaskRegistry }) => asyncTaskRegistry.abortAll(),
+    )
     // Ensure all in-flight requests are aborted on unload
     this.cancelAllAiTasks()
     this.clearTabCompletionTimer()
     this.cancelTabCompletionRequest()
     this.clearInlineSuggestion()
+
+    // Release the pdfjs worker Blob URL we may have created during this
+    // session. Outstanding workers already spawned keep running; this only
+    // prevents future fetches and lets the GC collect the source string.
+    void import('./utils/pdf/pdfjsLoader').then(({ disposePdfjsWorker }) =>
+      disposePdfjsWorker(),
+    )
   }
 
   async loadSettings() {
-    this.settings = ensureDefaultAssistantInSettings(
-      parseSmartComposerSettings(await this.loadData()),
+    // Read-only loader. The on-disk `data.json` in the plugin directory is
+    // the single source of truth for settings; `this.settings` is just a
+    // process-local view of it. Cross-device sync is delegated to whatever
+    // tool the user is using (Obsidian Sync, remotely-save, syncthing, git,
+    // …) — they all replicate the plugin-dir file directly. We never write
+    // back during load, so a backup pasted into `data.json` while the
+    // plugin was off can't be silently overwritten by startup
+    // normalization, and a Sync push that lands during boot can't be
+    // clobbered by a stale in-memory snapshot.
+    const rawPluginData = (await this.loadData()) as unknown
+    const pluginExtract = extractYoloDataMeta(rawPluginData)
+    const sourceRaw = pluginExtract?.raw ?? null
+    const sourceMeta = pluginExtract?.meta ?? null
+
+    const parsedSettings = parseYoloSettings(sourceRaw)
+    const settingsWithDefaultAssistant =
+      ensureDefaultAssistantInSettings(parsedSettings)
+    const { chatModels, changed } = applyKnownMaxContextTokensToChatModels(
+      settingsWithDefaultAssistant.chatModels,
     )
-    await this.saveData(this.settings) // Save updated settings
+    const normalizedSettings = changed
+      ? { ...settingsWithDefaultAssistant, chatModels }
+      : settingsWithDefaultAssistant
+
+    this.settings = normalizedSettings
+    this.currentSettingsMeta = sourceMeta
+    setLLMDebugCaptureEnabled(
+      this.settings.debug?.captureRawRequestDebug ?? false,
+    )
   }
 
-  async setSettings(newSettings: SmartComposerSettings) {
-    const normalizedSettings = ensureDefaultAssistantInSettings(newSettings)
-    const validationResult =
-      smartComposerSettingsSchema.safeParse(normalizedSettings)
+  private getDeviceId(): string {
+    if (this.deviceId) {
+      return this.deviceId
+    }
+    const storageKey = 'yolo.deviceId'
+    let id: string | null = null
+    try {
+      id = window.localStorage.getItem(storageKey)
+    } catch {
+      // localStorage may be unavailable in some contexts; fall through to gen.
+    }
+    if (!id) {
+      id =
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+      try {
+        window.localStorage.setItem(storageKey, id)
+      } catch {
+        // Best-effort persistence; a regenerated id on next boot is acceptable.
+      }
+    }
+    this.deviceId = id
+    return id
+  }
+
+  /**
+   * Total ordering on `YoloDataMeta`. Returns true iff `b` beats `a`.
+   *   - Strictly newer `updatedAt` wins.
+   *   - Equal `updatedAt` ties are broken by lexically larger `deviceId`,
+   *     so all devices observing a millisecond-coincident race converge
+   *     on the same winner deterministically.
+   * `metaBeats(self, self)` is false.
+   */
+  private metaBeats(a: YoloDataMeta, b: YoloDataMeta): boolean {
+    if (b.updatedAt > a.updatedAt) return true
+    if (b.updatedAt < a.updatedAt) return false
+    return b.deviceId > a.deviceId
+  }
+
+  /**
+   * Builds a fresh `__meta` for our own writes. Monotonic against the
+   * meta we last observed in memory: prevents a device whose clock lags
+   * behind a freshly-synced peer from emitting a write whose `updatedAt`
+   * is below `currentSettingsMeta`, which other devices would then
+   * legitimately reject as stale.
+   */
+  private buildSettingsMeta(): YoloDataMeta {
+    const baseTime = Date.now()
+    const monotonic = this.currentSettingsMeta
+      ? Math.max(baseTime, this.currentSettingsMeta.updatedAt + 1)
+      : baseTime
+    return {
+      updatedAt: monotonic,
+      deviceId: this.getDeviceId(),
+    }
+  }
+
+  private async persistPluginDirSettings(
+    settings: YoloSettings,
+    meta: YoloDataMeta = this.buildSettingsMeta(),
+  ): Promise<YoloDataMeta> {
+    await this.saveData(stampYoloDataMeta(settings, meta))
+    this.currentSettingsMeta = meta
+    return meta
+  }
+
+  /**
+   * Adopt an externally-written `data.json` payload into in-memory state.
+   *
+   * Called from two places:
+   *   - `onExternalSettingsChange()` — Obsidian's official hook fires when
+   *     it detects the plugin's `data.json` was modified by something
+   *     other than `saveData` (Obsidian Sync push, remotely-save replay,
+   *     manual paste, git pull, …).
+   *   - `setSettings()` conflict path — when a write-attempt detects the
+   *     on-disk file is newer than what we last committed in memory.
+   *
+   * Protocol invariant:
+   *   Every legitimate write to `data.json` MUST stamp it with a
+   *   `__meta.updatedAt` strictly greater than the last meta this client
+   *   observed (or, on a millisecond-coincident race from another
+   *   device, a different `deviceId` so the lex tie-break in
+   *   `metaBeats` resolves the winner). `buildSettingsMeta` enforces
+   *   monotonicity for our own writes; cross-device sync naturally
+   *   satisfies it via `Date.now()` advancement. A user who hand-edits
+   *   `data.json` without bumping `__meta.updatedAt` falls outside the
+   *   protocol — we accept that such an edit may be missed until the
+   *   next external-change event re-reads the file.
+   */
+  private async applyExternalSettingsUpdate(
+    raw: Record<string, unknown>,
+    incomingMeta: YoloDataMeta | null,
+  ): Promise<void> {
+    // Self-write echo: same device + same updatedAt means this event is
+    // the reflection of our own most recent saveData. Suppress.
+    if (
+      incomingMeta &&
+      this.currentSettingsMeta &&
+      incomingMeta.deviceId === this.currentSettingsMeta.deviceId &&
+      incomingMeta.updatedAt === this.currentSettingsMeta.updatedAt
+    ) {
+      return
+    }
+    // Meta-less incoming with a meta-stamped local copy: refuse, per
+    // protocol — we can't compare freshness so preferring local avoids
+    // stale replays clobbering newer settings.
+    if (!incomingMeta && this.currentSettingsMeta) {
+      return
+    }
+    // Reject anything our current in-memory state already beats under
+    // the total `metaBeats` ordering (older OR equal-and-loser).
+    if (
+      this.currentSettingsMeta &&
+      incomingMeta &&
+      !this.metaBeats(this.currentSettingsMeta, incomingMeta)
+    ) {
+      return
+    }
+
+    const parsedSettings = parseYoloSettings(raw)
+    const settingsWithDefaultAssistant =
+      ensureDefaultAssistantInSettings(parsedSettings)
+    const { chatModels, changed } = applyKnownMaxContextTokensToChatModels(
+      settingsWithDefaultAssistant.chatModels,
+    )
+    const normalizedSettings = changed
+      ? { ...settingsWithDefaultAssistant, chatModels }
+      : settingsWithDefaultAssistant
+
+    const previousSettings = this.settings
+    const baseDirChanged =
+      previousSettings?.yolo?.baseDir !== normalizedSettings.yolo.baseDir
+
+    this.settings = normalizedSettings
+    this.currentSettingsMeta = incomingMeta
+
+    if (baseDirChanged) {
+      // External payload references a different `baseDir`. Don't call
+      // `relocateYoloManagedData` here — the on-disk YOLO/ folder either
+      // already lives at the new path because Sync replicated it, or (in
+      // the manual paste case) corresponds to the user's pre-restore
+      // state and would be wrong to move. Tear down the active runtime
+      // and let the next access re-init against the new paths.
+      if (this.dbManager) {
+        await this.dbManager.cleanup()
+        this.dbManager = null
+        this.dbManagerInitPromise = null
+      }
+      new Notice(
+        'YOLO: detected a `baseDir` change in data.json. Reloaded settings against the new path.',
+      )
+    }
+
+    this.syncOAuthRuntimesFromSettings(normalizedSettings)
+    this.ragCoordinator?.updateSettings(normalizedSettings)
+    this.settingsChangeListeners.forEach((listener) => {
+      listener(normalizedSettings)
+    })
+  }
+
+  /**
+   * Obsidian's official hook for "data.json was modified outside of
+   * saveData()". Fires for Obsidian Sync pushes, remotely-save replays,
+   * manual user pastes, etc. — platform-agnostic and reliable, no
+   * fs.watch needed. https://docs.obsidian.md/Reference/TypeScript+API/Plugin/onExternalSettingsChange
+   */
+  async onExternalSettingsChange(): Promise<void> {
+    let raw: unknown
+    try {
+      raw = await this.loadData()
+    } catch (error) {
+      console.warn(
+        '[YOLO] Failed to re-read data.json after external change.',
+        error,
+      )
+      return
+    }
+    const extract = extractYoloDataMeta(raw)
+    if (!extract) {
+      return
+    }
+    await this.applyExternalSettingsUpdate(extract.raw, extract.meta)
+  }
+
+  /**
+   * Returns the on-disk settings + meta when the plugin-dir file has
+   * been mutated externally since we last wrote/loaded it; otherwise
+   * null. Used by `setSettings` to refuse stale full-object writes.
+   */
+  private async detectExternalSettingsConflict(): Promise<{
+    raw: Record<string, unknown>
+    meta: YoloDataMeta
+  } | null> {
+    let raw: unknown
+    try {
+      raw = await this.loadData()
+    } catch (error) {
+      console.warn('[YOLO] Failed to read data.json before write.', error)
+      return null
+    }
+    const extract = extractYoloDataMeta(raw)
+    if (!extract?.meta) {
+      return null
+    }
+    const diskMeta = extract.meta
+    const currentMeta = this.currentSettingsMeta
+    // Self-write: same device + same updatedAt is the write we just made.
+    if (
+      currentMeta &&
+      diskMeta.deviceId === currentMeta.deviceId &&
+      diskMeta.updatedAt === currentMeta.updatedAt
+    ) {
+      return null
+    }
+    // Conflict iff disk beats current memory (newer OR equal-but-foreign
+    // by deviceId tie-break).
+    if (currentMeta && !this.metaBeats(currentMeta, diskMeta)) {
+      return null
+    }
+    return { raw: extract.raw, meta: diskMeta }
+  }
+
+  /**
+   * One-shot migration of the deprecated "vault mirror" feature. Earlier
+   * versions optionally mirrored `data.json` into a vault-visible folder
+   * so that Obsidian Sync (which historically didn't sync plugin configs)
+   * could carry the settings. Modern Obsidian Sync replicates
+   * `.obsidian/plugins/<id>/data.json` natively, and the mirror was the
+   * source of considerable concurrency pain — so we removed it.
+   *
+   * Trigger: presence of the legacy mirror file (or its pointer) on disk.
+   * The legacy `experimental.storeDataInVault` flag has already been
+   * dropped from the schema, so it gets stripped on parse and isn't a
+   * reliable signal anymore — the file's existence is.
+   *
+   * Steps:
+   *   1. Read mirror via the pointer (which honors a custom baseDir).
+   *   2. If the mirror beats plugin-dir under `metaBeats`, adopt mirror
+   *      payload into memory + plugin-dir (verified via re-stamp).
+   *   3. Best-effort delete pointer + mirror file.
+   *   4. Notify the user once.
+   *
+   * Idempotent: a second run finds no mirror and exits silently.
+   */
+  private async migrateLegacyVaultMirrorIfNeeded(): Promise<void> {
+    let mirrorRead
+    try {
+      // Pass current settings so the reader can fall back to the
+      // default mirror path ONLY when the pointer file is genuinely
+      // absent — this covers the partial legacy state where a user
+      // manually deleted the pointer but left `YOLO/.yolo_data.json`
+      // behind. A pointer that exists but is corrupt is treated as
+      // authoritative and yields null, deferring to the next launch
+      // rather than risking a stale default-path mirror.
+      mirrorRead = await readVaultDataJson(this.app, this.settings)
+    } catch (error) {
+      console.warn('[YOLO] Legacy mirror read failed during migration.', error)
+      return
+    }
+    if (!mirrorRead) {
+      return
+    }
+
+    const mirrorMeta = mirrorRead.meta
+    const currentMeta = this.currentSettingsMeta
+    // Adopt mirror only when it strictly beats plugin-dir under the
+    // total `metaBeats` ordering. Both meta-less or local-meta-only =>
+    // keep plugin-dir (it's the new source of truth).
+    const shouldAdoptMirror = !!(
+      mirrorMeta &&
+      (!currentMeta || this.metaBeats(currentMeta, mirrorMeta))
+    )
+
+    if (shouldAdoptMirror && mirrorMeta) {
+      await this.applyExternalSettingsUpdate(mirrorRead.raw, mirrorMeta)
+      try {
+        await this.saveData(stampYoloDataMeta(this.settings, mirrorMeta))
+        this.currentSettingsMeta = mirrorMeta
+      } catch (error) {
+        console.warn(
+          '[YOLO] Failed to persist plugin-dir during legacy mirror migration; aborting cleanup so the mirror remains as the canonical copy.',
+          error,
+        )
+        return
+      }
+      // Read-after-write verify before deleting the canonical mirror
+      // copy. Catches half-committed FS state where `saveData` reported
+      // success but the file isn't actually persisted as expected. On
+      // verification failure, leave the mirror in place so the next
+      // launch retries the migration.
+      try {
+        const verify = extractYoloDataMeta(await this.loadData())
+        if (
+          !verify?.meta ||
+          verify.meta.deviceId !== mirrorMeta.deviceId ||
+          verify.meta.updatedAt !== mirrorMeta.updatedAt
+        ) {
+          console.warn(
+            '[YOLO] Plugin-dir verification failed after legacy mirror migration write; leaving mirror in place for next launch.',
+          )
+          return
+        }
+      } catch (error) {
+        console.warn(
+          '[YOLO] Plugin-dir verification read failed during legacy mirror migration; leaving mirror in place.',
+          error,
+        )
+        return
+      }
+    }
+
+    // Best-effort cleanup of mirror + pointer. Failures are logged but
+    // never block startup.
+    try {
+      await removeVaultDataJson(this.app, this.settings)
+    } catch (error) {
+      console.warn('[YOLO] Failed to remove legacy mirror files.', error)
+    }
+
+    new Notice(
+      'YOLO: migrated legacy vault-mirror settings. Cross-device sync now uses Obsidian Sync (or your sync tool of choice) on the plugin data file directly.',
+    )
+  }
+
+  async setSettings(newSettings: YoloSettings) {
+    const normalizedSettings = ensureDefaultAssistantInSettings(
+      normalizeYoloSettingsReferences(newSettings),
+    )
+    const validationResult = yoloSettingsSchema.safeParse(normalizedSettings)
 
     if (!validationResult.success) {
       new Notice(`Invalid settings:
@@ -942,17 +2458,74 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
       return
     }
 
+    // Read-before-write conflict check. If the file on disk has been
+    // mutated externally (Sync push, third-party sync replay, manual
+    // paste, …) since we last committed memory, the in-memory
+    // `newSettings` was constructed against a stale base. Blindly
+    // writing it back would silently revert whatever fields the external
+    // writer changed. Adopt the disk version into memory and notify the
+    // user to redo their edit. We intentionally don't auto-merge: most
+    // call sites pass a full settings object via `{ ...this.settings,
+    // foo: 'x' }` spreads, so we cannot tell which fields were the
+    // user's actual intent and which are stale snapshot.
+    const conflict = await this.detectExternalSettingsConflict()
+    if (conflict) {
+      await this.applyExternalSettingsUpdate(conflict.raw, conflict.meta)
+      new Notice(
+        'YOLO: settings were updated externally (sync, another device, or manual edit). Your last change was not saved — please redo it.',
+      )
+      return
+    }
+
+    const previousSettings = this.settings
+    const yoloBaseDirChanged =
+      previousSettings?.yolo?.baseDir !== normalizedSettings.yolo.baseDir
+
+    if (yoloBaseDirChanged) {
+      if (this.dbManager) {
+        await this.dbManager.save()
+      }
+      const migrated = await relocateYoloManagedData({
+        app: this.app,
+        fromSettings: previousSettings,
+        toSettings: normalizedSettings,
+      })
+      if (!migrated) {
+        new Notice(
+          'Failed to move YOLO managed data. Keeping previous YOLO root folder.',
+        )
+        return
+      }
+      if (this.dbManager) {
+        await this.dbManager.cleanup()
+        this.dbManager = null
+        this.dbManagerInitPromise = null
+      }
+    }
+
     this.settings = normalizedSettings
-    await this.saveData(normalizedSettings)
+    await this.persistPluginDirSettings(normalizedSettings)
+    setLLMDebugCaptureEnabled(
+      this.settings.debug?.captureRawRequestDebug ?? false,
+    )
+
+    this.syncOAuthRuntimesFromSettings(normalizedSettings)
     this.ragCoordinator?.updateSettings(normalizedSettings)
+
+    // When RAG is disabled, stop all pending auto-update timers and clear
+    // any retry_scheduled state so the background-activity UI disappears.
+    const ragIsEnabled = normalizedSettings.ragOptions.enabled
+    if (!ragIsEnabled) {
+      this.ragAutoUpdateService?.cleanup()
+      this.ragIndexService?.refreshActivity()
+    }
+
     this.settingsChangeListeners.forEach((listener) => {
       listener(normalizedSettings)
     })
   }
 
-  addSettingsChangeListener(
-    listener: (newSettings: SmartComposerSettings) => void,
-  ) {
+  addSettingsChangeListener(listener: (newSettings: YoloSettings) => void) {
     this.settingsChangeListeners.push(listener)
     return () => {
       this.settingsChangeListeners = this.settingsChangeListeners.filter(
@@ -961,16 +2534,92 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     }
   }
 
-  async openChatView(openNewChat = false) {
-    await this.getChatViewNavigator().openChatView(openNewChat)
+  isUpdateBannerDismissed(): boolean {
+    return this.updateBannerDismissed
   }
 
-  async activateChatView(chatProps?: ChatProps, openNewChat = false) {
-    await this.getChatViewNavigator().activateChatView(chatProps, openNewChat)
+  addUpdateCheckListener(listener: () => void): () => void {
+    this.updateCheckListeners.push(listener)
+    return () => {
+      this.updateCheckListeners = this.updateCheckListeners.filter(
+        (l) => l !== listener,
+      )
+    }
+  }
+
+  private notifyUpdateCheckListeners(): void {
+    for (const listener of this.updateCheckListeners) {
+      listener()
+    }
+  }
+
+  dismissUpdateBanner(): void {
+    this.updateBannerDismissed = true
+    this.notifyUpdateCheckListeners()
+  }
+
+  checkForUpdateOnce(): void {
+    if (this.hasCheckedForUpdate) {
+      return
+    }
+    this.hasCheckedForUpdate = true
+    void (async () => {
+      const fetched = await checkForUpdate(this.manifest.version)
+      if (fetched?.hasUpdate) {
+        this.updateCheckResult = fetched
+        this.notifyUpdateCheckListeners()
+      }
+    })()
+  }
+
+  async openChatView(options?: {
+    placement?: ChatLeafPlacement
+    openNewChat?: boolean
+    selectedBlock?: MentionableBlockData
+    initialConversationId?: string
+    prefillText?: string
+    forceNewLeaf?: boolean
+  }) {
+    await this.getChatViewNavigator().openChatView(options)
+  }
+
+  resolveRibbonPlacement(): ChatLeafPlacement {
+    const action = this.settings.chatOptions.ribbonClickAction ?? 'sidebar'
+    if (action === 'last') {
+      const last = this.settings.chatOptions.lastChatPlacement
+      return last ?? 'sidebar'
+    }
+    return action
+  }
+
+  async openCurrentOrSidebarNewChat() {
+    await this.getChatViewNavigator().openCurrentOrSidebarNewChat()
   }
 
   async addSelectionToChat(editor: Editor, view: MarkdownView) {
-    await this.getChatViewNavigator().addSelectionToChat(editor, view)
+    const editorView = this.getEditorView(editor)
+    const data = getMentionableBlockData(editor, view)
+    if (!data) return
+
+    const highlightId = crypto.randomUUID()
+    if (editorView) {
+      const sel = editorView.state.selection.main
+      if (!sel.empty) {
+        selectionHighlightController.addHighlight(
+          editorView,
+          highlightId,
+          { from: sel.from, to: sel.to },
+          'pinned',
+          'chat',
+        )
+      }
+    }
+
+    await this.getChatViewNavigator().addSelectionBlockToChat({
+      ...data,
+      source: 'selection-pinned',
+      highlightId,
+    })
   }
 
   async addFileToChat(file: TFile) {
@@ -981,6 +2630,15 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     await this.getChatViewNavigator().addFolderToChat(folder)
   }
 
+  /**
+   * Inject a MentionableImage into the most recently active chat panel.
+   * If no chat panel is open, a new sidebar chat is created automatically.
+   * This is the typed public API used by the PDF screenshot feature.
+   */
+  async addImageToActiveChat(image: MentionableImage): Promise<void> {
+    await this.getChatViewNavigator().addImageToChat(image)
+  }
+
   async getDbManager(): Promise<DatabaseManager> {
     if (this.dbManager) {
       return this.dbManager
@@ -989,9 +2647,12 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     if (!this.dbManagerInitPromise) {
       this.dbManagerInitPromise = (async () => {
         try {
+          const runtime = await this.getPGliteRuntimeManager().ensureReady()
           this.dbManager = await DatabaseManager.create(
             this.app,
-            this.resolvePgliteResourcePath(),
+            runtime.dir,
+            this.settings,
+            this.manifest.dir ? normalizePath(this.manifest.dir) : undefined,
           )
           return this.dbManager
         } catch (error) {
@@ -1014,7 +2675,7 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
       return dbManager.getVectorManager()
     } catch (error) {
       console.warn(
-        '[Smart Composer] Failed to initialize vector manager, skip vector-dependent operations.',
+        '[YOLO] Failed to initialize vector manager, skip vector-dependent operations.',
         error,
       )
       return null
@@ -1023,6 +2684,46 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
 
   async getRAGEngine(): Promise<RAGEngine> {
     return this.getRagCoordinator().getRagEngine()
+  }
+
+  async runRagIndex(options: {
+    mode: 'rebuild' | 'sync'
+    scope: import('./core/rag/reconciler').ReconcileScope
+    trigger: 'manual' | 'auto'
+    retryPolicy: 'none' | 'transient'
+    onProgress?: (
+      progress: import('./components/chat-view/QueryProgress').IndexProgress,
+    ) => void
+  }): Promise<void> {
+    await this.getRagIndexService().runIndex(options)
+  }
+
+  /** Re-issue the previously failed run. Falls back to a full sync reconcile. */
+  async retryRagIndex(): Promise<void> {
+    const snapshot = this.getRagIndexSnapshot()
+    if (snapshot.mode === null) {
+      return
+    }
+    await this.runRagIndex({
+      mode: snapshot.mode,
+      scope: { kind: 'all' },
+      trigger: 'manual',
+      retryPolicy: 'transient',
+    })
+  }
+
+  subscribeToRagIndexRuns(
+    listener: (snapshot: RagIndexRunSnapshot) => void,
+  ): () => void {
+    return this.getRagIndexService().subscribe(listener)
+  }
+
+  getRagIndexSnapshot(): RagIndexRunSnapshot {
+    return this.getRagIndexService().getSnapshot()
+  }
+
+  cancelRagIndex(): void {
+    this.getRagIndexService().cancelActiveRun()
   }
 
   async getMcpManager(): Promise<McpManager> {
@@ -1094,17 +2795,5 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
       geminiTools,
       mentionables,
     )
-  }
-
-  // removed migrateToJsonStorage (templates)
-
-  private async reloadChatView() {
-    const leaves = this.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)
-    if (leaves.length === 0 || !(leaves[0].view instanceof ChatView)) {
-      return
-    }
-    new Notice('Reloading "next-composer" due to migration', 1000)
-    leaves[0].detach()
-    await this.activateChatView()
   }
 }

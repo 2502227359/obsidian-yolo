@@ -3,13 +3,20 @@ import { Editor } from 'obsidian'
 import React from 'react'
 import { Root, createRoot } from 'react-dom/client'
 
+import { ChatView } from '../../../ChatView'
 import { AppProvider } from '../../../contexts/app-context'
+import { ChatViewProvider } from '../../../contexts/chat-view-context'
 import { LanguageProvider } from '../../../contexts/language-context'
 import { McpProvider } from '../../../contexts/mcp-context'
 import { PluginProvider } from '../../../contexts/plugin-context'
 import { RAGProvider } from '../../../contexts/rag-context'
 import { SettingsProvider } from '../../../contexts/settings-context'
-import SmartComposerPlugin from '../../../main'
+import type { QuickAskAnchor } from '../../../features/editor/quick-ask/quickAsk.anchor'
+import type {
+  QuickAskLaunchMode,
+  QuickAskSelectionScope,
+} from '../../../features/editor/quick-ask/quickAsk.types'
+import YoloPlugin from '../../../main'
 import type { Mentionable } from '../../../types/mentionable'
 import {
   clearDynamicStyleClass,
@@ -17,6 +24,36 @@ import {
 } from '../../../utils/dom/dynamicStyleManager'
 
 import { QuickAskPanel } from './QuickAskPanel'
+
+/**
+ * Capabilities discriminated union.
+ *
+ * When edit=true, editor and view must be provided.
+ * When edit=false, editor and view must be null (PDF path).
+ * TypeScript enforces this at the call site.
+ */
+export type QuickAskCapabilities =
+  | { edit: true; editor: Editor; view: EditorView }
+  | { edit: false; editor: null; view: null }
+
+type QuickAskOverlayOptions = {
+  plugin: YoloPlugin
+  anchor: QuickAskAnchor
+  capabilities: QuickAskCapabilities
+  contextText: string
+  fileTitle: string
+  sourceFilePath?: string
+  initialPrompt?: string
+  initialMentionables?: Mentionable[]
+  initialMode?: QuickAskLaunchMode
+  initialInput?: string
+  editContextText?: string
+  editSelectionFrom?: { line: number; ch: number }
+  selectionScope?: QuickAskSelectionScope
+  autoSend?: boolean
+  initialAssistantId?: string
+  onClose: () => void
+}
 
 export class QuickAskOverlay {
   private static overlayRoot: HTMLElement | null = null
@@ -41,29 +78,13 @@ export class QuickAskOverlay {
   private dragPosition: { x: number; y: number } | null = null
   // Resize state - when set, override panel size
   private resizeSize: { width: number; height: number } | null = null
+  // pos is only meaningful for CM-based anchors (ViewPlugin route)
   private pos: number | null = null
 
-  constructor(
-    private readonly options: {
-      plugin: SmartComposerPlugin
-      editor: Editor
-      view: EditorView
-      contextText: string
-      fileTitle: string
-      sourceFilePath?: string
-      initialPrompt?: string
-      initialMentionables?: Mentionable[]
-      initialMode?: 'ask' | 'edit' | 'edit-direct'
-      initialInput?: string
-      editContextText?: string
-      editSelectionFrom?: { line: number; ch: number }
-      autoSend?: boolean
-      onClose: () => void
-    },
-  ) {}
+  constructor(private readonly options: QuickAskOverlayOptions) {}
 
-  mount(pos: number): void {
-    this.pos = pos
+  mount(pos?: number): void {
+    this.pos = pos ?? 0
     QuickAskOverlay.currentInstance = this
     this.mountOverlay()
     this.setupGlobalListeners()
@@ -121,7 +142,7 @@ export class QuickAskOverlay {
       const host = overlayRoot.parentElement
       overlayRoot.remove()
       QuickAskOverlay.overlayRoot = null
-      host?.classList.remove('smtcmp-quick-ask-overlay-host')
+      host?.classList.remove('yolo-quick-ask-overlay-host')
     }
     this.pos = null
   }
@@ -132,7 +153,7 @@ export class QuickAskOverlay {
       QuickAskOverlay.overlayRoot.parentElement !== host
     ) {
       QuickAskOverlay.overlayRoot.parentElement?.classList.remove(
-        'smtcmp-quick-ask-overlay-host',
+        'yolo-quick-ask-overlay-host',
       )
       QuickAskOverlay.overlayRoot.remove()
       QuickAskOverlay.overlayRoot = null
@@ -141,9 +162,9 @@ export class QuickAskOverlay {
     if (QuickAskOverlay.overlayRoot) return QuickAskOverlay.overlayRoot
 
     const root = document.createElement('div')
-    root.className = 'smtcmp-quick-ask-overlay-root'
+    root.className = 'yolo-quick-ask-overlay-root'
     host.appendChild(root)
-    host.classList.add('smtcmp-quick-ask-overlay-host')
+    host.classList.add('yolo-quick-ask-overlay-host')
     QuickAskOverlay.overlayRoot = root
     return root
   }
@@ -175,63 +196,93 @@ export class QuickAskOverlay {
   }
 
   private mountOverlay() {
-    // 将浮层挂载到编辑器 DOM 内部，使其层级/裁剪行为更接近正文内容，避免遮挡标题栏
-    const overlayHost = this.options.view.dom ?? document.body
+    const overlayHost = this.options.anchor.hostEl
     this.overlayHost = overlayHost
 
     const overlayRoot = QuickAskOverlay.getOverlayRoot(overlayHost)
     const overlayContainer = document.createElement('div')
-    overlayContainer.className = 'smtcmp-quick-ask-overlay'
+    overlayContainer.className = 'yolo-quick-ask-overlay'
     overlayRoot.appendChild(overlayContainer)
     this.overlayContainer = overlayContainer
 
+    const { capabilities } = this.options
+
     this.root = createRoot(overlayContainer)
     this.root.render(
-      <PluginProvider plugin={this.options.plugin}>
-        <SettingsProvider
-          settings={this.options.plugin.settings}
-          setSettings={(newSettings) =>
-            this.options.plugin.setSettings(newSettings)
-          }
-          addSettingsChangeListener={(listener) =>
-            this.options.plugin.addSettingsChangeListener(listener)
-          }
-        >
-          <LanguageProvider>
-            <AppProvider app={this.options.plugin.app}>
-              <RAGProvider
-                getRAGEngine={() => this.options.plugin.getRAGEngine()}
-              >
-                <McpProvider
-                  getMcpManager={() => this.options.plugin.getMcpManager()}
+      <ChatViewProvider chatView={this.options.plugin as unknown as ChatView}>
+        <PluginProvider plugin={this.options.plugin}>
+          <SettingsProvider
+            settings={this.options.plugin.settings}
+            setSettings={(newSettings) =>
+              this.options.plugin.setSettings(newSettings)
+            }
+            addSettingsChangeListener={(listener) =>
+              this.options.plugin.addSettingsChangeListener(listener)
+            }
+          >
+            <LanguageProvider>
+              <AppProvider app={this.options.plugin.app}>
+                <RAGProvider
+                  getRAGEngine={() => this.options.plugin.getRAGEngine()}
                 >
-                  <QuickAskPanel
-                    plugin={this.options.plugin}
-                    editor={this.options.editor}
-                    view={this.options.view}
-                    contextText={this.options.contextText}
-                    fileTitle={this.options.fileTitle}
-                    sourceFilePath={this.options.sourceFilePath}
-                    initialPrompt={this.options.initialPrompt}
-                    initialMentionables={this.options.initialMentionables}
-                    initialMode={this.options.initialMode}
-                    initialInput={this.options.initialInput}
-                    editContextText={this.options.editContextText}
-                    editSelectionFrom={this.options.editSelectionFrom}
-                    autoSend={this.options.autoSend}
-                    onClose={this.closeWithAnimation}
-                    containerRef={this.containerRef}
-                    onOverlayStateChange={this.handleOverlayStateChange}
-                    onDragOffset={this.handleDragOffset}
-                    onResize={this.handleResize}
-                    onDockToTopRight={this.handleDockToTopRight}
-                  />
-                </McpProvider>
-              </RAGProvider>
-            </AppProvider>
-          </LanguageProvider>
-        </SettingsProvider>
-      </PluginProvider>,
+                  <McpProvider
+                    getMcpManager={() => this.options.plugin.getMcpManager()}
+                  >
+                    {capabilities.edit ? (
+                      <QuickAskPanel
+                        plugin={this.options.plugin}
+                        capabilities={{ edit: true }}
+                        editor={capabilities.editor}
+                        view={capabilities.view}
+                        contextText={this.options.contextText}
+                        fileTitle={this.options.fileTitle}
+                        sourceFilePath={this.options.sourceFilePath}
+                        initialPrompt={this.options.initialPrompt}
+                        initialMentionables={this.options.initialMentionables}
+                        initialMode={this.options.initialMode}
+                        initialInput={this.options.initialInput}
+                        editContextText={this.options.editContextText}
+                        editSelectionFrom={this.options.editSelectionFrom}
+                        selectionScope={this.options.selectionScope}
+                        autoSend={this.options.autoSend}
+                        initialAssistantId={this.options.initialAssistantId}
+                        onClose={this.closeWithAnimation}
+                        containerRef={this.containerRef}
+                        onOverlayStateChange={this.handleOverlayStateChange}
+                        onDragOffset={this.handleDragOffset}
+                        onResize={this.handleResize}
+                        onDockToTopRight={this.handleDockToTopRight}
+                      />
+                    ) : (
+                      <QuickAskPanel
+                        plugin={this.options.plugin}
+                        capabilities={{ edit: false }}
+                        editor={null}
+                        view={null}
+                        contextText={this.options.contextText}
+                        fileTitle={this.options.fileTitle}
+                        sourceFilePath={this.options.sourceFilePath}
+                        initialPrompt={this.options.initialPrompt}
+                        initialMentionables={this.options.initialMentionables}
+                        initialMode={this.options.initialMode}
+                        initialInput={this.options.initialInput}
+                        autoSend={this.options.autoSend}
+                        initialAssistantId={this.options.initialAssistantId}
+                        onClose={this.closeWithAnimation}
+                        containerRef={this.containerRef}
+                        onOverlayStateChange={this.handleOverlayStateChange}
+                        onDragOffset={this.handleDragOffset}
+                        onResize={this.handleResize}
+                        onDockToTopRight={this.handleDockToTopRight}
+                      />
+                    )}
+                  </McpProvider>
+                </RAGProvider>
+              </AppProvider>
+            </LanguageProvider>
+          </SettingsProvider>
+        </PluginProvider>
+      </ChatViewProvider>,
     )
 
     const handleScroll = () => this.schedulePositionUpdate()
@@ -246,19 +297,29 @@ export class QuickAskOverlay {
       window.removeEventListener('resize', handleResize),
     )
 
-    const scrollDom = this.options.view?.scrollDOM
-    if (scrollDom) {
-      scrollDom.addEventListener('scroll', handleScroll)
+    const scrollEl = this.options.anchor.scrollEl
+    if (scrollEl) {
+      scrollEl.addEventListener('scroll', handleScroll)
       this.cleanupCallbacks.push(() =>
-        scrollDom.removeEventListener('scroll', handleScroll),
+        scrollEl.removeEventListener('scroll', handleScroll),
       )
     }
 
     this.resizeObserver = new ResizeObserver(() =>
       this.schedulePositionUpdate(),
     )
-    if (scrollDom) this.resizeObserver.observe(scrollDom)
-    this.resizeObserver.observe(overlayContainer)
+    if (scrollEl) this.resizeObserver.observe(scrollEl)
+  }
+
+  private getMinimumTopOffset(margin: number): number {
+    return margin
+  }
+
+  private getPanelHeight(): number | null {
+    const rect = this.containerRef.current?.getBoundingClientRect()
+    if (!rect || !Number.isFinite(rect.height)) return null
+    if (rect.height <= 0) return null
+    return rect.height
   }
 
   private setupGlobalListeners() {
@@ -287,10 +348,24 @@ export class QuickAskOverlay {
     })
   }
 
-  updatePosition(pos?: number): void {
+  updatePosition(
+    pos?: number,
+    selectionAnchor?: { from: number; to: number } | null,
+  ): void {
     if (typeof pos === 'number') {
       this.pos = pos
     }
+    // selectionAnchor updates are handled by the CM ViewPlugin via the anchor;
+    // PDF anchors capture the range at construction time and don't need updates.
+    void selectionAnchor
+
+    // Opening position is anchored once. After the panel becomes an
+    // independent floating window, document edits should no longer pull it
+    // around by the trigger line or selection.
+    if (this.dragPosition || this.isDockedTopRight) {
+      return
+    }
+
     this.schedulePositionUpdate()
   }
 
@@ -308,7 +383,9 @@ export class QuickAskOverlay {
       return
     }
 
-    const anchorRect = this.options.view.coordsAtPos(this.pos)
+    const anchor = this.options.anchor
+    const selectionRects = anchor.getSelectionRects()
+    const anchorRect = selectionRects?.endRect ?? anchor.getAnchorRect()
     if (!anchorRect) {
       return
     }
@@ -321,29 +398,16 @@ export class QuickAskOverlay {
     const margin = 12
     const offsetY = 6
 
-    const scrollDom = this.options.view.scrollDOM
-    const scrollRect = scrollDom?.getBoundingClientRect()
-    const sizer = scrollDom?.querySelector('.cm-sizer')
-    const sizerRect = sizer?.getBoundingClientRect()
-
-    const fallbackWidth = parseInt(
-      getComputedStyle(document.documentElement).getPropertyValue(
-        '--file-line-width',
-      ) || '720',
-      10,
-    )
-
-    const editorContentWidth =
-      sizerRect?.width ?? scrollRect?.width ?? fallbackWidth
+    const contentBounds = anchor.getContentBounds()
+    const editorContentWidth = contentBounds.width
     const maxPanelWidth = Math.max(
       120,
       Math.min(editorContentWidth, viewportWidth - margin * 2),
     )
 
-    const contentLeft =
-      (sizerRect?.left ?? scrollRect?.left ?? hostRect.left + margin) -
-      hostRect.left
+    const contentLeft = contentBounds.left - hostRect.left
     const contentRight = contentLeft + editorContentWidth
+    const panelHeight = this.resizeSize?.height ?? this.getPanelHeight()
 
     let left = anchorRect.left - hostRect.left
     left = Math.min(left, contentRight - maxPanelWidth)
@@ -351,15 +415,60 @@ export class QuickAskOverlay {
     left = Math.min(left, viewportWidth - margin - maxPanelWidth)
     left = Math.max(left, margin)
 
-    const top = anchorRect.bottom - hostRect.top + offsetY
+    const minTop = this.getMinimumTopOffset(margin)
+    const preferredBelowTop = anchorRect.bottom - hostRect.top + offsetY
+    const preferredAboveTop =
+      (selectionRects?.startRect.top ?? anchorRect.top) -
+      hostRect.top -
+      offsetY -
+      (panelHeight ?? 0)
+
+    const resolvedLeft = Math.round(left)
+
+    if (panelHeight === null && !this.resizeSize) {
+      updateDynamicStyleClass(
+        this.overlayContainer,
+        'yolo-quick-ask-overlay-pos',
+        {
+          width: maxPanelWidth,
+          left: resolvedLeft,
+          top: Math.max(minTop, Math.round(preferredBelowTop)),
+        },
+      )
+      this.schedulePositionUpdate()
+      return
+    }
+
+    let top = preferredBelowTop
+    if (panelHeight !== null) {
+      const maxTop = Math.max(minTop, hostRect.height - margin - panelHeight)
+      const fitsBelow =
+        preferredBelowTop + panelHeight <= hostRect.height - margin
+      const fitsAbove = preferredAboveTop >= minTop
+
+      if (!fitsBelow && fitsAbove) {
+        top = preferredAboveTop
+      } else if (!fitsBelow) {
+        top = Math.min(maxTop, Math.max(minTop, preferredBelowTop))
+      }
+    }
+
+    const resolvedTop = Math.max(minTop, Math.round(top))
+
+    // Lock the initial anchored placement into the floating window's own
+    // geometry state so later content growth only affects inner scrolling.
+    this.dragPosition = {
+      x: hostRect.left + resolvedLeft,
+      y: hostRect.top + resolvedTop,
+    }
 
     updateDynamicStyleClass(
       this.overlayContainer,
-      'smtcmp-quick-ask-overlay-pos',
+      'yolo-quick-ask-overlay-pos',
       {
         width: maxPanelWidth,
-        left: Math.round(left),
-        top: Math.round(top),
+        left: resolvedLeft,
+        top: resolvedTop,
       },
     )
   }
@@ -378,58 +487,74 @@ export class QuickAskOverlay {
     this.hasUserDragged = true
     this.isDockedTopRight = false
     this.dragPosition = { x, y }
-    this.updateDragPosition()
+    // 通过 rAF 节流;mousemove 在高刷屏可达 120Hz+,直接同步 updateDragPosition
+    // 会让每次都做 4 次 getBoundingClientRect + getComputedStyle + querySelector,
+    // 拖拽明显发卡。schedulePositionUpdate 会自动路由回 updateDragPosition。
+    this.schedulePositionUpdate()
   }
 
   private handleResize = (width: number, height: number) => {
     this.resizeSize = { width, height }
-    this.updateDragPosition() // Also update position when resizing
+    this.schedulePositionUpdate()
   }
 
   private updateDragPosition() {
     if (!this.overlayContainer || !this.dragPosition) return
 
+    const margin = 12
     const hostRect =
       this.overlayHost?.getBoundingClientRect() ??
       document.body.getBoundingClientRect()
 
-    const measuredWidth = this.getPanelWidth()
+    // Panel rect 一次读两个维度,避免对同一元素两次 getBoundingClientRect。
+    const panelRect = this.containerRef.current?.getBoundingClientRect() ?? null
+    const measuredWidth =
+      panelRect && Number.isFinite(panelRect.width) && panelRect.width > 0
+        ? panelRect.width
+        : null
+    const measuredHeight =
+      panelRect && Number.isFinite(panelRect.height) && panelRect.height > 0
+        ? panelRect.height
+        : null
 
-    // Get panel dimensions for width calculation
-    const scrollDom = this.options.view.scrollDOM
-    const scrollRect = scrollDom?.getBoundingClientRect()
-    const sizer = scrollDom?.querySelector('.cm-sizer')
-    const sizerRect = sizer?.getBoundingClientRect()
+    // Content width fallback — only needed when user hasn't resized and panel
+    // width isn't measured yet. Lazily evaluated to avoid unnecessary DOM reads.
+    const computeContentWidth = () => {
+      const bounds = this.options.anchor.getContentBounds()
+      return bounds.width
+    }
 
-    const fallbackWidth = parseInt(
-      getComputedStyle(document.documentElement).getPropertyValue(
-        '--file-line-width',
-      ) || '720',
-      10,
-    )
-
-    const viewportWidth = hostRect.width
-    const margin = 12
-
-    const editorContentWidth =
-      sizerRect?.width ?? scrollRect?.width ?? fallbackWidth
-
-    // Use resized width if available, otherwise use default max width
     const panelWidth =
       this.resizeSize?.width ??
       measuredWidth ??
-      Math.max(120, Math.min(editorContentWidth, viewportWidth - margin * 2))
+      Math.max(
+        120,
+        Math.min(computeContentWidth(), hostRect.width - margin * 2),
+      )
 
     const panelHeight = this.resizeSize?.height
+    const minTop = this.getMinimumTopOffset(margin)
+    const minLeft = margin
+    const maxLeft = Math.max(minLeft, hostRect.width - margin - panelWidth)
+    const effectiveHeight = panelHeight ?? measuredHeight ?? 0
+    const maxTop = Math.max(minTop, hostRect.height - margin - effectiveHeight)
+    const nextLeft = Math.min(
+      maxLeft,
+      Math.max(minLeft, Math.round(this.dragPosition.x - hostRect.left)),
+    )
+    const nextTop = Math.min(
+      maxTop,
+      Math.max(minTop, Math.round(this.dragPosition.y - hostRect.top)),
+    )
 
     updateDynamicStyleClass(
       this.overlayContainer,
-      'smtcmp-quick-ask-overlay-pos',
+      'yolo-quick-ask-overlay-pos',
       {
         width: panelWidth,
         ...(panelHeight ? { height: panelHeight } : {}),
-        left: Math.round(this.dragPosition.x - hostRect.left),
-        top: Math.round(this.dragPosition.y - hostRect.top),
+        left: nextLeft,
+        top: nextTop,
       },
     )
   }
@@ -442,34 +567,29 @@ export class QuickAskOverlay {
     const hostRect =
       this.overlayHost?.getBoundingClientRect() ??
       document.body.getBoundingClientRect()
+    const dockRect = this.options.anchor.getDockReferenceRect()
 
     const measuredWidth = this.getPanelWidth()
 
-    const scrollDom = this.options.view.scrollDOM
-    const scrollRect = scrollDom?.getBoundingClientRect()
-    const sizer = scrollDom?.querySelector('.cm-sizer')
-    const sizerRect = sizer?.getBoundingClientRect()
-
-    const fallbackWidth = parseInt(
-      getComputedStyle(document.documentElement).getPropertyValue(
-        '--file-line-width',
-      ) || '720',
-      10,
-    )
+    const contentBounds = this.options.anchor.getContentBounds()
+    const editorContentWidth = contentBounds.width
 
     const viewportWidth = hostRect.width
     const margin = 12
-
-    const editorContentWidth =
-      sizerRect?.width ?? scrollRect?.width ?? fallbackWidth
 
     const panelWidth =
       this.resizeSize?.width ??
       measuredWidth ??
       Math.max(120, Math.min(editorContentWidth, viewportWidth - margin * 2))
 
-    const left = hostRect.right - margin - panelWidth
-    const top = hostRect.top + margin
+    const left = Math.min(
+      dockRect.right - margin - panelWidth,
+      hostRect.right - margin - panelWidth,
+    )
+    const top = Math.max(
+      hostRect.top + this.getMinimumTopOffset(margin),
+      dockRect.top + margin,
+    )
 
     this.dragPosition = { x: left, y: top }
     this.updateDragPosition()
@@ -477,7 +597,7 @@ export class QuickAskOverlay {
 
   private startDockAnimation() {
     if (!this.overlayContainer) return
-    this.overlayContainer.classList.add('smtcmp-quick-ask-overlay--docking')
+    this.overlayContainer.classList.add('yolo-quick-ask-overlay--docking')
 
     if (this.dockAnimationTimeout !== null) {
       window.clearTimeout(this.dockAnimationTimeout)
@@ -485,9 +605,7 @@ export class QuickAskOverlay {
 
     this.dockAnimationTimeout = window.setTimeout(() => {
       this.dockAnimationTimeout = null
-      this.overlayContainer?.classList.remove(
-        'smtcmp-quick-ask-overlay--docking',
-      )
+      this.overlayContainer?.classList.remove('yolo-quick-ask-overlay--docking')
     }, 220)
   }
 

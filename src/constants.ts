@@ -1,40 +1,108 @@
+import { Platform } from 'obsidian'
+
 import { ChatModel } from './types/chat-model.types'
 import { EmbeddingModel } from './types/embedding-model.types'
-import { LLMProvider, LLMProviderType } from './types/provider.types'
+import {
+  LLMProvider,
+  LLMProviderApiType,
+  LLMProviderPresetType,
+  getDefaultApiTypeForPresetType,
+  getDefaultRequestTransportModeForPresetType,
+} from './types/provider.types'
 
-export const CHAT_VIEW_TYPE = 'smtcmp-chat-view'
-
-export const PGLITE_DB_PATH = '.smtcmp_vector_db.tar.gz'
-export const PLUGIN_ID = 'obsidian-smart-composer'
+export const CHAT_VIEW_TYPE = 'yolo-chat-view'
+// Empty-string sentinel; display layer localizes via getConversationDisplayTitle.
+export const DEFAULT_UNTITLED_CONVERSATION_TITLE = ''
+// Historical defaults persisted in user data — kept so auto-naming still overwrites them.
+export const LEGACY_UNTITLED_CONVERSATION_TITLES = ['新消息', '新对话'] as const
 
 // Default model ids (with provider prefix)
 export const DEFAULT_CHAT_MODEL_ID = 'openai/gpt-5'
-export const DEFAULT_APPLY_MODEL_ID = 'openai/gpt-4.1-mini'
+export const DEFAULT_CHAT_TITLE_MODEL_ID = 'openai/gpt-4.1-mini'
 
 // Recommended model ids (with provider prefix)
 export const RECOMMENDED_MODELS_FOR_CHAT = [
   'anthropic/claude-sonnet-4.0',
   'openai/gpt-4.1',
 ]
-export const RECOMMENDED_MODELS_FOR_APPLY = ['openai/gpt-4.1-mini']
+export const RECOMMENDED_MODELS_FOR_CHAT_TITLE = ['openai/gpt-4.1-mini']
 export const RECOMMENDED_MODELS_FOR_EMBEDDING = [
   'openai/text-embedding-3-small',
 ]
 
 export const DEFAULT_CHAT_TITLE_PROMPT = {
-  en: "You are a title generator. Generate a concise conversation title based on the first user message and the assistant's first completed reply. Output the title only.",
-  zh: '你是一个标题生成器。请基于第一轮对话（用户首条消息与助手首个完整回复）生成一个简洁的会话标题，直接输出标题本身。',
-  it: "Sei un generatore di titoli. Genera un titolo di conversazione conciso in base al primo messaggio dell'utente e alla prima risposta completa dell'assistente. Restituisci solo il titolo.",
+  en: 'You are a title generator. Generate a concise conversation title based on the first user message. Output the title only.',
+  zh: '你是一个标题生成器。请基于用户首条消息生成一个简洁的会话标题，直接输出标题本身。',
+  it: "Sei un generatore di titoli. Genera un titolo di conversazione conciso in base al primo messaggio dell'utente. Restituisci solo il titolo.",
 } as const
 
-export const PROVIDER_TYPES_INFO = {
+const REQUEST_TRANSPORT_MODE_SETTING = {
+  label: 'Request transport mode',
+  key: 'requestTransportMode',
+  type: 'select' as const,
+  required: false,
+  options: {
+    auto: 'Auto',
+    browser: 'Browser fetch',
+    obsidian: 'Obsidian requestUrl',
+    node: 'Desktop Node fetch',
+  },
+  description:
+    'Auto: on desktop tries Node fetch first, then browser fetch on CORS/network errors; on mobile tries browser fetch then Obsidian requestUrl. Obsidian mode buffers streaming responses. Node mode uses desktop-only Node fetch for real streaming.',
+}
+
+// Surfaced dynamically when a provider's apiType is 'anthropic'
+// (native Anthropic or Anthropic-compatible endpoints like Moonshot/Kimi).
+export const PROMPT_CACHING_SETTING = {
+  label: 'Prompt caching',
+  key: 'promptCaching',
+  type: 'toggle' as const,
+  required: false,
+}
+
+export const PROVIDER_PRESET_INFO = {
   openai: {
     label: 'OpenAI',
     defaultProviderId: 'openai',
     requireApiKey: true,
     requireBaseUrl: false,
     supportEmbedding: true,
-    additionalSettings: [],
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  'chatgpt-oauth': {
+    label: 'ChatGPT OAuth',
+    defaultProviderId: 'chatgpt-oauth',
+    requireApiKey: false,
+    requireBaseUrl: false,
+    supportEmbedding: false,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  'gemini-oauth': {
+    label: 'Gemini OAuth',
+    defaultProviderId: 'gemini-oauth',
+    requireApiKey: false,
+    requireBaseUrl: false,
+    supportEmbedding: false,
+    additionalSettings: [
+      {
+        label: 'Google Cloud Project ID',
+        key: 'projectId',
+        placeholder: 'my-gcp-project-id',
+        type: 'text',
+        required: false,
+        description:
+          'Optional. Some Gemini plans require a Google Cloud project ID to access paid quotas.',
+      },
+      REQUEST_TRANSPORT_MODE_SETTING,
+    ],
+  },
+  'qwen-oauth': {
+    label: 'Qwen OAuth',
+    defaultProviderId: 'qwen-oauth',
+    requireApiKey: false,
+    requireBaseUrl: false,
+    supportEmbedding: false,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
   },
   anthropic: {
     label: 'Anthropic',
@@ -42,7 +110,7 @@ export const PROVIDER_TYPES_INFO = {
     requireApiKey: true,
     requireBaseUrl: false,
     supportEmbedding: false,
-    additionalSettings: [],
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
   },
   gemini: {
     label: 'Gemini',
@@ -50,7 +118,7 @@ export const PROVIDER_TYPES_INFO = {
     requireApiKey: true,
     requireBaseUrl: false,
     supportEmbedding: true,
-    additionalSettings: [],
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
   },
   groq: {
     label: 'Groq',
@@ -58,7 +126,7 @@ export const PROVIDER_TYPES_INFO = {
     requireApiKey: true,
     requireBaseUrl: false,
     supportEmbedding: false,
-    additionalSettings: [],
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
   },
   openrouter: {
     label: 'OpenRouter',
@@ -66,7 +134,7 @@ export const PROVIDER_TYPES_INFO = {
     requireApiKey: true,
     requireBaseUrl: false,
     supportEmbedding: true,
-    additionalSettings: [],
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
   },
   ollama: {
     label: 'Ollama',
@@ -74,7 +142,7 @@ export const PROVIDER_TYPES_INFO = {
     requireApiKey: false,
     requireBaseUrl: false,
     supportEmbedding: true,
-    additionalSettings: [],
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
   },
   'lm-studio': {
     label: 'LM Studio',
@@ -82,7 +150,7 @@ export const PROVIDER_TYPES_INFO = {
     requireApiKey: false,
     requireBaseUrl: false,
     supportEmbedding: true,
-    additionalSettings: [],
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
   },
   deepseek: {
     label: 'DeepSeek',
@@ -90,7 +158,15 @@ export const PROVIDER_TYPES_INFO = {
     requireApiKey: true,
     requireBaseUrl: false,
     supportEmbedding: false,
-    additionalSettings: [],
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  moonshot: {
+    label: 'Moonshot',
+    defaultProviderId: null,
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: false,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
   },
   perplexity: {
     label: 'Perplexity',
@@ -98,7 +174,7 @@ export const PROVIDER_TYPES_INFO = {
     requireApiKey: true,
     requireBaseUrl: false,
     supportEmbedding: false,
-    additionalSettings: [],
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
   },
   mistral: {
     label: 'Mistral',
@@ -106,7 +182,7 @@ export const PROVIDER_TYPES_INFO = {
     requireApiKey: true,
     requireBaseUrl: false,
     supportEmbedding: false,
-    additionalSettings: [],
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
   },
   morph: {
     label: 'Morph',
@@ -114,7 +190,7 @@ export const PROVIDER_TYPES_INFO = {
     requireApiKey: true,
     requireBaseUrl: false,
     supportEmbedding: false,
-    additionalSettings: [],
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
   },
   'azure-openai': {
     label: 'Azure OpenAI',
@@ -137,7 +213,113 @@ export const PROVIDER_TYPES_INFO = {
         type: 'text',
         required: true,
       },
+      REQUEST_TRANSPORT_MODE_SETTING,
     ],
+  },
+  'amazon-bedrock': {
+    label: 'Amazon Bedrock',
+    defaultProviderId: null, // no default provider for this type
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: true,
+    additionalSettings: [
+      {
+        label: 'AWS Region',
+        key: 'awsRegion',
+        placeholder: 'us-east-1',
+        type: 'text',
+        required: true,
+      },
+      REQUEST_TRANSPORT_MODE_SETTING,
+    ],
+  },
+  zhipu: {
+    label: 'Zhipu',
+    defaultProviderId: null,
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: true,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  doubao: {
+    label: 'Doubao',
+    defaultProviderId: null,
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: true,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  siliconflow: {
+    label: 'SiliconFlow',
+    defaultProviderId: null,
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: true,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  stepfun: {
+    label: 'StepFun',
+    defaultProviderId: null,
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: false,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  minimax: {
+    label: 'MiniMax',
+    defaultProviderId: null,
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: true,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  hunyuan: {
+    label: 'Hunyuan',
+    defaultProviderId: null,
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: false,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  xai: {
+    label: 'xAI',
+    defaultProviderId: null,
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: false,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  'together-ai': {
+    label: 'Together AI',
+    defaultProviderId: null,
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: true,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  cerebras: {
+    label: 'Cerebras',
+    defaultProviderId: null,
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: false,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  sambanova: {
+    label: 'SambaNova',
+    defaultProviderId: null,
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: false,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
+  },
+  xiaomimimo: {
+    label: 'Xiaomi MiMo',
+    defaultProviderId: 'xiaomimimo',
+    requireApiKey: true,
+    requireBaseUrl: false,
+    supportEmbedding: false,
+    additionalSettings: [REQUEST_TRANSPORT_MODE_SETTING],
   },
   'openai-compatible': {
     label: 'OpenAI Compatible',
@@ -154,18 +336,11 @@ export const PROVIDER_TYPES_INFO = {
         description:
           'Enable this if you encounter CORS errors related to Stainless headers (x-stainless-os, etc.)',
       },
-      {
-        label: 'Use Obsidian requestUrl',
-        key: 'useObsidianRequestUrl',
-        type: 'toggle',
-        required: false,
-        description:
-          'Use Obsidian requestUrl to bypass CORS restrictions. Streaming responses will be buffered.',
-      },
+      REQUEST_TRANSPORT_MODE_SETTING,
     ],
   },
 } as const satisfies Record<
-  LLMProviderType,
+  LLMProviderPresetType,
   {
     label: string
     defaultProviderId: string | null
@@ -175,13 +350,53 @@ export const PROVIDER_TYPES_INFO = {
     additionalSettings: {
       label: string
       key: string
-      type: 'text' | 'toggle'
+      type: 'text' | 'toggle' | 'select'
+      options?: Record<string, string>
       placeholder?: string
       description?: string
       required?: boolean
     }[]
   }
 >
+
+export const PROVIDER_API_INFO: Record<
+  LLMProviderApiType,
+  {
+    label: string
+  }
+> = {
+  'openai-compatible': {
+    label: 'OpenAI Compatible',
+  },
+  'openai-responses': {
+    label: 'OpenAI Responses',
+  },
+  anthropic: {
+    label: 'Anthropic API',
+  },
+  gemini: {
+    label: 'Gemini API',
+  },
+  'amazon-bedrock': {
+    label: 'Amazon Bedrock Converse',
+  },
+}
+
+export const PROVIDER_TYPES_INFO = PROVIDER_PRESET_INFO
+
+const getDefaultProviderAdditionalSettings = (
+  presetType: LLMProviderPresetType,
+): LLMProvider['additionalSettings'] => {
+  const requestTransportMode = getDefaultRequestTransportModeForPresetType(
+    presetType,
+    Platform.isDesktop,
+  )
+  if (!requestTransportMode) {
+    return undefined
+  }
+
+  return { requestTransportMode }
+}
 
 /**
  * Important
@@ -190,24 +405,52 @@ export const PROVIDER_TYPES_INFO = {
  */
 export const DEFAULT_PROVIDERS: readonly LLMProvider[] = [
   {
-    type: 'openai',
-    id: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    presetType: 'openai',
+    apiType: getDefaultApiTypeForPresetType('openai'),
+    id: PROVIDER_PRESET_INFO.openai.defaultProviderId,
   },
   {
-    type: 'anthropic',
-    id: PROVIDER_TYPES_INFO.anthropic.defaultProviderId,
+    presetType: 'chatgpt-oauth',
+    apiType: getDefaultApiTypeForPresetType('chatgpt-oauth'),
+    id: PROVIDER_PRESET_INFO['chatgpt-oauth'].defaultProviderId,
+    additionalSettings: getDefaultProviderAdditionalSettings('chatgpt-oauth'),
   },
   {
-    type: 'gemini',
-    id: PROVIDER_TYPES_INFO.gemini.defaultProviderId,
+    presetType: 'gemini-oauth',
+    apiType: getDefaultApiTypeForPresetType('gemini-oauth'),
+    id: PROVIDER_PRESET_INFO['gemini-oauth'].defaultProviderId,
+    additionalSettings: getDefaultProviderAdditionalSettings('gemini-oauth'),
   },
   {
-    type: 'deepseek',
-    id: PROVIDER_TYPES_INFO.deepseek.defaultProviderId,
+    presetType: 'qwen-oauth',
+    apiType: getDefaultApiTypeForPresetType('qwen-oauth'),
+    id: PROVIDER_PRESET_INFO['qwen-oauth'].defaultProviderId,
+    additionalSettings: getDefaultProviderAdditionalSettings('qwen-oauth'),
   },
   {
-    type: 'openrouter',
-    id: PROVIDER_TYPES_INFO.openrouter.defaultProviderId,
+    presetType: 'anthropic',
+    apiType: getDefaultApiTypeForPresetType('anthropic'),
+    id: PROVIDER_PRESET_INFO.anthropic.defaultProviderId,
+  },
+  {
+    presetType: 'gemini',
+    apiType: getDefaultApiTypeForPresetType('gemini'),
+    id: PROVIDER_PRESET_INFO.gemini.defaultProviderId,
+  },
+  {
+    presetType: 'deepseek',
+    apiType: getDefaultApiTypeForPresetType('deepseek'),
+    id: PROVIDER_PRESET_INFO.deepseek.defaultProviderId,
+  },
+  {
+    presetType: 'openrouter',
+    apiType: getDefaultApiTypeForPresetType('openrouter'),
+    id: PROVIDER_PRESET_INFO.openrouter.defaultProviderId,
+  },
+  {
+    presetType: 'xiaomimimo',
+    apiType: getDefaultApiTypeForPresetType('xiaomimimo'),
+    id: PROVIDER_PRESET_INFO.xiaomimimo.defaultProviderId,
   },
 ]
 
@@ -218,186 +461,228 @@ export const DEFAULT_PROVIDERS: readonly LLMProvider[] = [
  */
 export const DEFAULT_CHAT_MODELS: readonly ChatModel[] = [
   {
-    providerType: 'anthropic',
-    providerId: PROVIDER_TYPES_INFO.anthropic.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.anthropic.defaultProviderId,
     id: 'anthropic/claude-sonnet-4.0',
     model: 'claude-sonnet-4-0',
     enable: false,
+    reasoningType: 'anthropic',
   },
   {
-    providerType: 'anthropic',
-    providerId: PROVIDER_TYPES_INFO.anthropic.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.anthropic.defaultProviderId,
     id: 'anthropic/claude-opus-4.1',
     model: 'claude-opus-4-1',
     enable: false,
+    reasoningType: 'anthropic',
   },
   {
-    providerType: 'anthropic',
-    providerId: PROVIDER_TYPES_INFO.anthropic.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.anthropic.defaultProviderId,
     id: 'anthropic/claude-3.7-sonnet',
     model: 'claude-3-7-sonnet-latest',
     enable: false,
+    reasoningType: 'anthropic',
   },
   {
-    providerType: 'anthropic',
-    providerId: PROVIDER_TYPES_INFO.anthropic.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.anthropic.defaultProviderId,
     id: 'anthropic/claude-3.5-sonnet',
     model: 'claude-3-5-sonnet-latest',
     enable: false,
   },
   {
-    providerType: 'anthropic',
-    providerId: PROVIDER_TYPES_INFO.anthropic.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.anthropic.defaultProviderId,
     id: 'anthropic/claude-3.5-haiku',
     model: 'claude-3-5-haiku-latest',
     enable: false,
   },
   {
-    providerType: 'openai',
-    providerId: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.openai.defaultProviderId,
     id: 'openai/gpt-5',
     model: 'gpt-5',
     enable: true,
   },
   {
-    providerType: 'openai',
-    providerId: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO['chatgpt-oauth'].defaultProviderId,
+    id: 'chatgpt-oauth/gpt-5.3-codex',
+    model: 'gpt-5.3-codex',
+    name: 'GPT-5.3 Codex',
+    enable: false,
+    reasoningType: 'openai',
+  },
+  {
+    providerId: PROVIDER_PRESET_INFO['chatgpt-oauth'].defaultProviderId,
+    id: 'chatgpt-oauth/gpt-5.4',
+    model: 'gpt-5.4',
+    name: 'GPT-5.4',
+    enable: false,
+    reasoningType: 'openai',
+  },
+  {
+    providerId: PROVIDER_PRESET_INFO['gemini-oauth'].defaultProviderId,
+    id: 'gemini-oauth/gemini-2.5-pro',
+    model: 'gemini-2.5-pro',
+    enable: false,
+    reasoningType: 'gemini',
+    builtinToolProvider: 'gemini',
+  },
+  {
+    providerId: PROVIDER_PRESET_INFO['gemini-oauth'].defaultProviderId,
+    id: 'gemini-oauth/gemini-2.5-flash',
+    model: 'gemini-2.5-flash',
+    enable: false,
+    reasoningType: 'gemini',
+    builtinToolProvider: 'gemini',
+  },
+  {
+    providerId: PROVIDER_PRESET_INFO['gemini-oauth'].defaultProviderId,
+    id: 'gemini-oauth/gemini-2.5-flash-lite',
+    model: 'gemini-2.5-flash-lite',
+    enable: false,
+    reasoningType: 'gemini',
+    builtinToolProvider: 'gemini',
+  },
+  {
+    providerId: PROVIDER_PRESET_INFO['qwen-oauth'].defaultProviderId,
+    id: 'qwen-oauth/coder-model',
+    model: 'coder-model',
+    name: 'Qwen Coder',
+    enable: false,
+  },
+  {
+    providerId: PROVIDER_PRESET_INFO.openai.defaultProviderId,
     id: 'openai/gpt-5-mini',
     model: 'gpt-5-mini',
     enable: false,
   },
   {
-    providerType: 'openai',
-    providerId: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.openai.defaultProviderId,
     id: 'openai/gpt-5-nano',
     model: 'gpt-5-nano',
     enable: false,
   },
   {
-    providerType: 'openai',
-    providerId: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.openai.defaultProviderId,
     id: 'openai/gpt-4.1',
     model: 'gpt-4.1',
     enable: true,
   },
   {
-    providerType: 'openai',
-    providerId: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.openai.defaultProviderId,
     id: 'openai/gpt-4.1-mini',
     model: 'gpt-4.1-mini',
     enable: true,
   },
   {
-    providerType: 'openai',
-    providerId: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.openai.defaultProviderId,
     id: 'openai/gpt-4.1-nano',
     model: 'gpt-4.1-nano',
     enable: true,
   },
   {
-    providerType: 'openai',
-    providerId: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.openai.defaultProviderId,
     id: 'openai/gpt-4o',
     model: 'gpt-4o',
     enable: false,
   },
   {
-    providerType: 'openai',
-    providerId: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.openai.defaultProviderId,
     id: 'openai/gpt-4o-mini',
     model: 'gpt-4o-mini',
     enable: false,
   },
   {
-    providerType: 'openai',
-    providerId: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.openai.defaultProviderId,
     id: 'openai/o4-mini',
     model: 'o4-mini',
     enable: false,
-    reasoning: {
-      enabled: true,
-      reasoning_effort: 'medium',
-    },
+    reasoningType: 'openai',
   },
   {
-    providerType: 'openai',
-    providerId: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.openai.defaultProviderId,
     id: 'openai/o3',
     model: 'o3',
     enable: false,
-    reasoning: {
-      enabled: true,
-      reasoning_effort: 'medium',
-    },
+    reasoningType: 'openai',
   },
   {
-    providerType: 'gemini',
-    providerId: PROVIDER_TYPES_INFO.gemini.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.gemini.defaultProviderId,
     id: 'gemini/gemini-2.5-pro',
     model: 'gemini-2.5-pro',
     enable: false,
-    thinking: {
-      enabled: true,
-      thinking_budget: -1,
-    },
+    reasoningType: 'gemini',
   },
   {
-    providerType: 'gemini',
-    providerId: PROVIDER_TYPES_INFO.gemini.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.gemini.defaultProviderId,
     id: 'gemini/gemini-2.5-flash',
     model: 'gemini-2.5-flash',
     enable: false,
-    thinking: {
-      enabled: true,
-      thinking_budget: -1,
-    },
+    reasoningType: 'gemini',
   },
   {
-    providerType: 'gemini',
-    providerId: PROVIDER_TYPES_INFO.gemini.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.gemini.defaultProviderId,
     id: 'gemini/gemini-2.5-flash-lite',
     model: 'gemini-2.5-flash-lite',
     enable: false,
-    thinking: {
-      enabled: true,
-      thinking_budget: -1,
-    },
+    reasoningType: 'gemini',
   },
   {
-    providerType: 'gemini',
-    providerId: PROVIDER_TYPES_INFO.gemini.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.gemini.defaultProviderId,
     id: 'gemini/gemini-2.0-flash',
     model: 'gemini-2.0-flash',
     enable: false,
-    thinking: {
-      enabled: true,
-      thinking_budget: -1,
-    },
+    reasoningType: 'gemini',
   },
   {
-    providerType: 'gemini',
-    providerId: PROVIDER_TYPES_INFO.gemini.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.gemini.defaultProviderId,
     id: 'gemini/gemini-2.0-flash-lite',
     model: 'gemini-2.0-flash-lite',
     enable: false,
-    thinking: {
-      enabled: true,
-      thinking_budget: -1,
-    },
+    reasoningType: 'gemini',
   },
   {
-    providerType: 'deepseek',
-    providerId: PROVIDER_TYPES_INFO.deepseek.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.deepseek.defaultProviderId,
     id: 'deepseek/deepseek-chat',
     model: 'deepseek-chat',
     enable: false,
   },
   {
-    providerType: 'deepseek',
-    providerId: PROVIDER_TYPES_INFO.deepseek.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.deepseek.defaultProviderId,
     id: 'deepseek/deepseek-reasoner',
     model: 'deepseek-reasoner',
     enable: false,
+  },
+  {
+    providerId: PROVIDER_PRESET_INFO.xiaomimimo.defaultProviderId,
+    id: 'xiaomimimo/mimo-v2.5-pro',
+    model: 'mimo-v2.5-pro',
+    enable: false,
+    reasoningType: 'openai',
+  },
+  {
+    providerId: PROVIDER_PRESET_INFO.xiaomimimo.defaultProviderId,
+    id: 'xiaomimimo/mimo-v2.5',
+    model: 'mimo-v2.5',
+    enable: false,
+    reasoningType: 'openai',
+  },
+  {
+    providerId: PROVIDER_PRESET_INFO.xiaomimimo.defaultProviderId,
+    id: 'xiaomimimo/mimo-v2-pro',
+    model: 'mimo-v2-pro',
+    enable: false,
+    reasoningType: 'openai',
+  },
+  {
+    providerId: PROVIDER_PRESET_INFO.xiaomimimo.defaultProviderId,
+    id: 'xiaomimimo/mimo-v2-omni',
+    model: 'mimo-v2-omni',
+    enable: false,
+    reasoningType: 'openai',
+  },
+  {
+    providerId: PROVIDER_PRESET_INFO.xiaomimimo.defaultProviderId,
+    id: 'xiaomimimo/mimo-v2-flash',
+    model: 'mimo-v2-flash',
+    enable: false,
+    reasoningType: 'openai',
   },
 ]
 
@@ -408,22 +693,19 @@ export const DEFAULT_CHAT_MODELS: readonly ChatModel[] = [
  */
 export const DEFAULT_EMBEDDING_MODELS: readonly EmbeddingModel[] = [
   {
-    providerType: 'openai',
-    providerId: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.openai.defaultProviderId,
     id: 'openai/text-embedding-3-small',
     model: 'text-embedding-3-small',
     dimension: 1536,
   },
   {
-    providerType: 'openai',
-    providerId: PROVIDER_TYPES_INFO.openai.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.openai.defaultProviderId,
     id: 'openai/text-embedding-3-large',
     model: 'text-embedding-3-large',
     dimension: 3072,
   },
   {
-    providerType: 'gemini',
-    providerId: PROVIDER_TYPES_INFO.gemini.defaultProviderId,
+    providerId: PROVIDER_PRESET_INFO.gemini.defaultProviderId,
     id: 'gemini/text-embedding-004',
     model: 'text-embedding-004',
     dimension: 768,

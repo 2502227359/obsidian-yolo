@@ -1,25 +1,47 @@
 import cx from 'clsx'
 import { ChevronDown, ChevronUp, Eye } from 'lucide-react'
-import { PropsWithChildren, useEffect, useMemo, useState } from 'react'
+import {
+  PropsWithChildren,
+  Suspense,
+  lazy,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react'
 
 import { useApp } from '../../contexts/app-context'
 import { useDarkModeContext } from '../../contexts/dark-mode-context'
 import { useLanguage } from '../../contexts/language-context'
-import { openMarkdownFile, readTFileContent } from '../../utils/obsidian'
+import {
+  openMarkdownFile,
+  openPdfFileAtPage,
+  readTFileContent,
+} from '../../utils/obsidian'
 
 import { ObsidianMarkdown } from './ObsidianMarkdown'
-import { MemoizedSyntaxHighlighterWrapper } from './SyntaxHighlighterWrapper'
+
+// Defer react-syntax-highlighter (refractor + prism langs, ~600KB) until a
+// reference block actually renders highlighted code. esbuild keeps the bytes
+// in main.js but skips top-level evaluation until the dynamic import resolves.
+const LazySyntaxHighlighterWrapper = lazy(() =>
+  import('./SyntaxHighlighterWrapper').then((mod) => ({
+    default: mod.MemoizedSyntaxHighlighterWrapper,
+  })),
+)
 
 export default function MarkdownReferenceBlock({
   filename,
   startLine,
   endLine,
   language,
+  previewContent,
 }: PropsWithChildren<{
   filename: string
   startLine: number
   endLine: number
   language?: string
+  /** For PDF references: assistant-provided excerpt (vault read is not plain text). */
+  previewContent?: string
 }>) {
   const app = useApp()
   const { isDarkMode } = useDarkModeContext()
@@ -33,8 +55,20 @@ export default function MarkdownReferenceBlock({
     return !language || ['markdown'].includes(language)
   }, [language])
 
+  const isPdf = filename.toLowerCase().endsWith('.pdf')
+
   useEffect(() => {
     async function fetchBlockContent() {
+      if (isPdf) {
+        const initial = (previewContent ?? '').trim()
+        setBlockContent(
+          initial.length > 0
+            ? initial
+            : t('chat.pdfReferenceNoPreview', '（PDF：点击标题打开对应页）'),
+        )
+        setCollapsed(initial.split('\n').length > 2)
+        return
+      }
       const file = app.vault.getFileByPath(filename)
       if (!file) {
         setBlockContent(null)
@@ -52,9 +86,13 @@ export default function MarkdownReferenceBlock({
     }
 
     void fetchBlockContent()
-  }, [filename, startLine, endLine, app.vault])
+  }, [filename, startLine, endLine, app.vault, isPdf, previewContent, t])
 
   const handleOpenFile = () => {
+    if (isPdf) {
+      openPdfFileAtPage(app, filename, startLine)
+      return
+    }
     openMarkdownFile(app, filename, startLine)
   }
 
@@ -71,20 +109,24 @@ export default function MarkdownReferenceBlock({
 
   return (
     blockContent && (
-      <div className={cx('smtcmp-code-block', filename && 'has-filename')}>
-        <div className="smtcmp-code-block-header">
+      <div className={cx('yolo-code-block', filename && 'has-filename')}>
+        <div className="yolo-code-block-header">
           {filename && (
             <div
-              className="smtcmp-code-block-header-filename"
+              className="yolo-code-block-header-filename"
               onClick={handleOpenFile}
             >
-              {filename}
+              {isPdf
+                ? startLine === endLine
+                  ? `${filename} · p.${startLine}`
+                  : `${filename} · p.${startLine}–${endLine}`
+                : filename}
             </div>
           )}
-          <div className="smtcmp-code-block-header-button-container smtcmp-code-block-header-button-container--spaced">
+          <div className="yolo-code-block-header-button-container yolo-code-block-header-button-container--spaced">
             {canCollapse && (
               <button
-                className="clickable-icon smtcmp-code-block-header-button"
+                className="clickable-icon yolo-code-block-header-button"
                 onClick={() => setCollapsed((v) => !v)}
               >
                 {collapsed ? (
@@ -101,7 +143,7 @@ export default function MarkdownReferenceBlock({
               </button>
             )}
             <button
-              className="clickable-icon smtcmp-code-block-header-button"
+              className="clickable-icon yolo-code-block-header-button"
               onClick={() => {
                 setIsPreviewMode(!isPreviewMode)
               }}
@@ -112,18 +154,36 @@ export default function MarkdownReferenceBlock({
           </div>
         </div>
         {isPreviewMode ? (
-          <div className="smtcmp-code-block-obsidian-markdown">
+          <div className="yolo-code-block-obsidian-markdown">
             <ObsidianMarkdown content={displayContent} scale="sm" />
           </div>
         ) : (
-          <MemoizedSyntaxHighlighterWrapper
-            isDarkMode={isDarkMode}
-            language={language}
-            hasFilename={!!filename}
-            wrapLines={wrapLines}
+          <Suspense
+            fallback={
+              <pre
+                className={cx(
+                  'yolo-syntax-highlighter',
+                  filename
+                    ? 'yolo-syntax-highlighter--with-filename'
+                    : 'yolo-syntax-highlighter--standalone',
+                  language === 'markdown'
+                    ? 'yolo-syntax-highlighter--markdown'
+                    : null,
+                )}
+              >
+                {displayContent}
+              </pre>
+            }
           >
-            {displayContent}
-          </MemoizedSyntaxHighlighterWrapper>
+            <LazySyntaxHighlighterWrapper
+              isDarkMode={isDarkMode}
+              language={language}
+              hasFilename={!!filename}
+              wrapLines={wrapLines}
+            >
+              {displayContent}
+            </LazySyntaxHighlighterWrapper>
+          </Suspense>
         )}
       </div>
     )

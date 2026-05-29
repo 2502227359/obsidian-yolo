@@ -2,26 +2,29 @@ import { App } from 'obsidian'
 import React from 'react'
 
 import { SettingsProvider } from '../../../contexts/settings-context'
-import SmartComposerPlugin from '../../../main'
+import YoloPlugin from '../../../main'
 import { ReactModal } from '../../common/ReactModal'
 import { SelectionChatActionsSettingsContent } from '../SelectionChatActionsSettings'
 
 type SelectionChatActionsModalComponentProps = {
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
 }
 
 export class SelectionChatActionsModal extends ReactModal<SelectionChatActionsModalComponentProps> {
-  constructor(app: App, plugin: SmartComposerPlugin) {
+  constructor(app: App, plugin: YoloPlugin) {
     super({
       app: app,
       Component: SelectionChatActionsModalComponentWrapper,
       props: { plugin },
       options: {
-        title: 'Cursor chat quick actions',
+        title: plugin.t(
+          'settings.selectionChat.quickActionsTitle',
+          'Cursor Chat quick actions',
+        ),
       },
       plugin: plugin,
     })
-    this.modalEl.classList.add('smtcmp-modal--wide')
+    this.modalEl.classList.add('yolo-modal--wide')
   }
 }
 

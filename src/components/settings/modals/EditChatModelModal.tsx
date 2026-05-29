@@ -1,14 +1,18 @@
+import { FileText, Image as ImageIcon, Type } from 'lucide-react'
 import { App, Notice } from 'obsidian'
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 
 import { useLanguage } from '../../../contexts/language-context'
-import SmartComposerPlugin from '../../../main'
-import { ChatModel } from '../../../types/chat-model.types'
+import YoloPlugin from '../../../main'
+import { ChatModel, ChatModelModality } from '../../../types/chat-model.types'
 import { CustomParameter } from '../../../types/custom-parameter.types'
 import {
   normalizeCustomParameterType,
   sanitizeCustomParameters,
 } from '../../../utils/custom-parameters'
+import { formatIntegerWithGrouping } from '../../../utils/formatIntegerWithGrouping'
+import { resolveKnownMaxContextTokens } from '../../../utils/llm/model-capability-registry'
+import { resolveDefaultChatModelModalities } from '../../../utils/llm/model-modalities'
 import {
   detectReasoningTypeFromModelId,
   ensureUniqueModelId,
@@ -22,7 +26,7 @@ import { ObsidianToggle } from '../../common/ObsidianToggle'
 import { ReactModal } from '../../common/ReactModal'
 
 type EditChatModelModalComponentProps = {
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
   model: ChatModel
 }
 
@@ -30,21 +34,29 @@ type CustomParameterFormEntry = CustomParameter & {
   uid: string
 }
 
-type EditableChatModel = ChatModel & {
-  reasoning?: {
-    enabled: boolean
-    reasoning_effort?: string
-  }
-  thinking?: {
-    enabled: boolean
-    thinking_budget?: number // Gemini, OpenRouter
-    budget_tokens?: number // Anthropic
-  }
-  toolType?: 'none' | 'gemini'
-  isBaseModel?: boolean
-  customParameters?: CustomParameter[]
-}
+const BUILTIN_TOOL_PROVIDERS = [
+  'none',
+  'gemini',
+  'gpt',
+  'openrouter',
+  'grok',
+] as const
+type BuiltinToolProvider = (typeof BUILTIN_TOOL_PROVIDERS)[number]
 
+const OPENROUTER_WEB_SEARCH_ENGINES = [
+  'auto',
+  'native',
+  'exa',
+  'firecrawl',
+  'parallel',
+] as const
+type OpenRouterWebSearchEngine = (typeof OPENROUTER_WEB_SEARCH_ENGINES)[number]
+const isOpenRouterWebSearchEngine = (
+  value: string,
+): value is OpenRouterWebSearchEngine =>
+  (OPENROUTER_WEB_SEARCH_ENGINES as readonly string[]).includes(value)
+const OPENROUTER_MAX_RESULTS_MIN = 1
+const OPENROUTER_MAX_RESULTS_MAX = 25
 const CUSTOM_PARAMETER_TYPES = ['text', 'number', 'boolean', 'json'] as const
 const RESERVED_CUSTOM_PARAMETER_KEYS = new Set([
   'temperature',
@@ -59,19 +71,27 @@ const isReservedCustomParameterKey = (key: string): boolean =>
 const MODEL_SAMPLING_DEFAULTS = {
   temperature: 0.8,
   topP: 0.9,
+  maxContextTokens: 32768,
   maxOutputTokens: 4096,
 } as const
+
+const MAX_CONTEXT_TOKENS_INPUT_MAX = 1000000
+const MAX_CONTEXT_TOKENS_SLIDER_STEP = 64
+const MAX_OUTPUT_TOKENS_SLIDER_MAX = 393216 // 384K, supports DeepSeek v4 and similar models
 
 const clampTemperature = (value: number): number =>
   Math.min(2, Math.max(0, value))
 
 const clampTopP = (value: number): number => Math.min(1, Math.max(0, value))
 
+const clampMaxContextTokens = (value: number): number =>
+  Math.max(1, Math.floor(value))
+
 const clampMaxOutputTokens = (value: number): number =>
   Math.max(1, Math.floor(value))
 
 export class EditChatModelModal extends ReactModal<EditChatModelModalComponentProps> {
-  constructor(app: App, plugin: SmartComposerPlugin, model: ChatModel) {
+  constructor(app: App, plugin: YoloPlugin, model: ChatModel) {
     super({
       app: app,
       Component: EditChatModelModalComponent,
@@ -90,25 +110,30 @@ function EditChatModelModalComponent({
   model,
 }: EditChatModelModalComponentProps & { onClose: () => void }) {
   const { t } = useLanguage()
-  const editableModel: EditableChatModel = model
+  const editableModel = model
+  const selectedProvider = plugin.settings.providers.find(
+    (provider) => provider.id === model.providerId,
+  )
 
   const normalizeReasoningType = (
     value: string,
-  ): 'none' | 'openai' | 'gemini' | 'anthropic' | 'generic' | 'base' => {
-    if (
-      value === 'openai' ||
-      value === 'gemini' ||
-      value === 'anthropic' ||
-      value === 'generic' ||
-      value === 'base'
-    ) {
+  ): 'none' | 'openai' | 'gemini' | 'anthropic' => {
+    if (value === 'openai' || value === 'gemini' || value === 'anthropic') {
       return value
     }
     return 'none'
   }
 
-  const normalizeToolType = (value: string): 'none' | 'gemini' =>
-    value === 'gemini' ? 'gemini' : 'none'
+  const normalizeBuiltinToolProvider = (value: string): BuiltinToolProvider =>
+    BUILTIN_TOOL_PROVIDERS.includes(value as BuiltinToolProvider)
+      ? (value as BuiltinToolProvider)
+      : 'none'
+
+  // Provider–family alignment is the user's responsibility (per upstream
+  // request): every family is selectable on every model, and downstream
+  // provider clients only forward families the gateway recognises. We still
+  // surface a hint so users understand that picking a family the gateway
+  // doesn't support is a silent no-op rather than a guaranteed success.
 
   // Update modal title
   React.useEffect(() => {
@@ -125,47 +150,104 @@ function EditChatModelModalComponent({
     name: model.name ?? '',
   })
 
-  const initialReasoningType:
-    | 'none'
-    | 'openai'
-    | 'gemini'
-    | 'anthropic'
-    | 'generic'
-    | 'base' = (() => {
-    if (editableModel.isBaseModel) return 'base'
-    if (editableModel.reasoningType && editableModel.reasoningType !== 'none') {
-      return editableModel.reasoningType
-    }
-    if (editableModel.reasoning?.enabled) return 'openai'
-    if (editableModel.thinking?.enabled) {
-      if (editableModel.providerType === 'anthropic') return 'anthropic'
-      if (editableModel.providerType === 'gemini') return 'gemini'
-      return 'generic'
-    }
-    return 'none'
-  })()
+  const initialReasoningType: 'none' | 'openai' | 'gemini' | 'anthropic' =
+    (() => {
+      if (
+        editableModel.reasoningType &&
+        editableModel.reasoningType !== 'none'
+      ) {
+        return editableModel.reasoningType
+      }
+      return normalizeReasoningType(
+        detectReasoningTypeFromModelId(editableModel.model),
+      )
+    })()
 
   // Reasoning UI states
   const [reasoningType, setReasoningType] = useState<
-    'none' | 'openai' | 'gemini' | 'anthropic' | 'generic' | 'base'
+    'none' | 'openai' | 'gemini' | 'anthropic'
   >(() => initialReasoningType)
   // If user changes dropdown manually, disable auto detection
-  const [autoDetectReasoning, setAutoDetectReasoning] = useState<boolean>(
-    initialReasoningType !== 'base',
-  )
+  const [autoDetectReasoning, setAutoDetectReasoning] = useState<boolean>(true)
 
-  // Tool type state
-  const [toolType, setToolType] = useState<'none' | 'gemini'>(
-    normalizeToolType(editableModel.toolType ?? 'none'),
+  // Built-in (hosted) provider tools state — note: this is intentionally
+  // unrelated to function-calling tools the agent runs. See ChatModel.
+  const [builtinToolProvider, setBuiltinToolProvider] =
+    useState<BuiltinToolProvider>(
+      normalizeBuiltinToolProvider(editableModel.builtinToolProvider ?? 'none'),
+    )
+  React.useEffect(() => {
+    if (
+      selectedProvider?.presetType === 'openrouter' &&
+      builtinToolProvider !== 'none' &&
+      builtinToolProvider !== 'openrouter'
+    ) {
+      setBuiltinToolProvider('none')
+    }
+  }, [selectedProvider?.presetType, builtinToolProvider])
+  const [gptWebSearchEnabled, setGptWebSearchEnabled] = useState<boolean>(
+    editableModel.builtinTools?.gpt?.webSearch?.enabled === true,
+  )
+  const [openRouterWebSearchEnabled, setOpenRouterWebSearchEnabled] =
+    useState<boolean>(
+      editableModel.builtinTools?.openrouter?.webSearch?.enabled === true,
+    )
+  const [openRouterWebSearchEngine, setOpenRouterWebSearchEngine] =
+    useState<OpenRouterWebSearchEngine>(() => {
+      const raw = editableModel.builtinTools?.openrouter?.webSearch?.engine
+      return raw && isOpenRouterWebSearchEngine(raw) ? raw : 'auto'
+    })
+  const initialOpenRouterMaxResults =
+    editableModel.builtinTools?.openrouter?.webSearch?.maxResults
+  const [
+    openRouterWebSearchMaxResultsInput,
+    setOpenRouterWebSearchMaxResultsInput,
+  ] = useState<string>(
+    typeof initialOpenRouterMaxResults === 'number'
+      ? String(initialOpenRouterMaxResults)
+      : '',
+  )
+  const [grokWebSearchEnabled, setGrokWebSearchEnabled] = useState<boolean>(
+    editableModel.builtinTools?.grok?.webSearch?.enabled === true,
+  )
+  const [geminiWebSearchEnabled, setGeminiWebSearchEnabled] = useState<boolean>(
+    editableModel.builtinTools?.gemini?.webSearch?.enabled === true,
+  )
+  const [geminiUrlContextEnabled, setGeminiUrlContextEnabled] =
+    useState<boolean>(
+      editableModel.builtinTools?.gemini?.urlContext?.enabled === true,
+    )
+  const [modalities, setModalities] = useState<ChatModelModality[]>(() => {
+    if (editableModel.modalities && editableModel.modalities.length > 0) {
+      return [...editableModel.modalities]
+    }
+    return resolveDefaultChatModelModalities(selectedProvider)
+  })
+  const toggleModality = (modality: ChatModelModality) => {
+    setModalities((prev) => {
+      if (prev.includes(modality)) {
+        if (prev.length === 1) return prev
+        return prev.filter((m) => m !== modality)
+      }
+      return [...prev, modality]
+    })
+  }
+  const resolvedKnownMaxContextTokens = resolveKnownMaxContextTokens(
+    model.model,
   )
   const [modelParamCache, setModelParamCache] = useState<{
     temperature: number
     topP: number
+    maxContextTokens: number
     maxOutputTokens: number
   }>(() => ({
     temperature:
       editableModel.temperature ?? MODEL_SAMPLING_DEFAULTS.temperature,
     topP: editableModel.topP ?? MODEL_SAMPLING_DEFAULTS.topP,
+    maxContextTokens:
+      editableModel.maxContextTokens ??
+      resolvedKnownMaxContextTokens ??
+      MODEL_SAMPLING_DEFAULTS.maxContextTokens,
     maxOutputTokens:
       editableModel.maxOutputTokens ?? MODEL_SAMPLING_DEFAULTS.maxOutputTokens,
   }))
@@ -173,9 +255,24 @@ function EditChatModelModalComponent({
     editableModel.temperature,
   )
   const [topP, setTopP] = useState<number | undefined>(editableModel.topP)
+  const [maxContextTokens, setMaxContextTokens] = useState<number | undefined>(
+    editableModel.maxContextTokens ?? resolvedKnownMaxContextTokens,
+  )
+  const [maxContextTokensInput, setMaxContextTokensInput] = useState<string>(
+    () =>
+      String(
+        editableModel.maxContextTokens ??
+          resolvedKnownMaxContextTokens ??
+          modelParamCache.maxContextTokens,
+      ),
+  )
+  const [isMaxContextTokensInputFocused, setIsMaxContextTokensInputFocused] =
+    useState(false)
   const [maxOutputTokens, setMaxOutputTokens] = useState<number | undefined>(
     editableModel.maxOutputTokens,
   )
+  const [hasManualMaxContextTokens, setHasManualMaxContextTokens] =
+    useState<boolean>(false)
   const customParameterUidRef = React.useRef(0)
   const createCustomParameterUid = (): string => {
     customParameterUidRef.current += 1
@@ -198,11 +295,58 @@ function EditChatModelModalComponent({
     setModelParamCache({
       temperature: MODEL_SAMPLING_DEFAULTS.temperature,
       topP: MODEL_SAMPLING_DEFAULTS.topP,
+      maxContextTokens:
+        resolveKnownMaxContextTokens(formData.model) ??
+        MODEL_SAMPLING_DEFAULTS.maxContextTokens,
       maxOutputTokens: MODEL_SAMPLING_DEFAULTS.maxOutputTokens,
     })
     setTemperature(MODEL_SAMPLING_DEFAULTS.temperature)
     setTopP(MODEL_SAMPLING_DEFAULTS.topP)
+    setMaxContextTokens(resolveKnownMaxContextTokens(formData.model))
     setMaxOutputTokens(MODEL_SAMPLING_DEFAULTS.maxOutputTokens)
+    setHasManualMaxContextTokens(false)
+  }
+
+  React.useEffect(() => {
+    if (hasManualMaxContextTokens) {
+      return
+    }
+
+    const matched = resolveKnownMaxContextTokens(formData.model)
+    const nextMaxContextTokens =
+      formData.model === editableModel.model &&
+      typeof editableModel.maxContextTokens === 'number'
+        ? editableModel.maxContextTokens
+        : matched
+
+    setModelParamCache((prev) => ({
+      ...prev,
+      maxContextTokens:
+        nextMaxContextTokens ?? MODEL_SAMPLING_DEFAULTS.maxContextTokens,
+    }))
+    setMaxContextTokens(nextMaxContextTokens)
+  }, [
+    editableModel.maxContextTokens,
+    editableModel.model,
+    formData.model,
+    hasManualMaxContextTokens,
+  ])
+
+  useEffect(() => {
+    if (typeof maxContextTokens === 'number') {
+      setMaxContextTokensInput(String(maxContextTokens))
+    }
+  }, [maxContextTokens])
+
+  const updateMaxContextTokens = (value: number) => {
+    const clamped = clampMaxContextTokens(value)
+    setHasManualMaxContextTokens(true)
+    setModelParamCache((prev) => ({
+      ...prev,
+      maxContextTokens: clamped,
+    }))
+    setMaxContextTokens(clamped)
+    setMaxContextTokensInput(String(clamped))
   }
 
   const setTemperatureEnabled = (enabled: boolean) => {
@@ -221,6 +365,13 @@ function EditChatModelModalComponent({
     const current = maxOutputTokens ?? modelParamCache.maxOutputTokens
     setModelParamCache((prev) => ({ ...prev, maxOutputTokens: current }))
     setMaxOutputTokens(enabled ? current : undefined)
+  }
+
+  const setMaxContextTokensEnabled = (enabled: boolean) => {
+    const current = maxContextTokens ?? modelParamCache.maxContextTokens
+    setHasManualMaxContextTokens(true)
+    setModelParamCache((prev) => ({ ...prev, maxContextTokens: current }))
+    setMaxContextTokens(enabled ? current : undefined)
   }
 
   const handleSubmit = () => {
@@ -248,7 +399,7 @@ function EditChatModelModalComponent({
         const newInternalId = ensureUniqueModelId(existingIds, baseInternalId)
 
         // Compose reasoning/thinking fields based on selection and provider
-        const updatedModel: EditableChatModel = {
+        const updatedModel: ChatModel = {
           ...chatModels[modelIndex],
           id: newInternalId,
           model: formData.model,
@@ -258,42 +409,52 @@ function EditChatModelModalComponent({
               : undefined,
           temperature,
           topP,
+          maxContextTokens,
           maxOutputTokens,
         }
 
-        // Apply according to selected reasoningType only (not limited by providerType)
-        if (reasoningType === 'base') {
-          delete updatedModel.reasoning
-          delete updatedModel.thinking
-          updatedModel.isBaseModel = true
-          delete updatedModel.reasoningType
-        } else if (reasoningType === 'openai') {
-          updatedModel.reasoningType = 'openai'
-          delete updatedModel.reasoning
-          delete updatedModel.thinking
-          delete updatedModel.isBaseModel
-        } else if (
-          reasoningType === 'gemini' ||
-          reasoningType === 'anthropic'
-        ) {
-          updatedModel.reasoningType = reasoningType
-          delete updatedModel.reasoning
-          delete updatedModel.thinking
-          delete updatedModel.isBaseModel
-        } else if (reasoningType === 'generic') {
-          updatedModel.reasoningType = 'generic'
-          delete updatedModel.reasoning
-          delete updatedModel.thinking
-          delete updatedModel.isBaseModel
-        } else {
-          delete updatedModel.reasoning
-          delete updatedModel.thinking
-          delete updatedModel.isBaseModel
-          updatedModel.reasoningType = 'none'
-        }
+        updatedModel.reasoningType = reasoningType
 
-        // Apply tool type
-        updatedModel.toolType = toolType
+        updatedModel.modalities =
+          modalities.length > 0 ? Array.from(new Set(modalities)) : ['text']
+
+        // Apply built-in (hosted) provider tools selection. The per-family
+        // toggle objects are always written (even when the family isn't the
+        // active one) so the user's prior choice persists across switches.
+        updatedModel.builtinToolProvider = builtinToolProvider
+        const trimmedMaxResults =
+          openRouterWebSearchMaxResultsInput.trim().length > 0
+            ? Number(openRouterWebSearchMaxResultsInput)
+            : null
+        const normalizedMaxResults =
+          trimmedMaxResults !== null && Number.isFinite(trimmedMaxResults)
+            ? Math.min(
+                OPENROUTER_MAX_RESULTS_MAX,
+                Math.max(
+                  OPENROUTER_MAX_RESULTS_MIN,
+                  Math.floor(trimmedMaxResults),
+                ),
+              )
+            : undefined
+        updatedModel.builtinTools = {
+          gpt: { webSearch: { enabled: gptWebSearchEnabled } },
+          openrouter: {
+            webSearch: {
+              enabled: openRouterWebSearchEnabled,
+              ...(openRouterWebSearchEngine !== 'auto'
+                ? { engine: openRouterWebSearchEngine }
+                : {}),
+              ...(normalizedMaxResults !== undefined
+                ? { maxResults: normalizedMaxResults }
+                : {}),
+            },
+          },
+          grok: { webSearch: { enabled: grokWebSearchEnabled } },
+          gemini: {
+            webSearch: { enabled: geminiWebSearchEnabled },
+            urlContext: { enabled: geminiUrlContextEnabled },
+          },
+        }
 
         const sanitizedCustomParameters = sanitizeCustomParameters(
           customParameters,
@@ -313,8 +474,8 @@ function EditChatModelModalComponent({
         if (nextSettings.chatModelId === model.id) {
           nextSettings.chatModelId = newInternalId
         }
-        if (nextSettings.applyModelId === model.id) {
-          nextSettings.applyModelId = newInternalId
+        if (nextSettings.chatTitleModelId === model.id) {
+          nextSettings.chatTitleModelId = newInternalId
         }
 
         await plugin.setSettings(nextSettings)
@@ -331,7 +492,7 @@ function EditChatModelModalComponent({
   }
 
   return (
-    <div className="smtcmp-chat-model-modal-form">
+    <div className="yolo-chat-model-modal-form">
       <ObsidianSetting
         name={t('settings.models.modelId')}
         desc={t('settings.models.modelIdDesc')}
@@ -344,7 +505,7 @@ function EditChatModelModalComponent({
             setFormData((prev) => ({ ...prev, model: value }))
             if (autoDetectReasoning) {
               const detected = detectReasoningTypeFromModelId(value)
-              setReasoningType(detected)
+              setReasoningType(normalizeReasoningType(detected))
             }
           }}
         />
@@ -362,7 +523,10 @@ function EditChatModelModalComponent({
       </ObsidianSetting>
 
       {/* Reasoning type */}
-      <ObsidianSetting name={t('settings.models.reasoningType')}>
+      <ObsidianSetting
+        name={t('settings.models.reasoningType')}
+        desc={t('settings.models.reasoningTypeDesc')}
+      >
         <ObsidianDropdown
           value={reasoningType}
           options={{
@@ -370,8 +534,6 @@ function EditChatModelModalComponent({
             openai: t('settings.models.reasoningTypeOpenAI'),
             gemini: t('settings.models.reasoningTypeGemini'),
             anthropic: t('settings.models.reasoningTypeAnthropic'),
-            generic: t('settings.models.reasoningTypeGeneric'),
-            base: t('settings.models.reasoningTypeBase'),
           }}
           onChange={(v: string) => {
             setReasoningType(normalizeReasoningType(v))
@@ -380,58 +542,423 @@ function EditChatModelModalComponent({
         />
       </ObsidianSetting>
 
-      {reasoningType === 'base' && (
-        <div className="smtcmp-settings-desc">
-          {t('settings.models.baseModelWarning')}
+      {/* Input modalities */}
+      <div className="yolo-modality-field">
+        <div className="yolo-modality-field-header">
+          <div className="yolo-modality-field-label">
+            {t('settings.models.inputModality')}
+          </div>
+          <div className="yolo-modality-field-desc">
+            {t('settings.models.inputModalityDesc')}
+          </div>
         </div>
-      )}
+        <div className="yolo-modality-chips">
+          <button
+            type="button"
+            className={`yolo-modality-chip${
+              modalities.includes('text') ? ' is-active' : ''
+            }`}
+            onClick={() => toggleModality('text')}
+          >
+            <Type size={14} />
+            <span className="yolo-modality-chip-label">
+              {t('settings.models.inputModalityText')}
+            </span>
+            <span className="yolo-modality-chip-sub">Text</span>
+          </button>
+          <button
+            type="button"
+            className={`yolo-modality-chip${
+              modalities.includes('vision') ? ' is-active' : ''
+            }`}
+            data-tooltip={t('settings.models.inputModalityVisionTooltip')}
+            onClick={() => toggleModality('vision')}
+          >
+            <ImageIcon size={14} />
+            <span className="yolo-modality-chip-label">
+              {t('settings.models.inputModalityVision')}
+            </span>
+            <span className="yolo-modality-chip-sub">Vision</span>
+          </button>
+          <button
+            type="button"
+            className={`yolo-modality-chip${
+              modalities.includes('pdf') ? ' is-active' : ''
+            }`}
+            data-tooltip={t('settings.models.inputModalityPdfTooltip')}
+            onClick={() => toggleModality('pdf')}
+          >
+            <FileText size={14} />
+            <span className="yolo-modality-chip-label">
+              {t('settings.models.inputModalityPdf')}
+            </span>
+            <span className="yolo-modality-chip-sub">PDF</span>
+          </button>
+        </div>
+      </div>
 
-      {/* Reasoning strength is controlled in the chat sidebar */}
-      {/* Tool type */}
       <ObsidianSetting
-        name={t('settings.models.toolType')}
-        desc={t('settings.models.toolTypeDesc')}
+        name={t('settings.models.builtinToolProvider')}
+        desc={t('settings.models.builtinToolProviderDesc')}
       >
         <ObsidianDropdown
-          value={toolType}
-          options={{
-            none: t('settings.models.toolTypeNone'),
-            gemini: t('settings.models.toolTypeGemini'),
-          }}
-          onChange={(v: string) => setToolType(normalizeToolType(v))}
+          value={builtinToolProvider}
+          options={
+            selectedProvider?.presetType === 'openrouter'
+              ? {
+                  none: t('settings.models.builtinToolProviderNone'),
+                  openrouter: t(
+                    'settings.models.builtinToolProviderOpenRouter',
+                  ),
+                }
+              : {
+                  none: t('settings.models.builtinToolProviderNone'),
+                  gemini: t('settings.models.builtinToolProviderGemini'),
+                  gpt: t('settings.models.builtinToolProviderGpt'),
+                  openrouter: t(
+                    'settings.models.builtinToolProviderOpenRouter',
+                  ),
+                  grok: t('settings.models.builtinToolProviderGrok'),
+                }
+          }
+          onChange={(v: string) =>
+            setBuiltinToolProvider(normalizeBuiltinToolProvider(v))
+          }
         />
       </ObsidianSetting>
 
-      <div className="smtcmp-agent-tools-panel smtcmp-agent-model-panel">
-        <div className="smtcmp-agent-tools-panel-head smtcmp-agent-model-panel-head">
-          <div className="smtcmp-agent-tools-panel-title">
-            {t('settings.models.sampling', 'Sampling parameters')}
+      {builtinToolProvider === 'gpt' && (
+        <div className="yolo-agent-tools-panel yolo-agent-model-panel">
+          <div className="yolo-agent-tools-panel-head yolo-agent-model-panel-head">
+            <div className="yolo-agent-tools-panel-title">
+              {t('settings.models.builtinToolsGpt')}
+            </div>
+          </div>
+
+          <div className="yolo-agent-model-controls">
+            <div className="yolo-agent-model-control">
+              <div className="yolo-agent-model-control-top">
+                <div className="yolo-agent-model-control-meta">
+                  <div className="yolo-agent-model-control-label">
+                    {t('settings.models.builtinToolWebSearch')}
+                  </div>
+                  <div className="yolo-agent-model-control-desc">
+                    {t('settings.models.builtinToolWebSearchDesc')}
+                  </div>
+                </div>
+                <div className="yolo-agent-model-control-actions">
+                  <ObsidianToggle
+                    value={gptWebSearchEnabled}
+                    onChange={setGptWebSearchEnabled}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {builtinToolProvider === 'openrouter' && (
+        <div className="yolo-agent-tools-panel yolo-agent-model-panel">
+          <div className="yolo-agent-tools-panel-head yolo-agent-model-panel-head">
+            <div className="yolo-agent-tools-panel-title">
+              {t('settings.models.builtinToolsOpenRouter')}
+            </div>
+          </div>
+
+          <div className="yolo-agent-model-controls">
+            <div className="yolo-agent-model-control">
+              <div className="yolo-agent-model-control-top">
+                <div className="yolo-agent-model-control-meta">
+                  <div className="yolo-agent-model-control-label">
+                    {t('settings.models.builtinToolWebSearch')}
+                  </div>
+                  <div className="yolo-agent-model-control-desc">
+                    {t('settings.models.builtinToolWebSearchDesc')}
+                  </div>
+                </div>
+                <div className="yolo-agent-model-control-actions">
+                  <ObsidianToggle
+                    value={openRouterWebSearchEnabled}
+                    onChange={setOpenRouterWebSearchEnabled}
+                  />
+                </div>
+              </div>
+            </div>
+
+            {openRouterWebSearchEnabled && (
+              <>
+                <div className="yolo-agent-model-control">
+                  <div className="yolo-agent-model-control-top">
+                    <div className="yolo-agent-model-control-meta">
+                      <div className="yolo-agent-model-control-label">
+                        {t('settings.models.openRouterWebSearchEngine')}
+                      </div>
+                      <div className="yolo-agent-model-control-desc">
+                        {t('settings.models.openRouterWebSearchEngineDesc')}
+                      </div>
+                    </div>
+                    <div className="yolo-agent-model-control-actions">
+                      <ObsidianDropdown
+                        value={openRouterWebSearchEngine}
+                        options={{
+                          auto: t(
+                            'settings.models.openRouterWebSearchEngineAuto',
+                          ),
+                          native: t(
+                            'settings.models.openRouterWebSearchEngineNative',
+                          ),
+                          exa: t(
+                            'settings.models.openRouterWebSearchEngineExa',
+                          ),
+                          firecrawl: t(
+                            'settings.models.openRouterWebSearchEngineFirecrawl',
+                          ),
+                          parallel: t(
+                            'settings.models.openRouterWebSearchEngineParallel',
+                          ),
+                        }}
+                        onChange={(v: string) =>
+                          setOpenRouterWebSearchEngine(
+                            isOpenRouterWebSearchEngine(v) ? v : 'auto',
+                          )
+                        }
+                      />
+                    </div>
+                  </div>
+                </div>
+                <div className="yolo-agent-model-control">
+                  <div className="yolo-agent-model-control-top">
+                    <div className="yolo-agent-model-control-meta">
+                      <div className="yolo-agent-model-control-label">
+                        {t('settings.models.openRouterWebSearchMaxResults')}
+                      </div>
+                      <div className="yolo-agent-model-control-desc">
+                        {t('settings.models.openRouterWebSearchMaxResultsDesc')}
+                      </div>
+                    </div>
+                    <div className="yolo-agent-model-control-actions">
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        className="yolo-agent-model-number"
+                        placeholder={t(
+                          'settings.models.openRouterWebSearchMaxResultsPlaceholder',
+                        )}
+                        value={openRouterWebSearchMaxResultsInput}
+                        onChange={(event) => {
+                          const next = event.currentTarget.value
+                          if (!/^\d*$/.test(next)) return
+                          setOpenRouterWebSearchMaxResultsInput(next)
+                        }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {builtinToolProvider === 'grok' && (
+        <div className="yolo-agent-tools-panel yolo-agent-model-panel">
+          <div className="yolo-agent-tools-panel-head yolo-agent-model-panel-head">
+            <div className="yolo-agent-tools-panel-title">
+              {t('settings.models.builtinToolsGrok')}
+            </div>
+          </div>
+
+          <div className="yolo-agent-model-controls">
+            <div className="yolo-agent-model-control">
+              <div className="yolo-agent-model-control-top">
+                <div className="yolo-agent-model-control-meta">
+                  <div className="yolo-agent-model-control-label">
+                    {t('settings.models.builtinToolWebSearch')}
+                  </div>
+                  <div className="yolo-agent-model-control-desc">
+                    {t('settings.models.builtinToolWebSearchDesc')}
+                  </div>
+                </div>
+                <div className="yolo-agent-model-control-actions">
+                  <ObsidianToggle
+                    value={grokWebSearchEnabled}
+                    onChange={setGrokWebSearchEnabled}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {builtinToolProvider === 'gemini' && (
+        <div className="yolo-agent-tools-panel yolo-agent-model-panel">
+          <div className="yolo-agent-tools-panel-head yolo-agent-model-panel-head">
+            <div className="yolo-agent-tools-panel-title">
+              {t('settings.models.builtinToolsGemini')}
+            </div>
+          </div>
+
+          <div className="yolo-agent-model-controls">
+            <div className="yolo-agent-model-control">
+              <div className="yolo-agent-model-control-top">
+                <div className="yolo-agent-model-control-meta">
+                  <div className="yolo-agent-model-control-label">
+                    {t('settings.models.builtinToolWebSearch')}
+                  </div>
+                  <div className="yolo-agent-model-control-desc">
+                    {t('settings.models.builtinToolWebSearchDesc')}
+                  </div>
+                </div>
+                <div className="yolo-agent-model-control-actions">
+                  <ObsidianToggle
+                    value={geminiWebSearchEnabled}
+                    onChange={setGeminiWebSearchEnabled}
+                  />
+                </div>
+              </div>
+            </div>
+            <div className="yolo-agent-model-control">
+              <div className="yolo-agent-model-control-top">
+                <div className="yolo-agent-model-control-meta">
+                  <div className="yolo-agent-model-control-label">
+                    {t('settings.models.builtinToolUrlContext')}
+                  </div>
+                  <div className="yolo-agent-model-control-desc">
+                    {t('settings.models.builtinToolUrlContextDesc')}
+                  </div>
+                </div>
+                <div className="yolo-agent-model-control-actions">
+                  <ObsidianToggle
+                    value={geminiUrlContextEnabled}
+                    onChange={setGeminiUrlContextEnabled}
+                  />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="yolo-agent-tools-panel yolo-agent-model-panel">
+        <div className="yolo-agent-tools-panel-head yolo-agent-model-panel-head">
+          <div className="yolo-agent-tools-panel-title">
+            {t('settings.models.customParameters', 'Custom parameters')}
           </div>
           <button
             type="button"
-            className="smtcmp-agent-model-reset"
+            className="yolo-agent-model-reset"
             onClick={resetModelParams}
           >
             {t('settings.models.restoreDefaults', 'Restore defaults')}
           </button>
         </div>
 
-        <div className="smtcmp-agent-model-controls">
+        <div className="yolo-agent-model-controls">
           <div
-            className={`smtcmp-agent-model-control${
+            className={`yolo-agent-model-control${
+              maxContextTokens === undefined ? ' is-disabled' : ''
+            }`}
+          >
+            <div className="yolo-agent-model-control-top">
+              <div className="yolo-agent-model-control-meta">
+                <div className="yolo-agent-model-control-label">
+                  {t(
+                    'settings.models.maxContextTokens',
+                    'Context window tokens',
+                  )}
+                </div>
+                <div className="yolo-agent-model-control-desc">
+                  {t(
+                    'settings.models.maxContextTokensDesc',
+                    'Auto-filled when this model is recognized. Adjust it if your provider uses a different limit.',
+                  )}
+                </div>
+              </div>
+              <div className="yolo-agent-model-control-actions">
+                <ObsidianToggle
+                  value={maxContextTokens !== undefined}
+                  onChange={setMaxContextTokensEnabled}
+                />
+              </div>
+            </div>
+            {maxContextTokens !== undefined && (
+              <div className="yolo-agent-model-control-adjust">
+                <input
+                  type="range"
+                  min={1024}
+                  max={MAX_CONTEXT_TOKENS_INPUT_MAX}
+                  step={MAX_CONTEXT_TOKENS_SLIDER_STEP}
+                  value={Math.min(
+                    MAX_CONTEXT_TOKENS_INPUT_MAX,
+                    Math.max(
+                      1024,
+                      maxContextTokens ?? modelParamCache.maxContextTokens,
+                    ),
+                  )}
+                  onChange={(event) => {
+                    const next = Number(event.currentTarget.value)
+                    if (!Number.isFinite(next)) {
+                      return
+                    }
+                    updateMaxContextTokens(next)
+                  }}
+                />
+                <input
+                  type="text"
+                  className="yolo-agent-model-number"
+                  inputMode="numeric"
+                  value={
+                    isMaxContextTokensInputFocused
+                      ? maxContextTokensInput
+                      : formatIntegerWithGrouping(maxContextTokensInput)
+                  }
+                  onChange={(event) => {
+                    const nextValue = event.currentTarget.value
+                    if (!/^\d*$/.test(nextValue)) {
+                      return
+                    }
+                    setMaxContextTokensInput(nextValue)
+                    if (nextValue === '') {
+                      return
+                    }
+                    updateMaxContextTokens(Number(nextValue))
+                  }}
+                  onFocus={() => {
+                    setIsMaxContextTokensInputFocused(true)
+                  }}
+                  onBlur={() => {
+                    setIsMaxContextTokensInputFocused(false)
+                    if (maxContextTokensInput !== '') {
+                      return
+                    }
+                    setMaxContextTokensInput(
+                      String(
+                        maxContextTokens ?? modelParamCache.maxContextTokens,
+                      ),
+                    )
+                  }}
+                />
+              </div>
+            )}
+          </div>
+
+          <div
+            className={`yolo-agent-model-control${
               temperature === undefined ? ' is-disabled' : ''
             }`}
           >
-            <div className="smtcmp-agent-model-control-top">
-              <div className="smtcmp-agent-model-control-meta">
-                <div className="smtcmp-agent-model-control-label">
+            <div className="yolo-agent-model-control-top">
+              <div className="yolo-agent-model-control-meta">
+                <div className="yolo-agent-model-control-label">
                   {t(
                     'settings.conversationSettings.temperature',
                     'Temperature',
                   )}
                 </div>
               </div>
-              <div className="smtcmp-agent-model-control-actions">
+              <div className="yolo-agent-model-control-actions">
                 <ObsidianToggle
                   value={temperature !== undefined}
                   onChange={setTemperatureEnabled}
@@ -439,7 +966,7 @@ function EditChatModelModalComponent({
               </div>
             </div>
             {temperature !== undefined && (
-              <div className="smtcmp-agent-model-control-adjust">
+              <div className="yolo-agent-model-control-adjust">
                 <input
                   type="range"
                   min={0}
@@ -461,7 +988,7 @@ function EditChatModelModalComponent({
                 />
                 <input
                   type="number"
-                  className="smtcmp-agent-model-number"
+                  className="yolo-agent-model-number"
                   min={0}
                   max={2}
                   step={0.1}
@@ -484,17 +1011,17 @@ function EditChatModelModalComponent({
           </div>
 
           <div
-            className={`smtcmp-agent-model-control${
+            className={`yolo-agent-model-control${
               topP === undefined ? ' is-disabled' : ''
             }`}
           >
-            <div className="smtcmp-agent-model-control-top">
-              <div className="smtcmp-agent-model-control-meta">
-                <div className="smtcmp-agent-model-control-label">
+            <div className="yolo-agent-model-control-top">
+              <div className="yolo-agent-model-control-meta">
+                <div className="yolo-agent-model-control-label">
                   {t('settings.conversationSettings.topP', 'Top P')}
                 </div>
               </div>
-              <div className="smtcmp-agent-model-control-actions">
+              <div className="yolo-agent-model-control-actions">
                 <ObsidianToggle
                   value={topP !== undefined}
                   onChange={setTopPEnabled}
@@ -502,7 +1029,7 @@ function EditChatModelModalComponent({
               </div>
             </div>
             {topP !== undefined && (
-              <div className="smtcmp-agent-model-control-adjust">
+              <div className="yolo-agent-model-control-adjust">
                 <input
                   type="range"
                   min={0}
@@ -521,7 +1048,7 @@ function EditChatModelModalComponent({
                 />
                 <input
                   type="number"
-                  className="smtcmp-agent-model-number"
+                  className="yolo-agent-model-number"
                   min={0}
                   max={1}
                   step={0.01}
@@ -541,17 +1068,17 @@ function EditChatModelModalComponent({
           </div>
 
           <div
-            className={`smtcmp-agent-model-control${
+            className={`yolo-agent-model-control${
               maxOutputTokens === undefined ? ' is-disabled' : ''
             }`}
           >
-            <div className="smtcmp-agent-model-control-top">
-              <div className="smtcmp-agent-model-control-meta">
-                <div className="smtcmp-agent-model-control-label">
+            <div className="yolo-agent-model-control-top">
+              <div className="yolo-agent-model-control-meta">
+                <div className="yolo-agent-model-control-label">
                   {t('settings.models.maxOutputTokens', 'Max output tokens')}
                 </div>
               </div>
-              <div className="smtcmp-agent-model-control-actions">
+              <div className="yolo-agent-model-control-actions">
                 <ObsidianToggle
                   value={maxOutputTokens !== undefined}
                   onChange={setMaxOutputTokensEnabled}
@@ -559,14 +1086,14 @@ function EditChatModelModalComponent({
               </div>
             </div>
             {maxOutputTokens !== undefined && (
-              <div className="smtcmp-agent-model-control-adjust">
+              <div className="yolo-agent-model-control-adjust">
                 <input
                   type="range"
                   min={256}
-                  max={32768}
+                  max={MAX_OUTPUT_TOKENS_SLIDER_MAX}
                   step={256}
                   value={Math.min(
-                    32768,
+                    MAX_OUTPUT_TOKENS_SLIDER_MAX,
                     Math.max(
                       256,
                       maxOutputTokens ?? modelParamCache.maxOutputTokens,
@@ -587,7 +1114,7 @@ function EditChatModelModalComponent({
                 />
                 <input
                   type="number"
-                  className="smtcmp-agent-model-number"
+                  className="yolo-agent-model-number"
                   min={1}
                   step={1}
                   value={maxOutputTokens ?? modelParamCache.maxOutputTokens}
@@ -633,7 +1160,7 @@ function EditChatModelModalComponent({
       {customParameters.map((param, index) => (
         <ObsidianSetting
           key={param.uid}
-          className="smtcmp-settings-kv-entry smtcmp-settings-kv-entry--inline"
+          className="yolo-settings-kv-entry yolo-settings-kv-entry--inline"
         >
           <ObsidianTextInput
             value={param.key}

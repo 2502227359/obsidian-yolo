@@ -9,6 +9,8 @@ type ObsidianTextAreaProps = {
   onChange: (value: string) => void
   containerClassName?: string
   inputClassName?: string
+  autoResize?: boolean
+  maxAutoResizeHeight?: number
   autoFocus?: boolean
   onKeyDown?: (ev: KeyboardEvent) => void
   disabled?: boolean
@@ -20,6 +22,8 @@ export function ObsidianTextArea({
   onChange,
   containerClassName,
   inputClassName,
+  autoResize = false,
+  maxAutoResizeHeight,
   autoFocus,
   onKeyDown,
   disabled = false,
@@ -67,6 +71,26 @@ export function ObsidianTextArea({
     textAreaComponent.inputEl.disabled = !!disabled
   }, [textAreaComponent, value, placeholder, disabled])
 
+  useEffect(() => {
+    if (!textAreaComponent || !autoResize) return
+    const inputEl = textAreaComponent.inputEl
+    inputEl.setCssProps({
+      '--yolo-textarea-auto-height': 'auto',
+    })
+
+    const nextHeight = maxAutoResizeHeight
+      ? Math.min(inputEl.scrollHeight, maxAutoResizeHeight)
+      : inputEl.scrollHeight
+
+    inputEl.setCssProps({
+      '--yolo-textarea-auto-height': `${nextHeight}px`,
+      '--yolo-textarea-auto-overflow-y':
+        maxAutoResizeHeight && inputEl.scrollHeight > maxAutoResizeHeight
+          ? 'auto'
+          : 'hidden',
+    })
+  }, [textAreaComponent, value, autoResize, maxAutoResizeHeight])
+
   // Apply input class for theming instead of inline styles
   useEffect(() => {
     if (!textAreaComponent) return
@@ -103,7 +127,7 @@ export function ObsidianTextArea({
   return (
     <div
       ref={containerRef}
-      className={`smtcmp-textarea-container${containerClassName ? ' ' + containerClassName : ''}`}
+      className={`yolo-textarea-container${containerClassName ? ' ' + containerClassName : ''}`}
     />
   )
 }

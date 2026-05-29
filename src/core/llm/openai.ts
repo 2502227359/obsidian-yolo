@@ -12,6 +12,11 @@ import {
   LLMResponseStreaming,
 } from '../../types/llm/response'
 import { LLMProvider } from '../../types/provider.types'
+import {
+  REASONING_META,
+  resolveRequestReasoningLevel,
+} from '../../types/reasoning'
+import { resolveProviderBaseUrl } from '../../utils/llm/provider-base-url'
 import { toProviderHeadersRecord } from '../../utils/llm/provider-headers'
 
 import { BaseLLMProvider } from './base'
@@ -22,23 +27,21 @@ import {
   LLMRateLimitExceededException,
 } from './exception'
 import { OpenAIMessageAdapter } from './openaiMessageAdapter'
+import { createBrowserFetch } from './sdkFetch'
 
-export class OpenAIAuthenticatedProvider extends BaseLLMProvider<
-  Extract<LLMProvider, { type: 'openai' }>
-> {
+export class OpenAIAuthenticatedProvider extends BaseLLMProvider<LLMProvider> {
   private adapter: OpenAIMessageAdapter
   private client: OpenAI
 
-  constructor(provider: Extract<LLMProvider, { type: 'openai' }>) {
+  constructor(provider: LLMProvider) {
     super(provider)
     const defaultHeaders = toProviderHeadersRecord(provider.customHeaders)
     this.client = new OpenAI({
       apiKey: provider.apiKey ?? '',
-      baseURL: provider.baseUrl
-        ? provider.baseUrl.replace(/\/+$/, '')
-        : undefined, // use default
+      baseURL: resolveProviderBaseUrl(provider),
       dangerouslyAllowBrowser: true,
       defaultHeaders,
+      fetch: createBrowserFetch(),
     })
     this.adapter = new OpenAIMessageAdapter()
   }
@@ -48,21 +51,20 @@ export class OpenAIAuthenticatedProvider extends BaseLLMProvider<
     request: LLMRequestNonStreaming,
     options?: LLMOptions,
   ): Promise<LLMResponseNonStreaming> {
-    if (model.providerType !== 'openai') {
-      throw new Error('Model is not an OpenAI model')
-    }
-
     if (!this.client.apiKey) {
       throw new LLMAPIKeyNotSetException(
         `Provider ${this.provider.id} API key is missing. Please set it in settings menu.`,
       )
     }
     try {
+      const level = resolveRequestReasoningLevel(model, request.reasoningLevel)
+      let reasoning_effort: ReasoningEffort | undefined
+      if (level !== undefined && level !== 'auto') {
+        reasoning_effort = REASONING_META[level].effort as ReasoningEffort
+      }
       let formattedRequest = {
         ...request,
-        reasoning_effort: model.reasoning?.enabled
-          ? (model.reasoning.reasoning_effort as ReasoningEffort)
-          : undefined,
+        reasoning_effort,
       }
 
       formattedRequest = this.applyCustomModelParameters(
@@ -116,21 +118,20 @@ export class OpenAIAuthenticatedProvider extends BaseLLMProvider<
     request: LLMRequestStreaming,
     options?: LLMOptions,
   ): Promise<AsyncIterable<LLMResponseStreaming>> {
-    if (model.providerType !== 'openai') {
-      throw new Error('Model is not an OpenAI model')
-    }
-
     if (!this.client.apiKey) {
       throw new LLMAPIKeyNotSetException(
         `Provider ${this.provider.id} API key is missing. Please set it in settings menu.`,
       )
     }
     try {
+      const level = resolveRequestReasoningLevel(model, request.reasoningLevel)
+      let reasoning_effort: ReasoningEffort | undefined
+      if (level !== undefined && level !== 'auto') {
+        reasoning_effort = REASONING_META[level].effort as ReasoningEffort
+      }
       let formattedRequest = {
         ...request,
-        reasoning_effort: model.reasoning?.enabled
-          ? (model.reasoning.reasoning_effort as ReasoningEffort)
-          : undefined,
+        reasoning_effort,
       }
 
       formattedRequest = this.applyCustomModelParameters(
@@ -155,7 +156,11 @@ export class OpenAIAuthenticatedProvider extends BaseLLMProvider<
     }
   }
 
-  async getEmbedding(model: string, text: string): Promise<number[]> {
+  async getEmbedding(
+    model: string,
+    text: string,
+    options?: { dimensions?: number },
+  ): Promise<number[]> {
     if (!this.client.apiKey) {
       throw new LLMAPIKeyNotSetException(
         `Provider ${this.provider.id} API key is missing. Please set it in settings menu.`,
@@ -166,6 +171,7 @@ export class OpenAIAuthenticatedProvider extends BaseLLMProvider<
       const embedding = await this.client.embeddings.create({
         model: model,
         input: text,
+        ...(options?.dimensions ? { dimensions: options.dimensions } : {}),
       })
       return extractEmbeddingVector(embedding)
     } catch (error) {

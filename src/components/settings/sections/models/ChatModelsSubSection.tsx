@@ -5,13 +5,13 @@ import { ObsidianToggle } from 'src/components/common/ObsidianToggle'
 
 import { DEFAULT_CHAT_MODELS } from '../../../../constants'
 import { useSettings } from '../../../../contexts/settings-context'
-import SmartComposerPlugin from '../../../../main'
+import YoloPlugin from '../../../../main'
 import { ConfirmModal } from '../../../modals/ConfirmModal'
 import { AddChatModelModal } from '../../modals/AddChatModelModal'
 
 type ChatModelsSubSectionProps = {
   app: App
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
 }
 
 const isEnabled = (enable: boolean | undefined | null) => enable ?? true
@@ -31,9 +31,9 @@ export function ChatModelsSubSection({
     const tryFind = (attempt = 0) => {
       const movedRow = document.querySelector(`tr[data-model-id="${movedId}"]`)
       if (movedRow) {
-        movedRow.classList.add('smtcmp-row-drop-success')
+        movedRow.classList.add('yolo-row-drop-success')
         window.setTimeout(() => {
-          movedRow.classList.remove('smtcmp-row-drop-success')
+          movedRow.classList.remove('yolo-row-drop-success')
         }, 700)
       } else if (attempt < 8) {
         window.setTimeout(() => tryFind(attempt + 1), 50)
@@ -43,9 +43,12 @@ export function ChatModelsSubSection({
   }
 
   const handleDeleteChatModel = (modelId: string) => {
-    if (modelId === settings.chatModelId || modelId === settings.applyModelId) {
+    if (
+      modelId === settings.chatModelId ||
+      modelId === settings.chatTitleModelId
+    ) {
       new Notice(
-        'Cannot remove model that is currently selected as chat model or tool model',
+        'Cannot remove model that is currently selected as chat model or conversation title model',
       )
       return
     }
@@ -79,10 +82,10 @@ export function ChatModelsSubSection({
         if (
           !value &&
           (modelId === settings.chatModelId ||
-            modelId === settings.applyModelId)
+            modelId === settings.chatTitleModelId)
         ) {
           new Notice(
-            'Cannot disable model that is currently selected as chat model or tool model',
+            'Cannot disable model that is currently selected as chat model or conversation title model',
           )
 
           await setSettings({
@@ -120,9 +123,9 @@ export function ChatModelsSubSection({
 
     // visual feedback: mark dragging row & handle
     const row = event.currentTarget
-    row.classList.add('smtcmp-row-dragging')
-    const handle = row.querySelector('.smtcmp-drag-handle')
-    if (handle) handle.classList.add('smtcmp-drag-handle--active')
+    row.classList.add('yolo-row-dragging')
+    const handle = row.querySelector('.yolo-drag-handle')
+    if (handle) handle.classList.add('yolo-drag-handle--active')
   }
 
   const handleDragOver = (
@@ -139,13 +142,13 @@ export function ChatModelsSubSection({
     // If hovering the row being dragged, suppress indicator to avoid flicker
     if (dragIndexRef.current === targetIndex) {
       row.classList.remove(
-        'smtcmp-row-drag-over-before',
-        'smtcmp-row-drag-over-after',
+        'yolo-row-drag-over-before',
+        'yolo-row-drag-over-after',
       )
       if (dragOverRowRef.current && dragOverRowRef.current !== row) {
         dragOverRowRef.current.classList.remove(
-          'smtcmp-row-drag-over-before',
-          'smtcmp-row-drag-over-after',
+          'yolo-row-drag-over-before',
+          'yolo-row-drag-over-after',
         )
       }
       dragOverRowRef.current = row
@@ -179,17 +182,17 @@ export function ChatModelsSubSection({
     // clear previous indicator
     if (dragOverRowRef.current) {
       dragOverRowRef.current.classList.remove(
-        'smtcmp-row-drag-over-before',
-        'smtcmp-row-drag-over-after',
+        'yolo-row-drag-over-before',
+        'yolo-row-drag-over-after',
       )
     }
 
     const desiredClass = dropAfter
-      ? 'smtcmp-row-drag-over-after'
-      : 'smtcmp-row-drag-over-before'
+      ? 'yolo-row-drag-over-after'
+      : 'yolo-row-drag-over-before'
     row.classList.remove(
-      'smtcmp-row-drag-over-before',
-      'smtcmp-row-drag-over-after',
+      'yolo-row-drag-over-before',
+      'yolo-row-drag-over-after',
     )
     row.classList.add(desiredClass)
     dragOverRowRef.current = row
@@ -201,21 +204,20 @@ export function ChatModelsSubSection({
     dragIndexRef.current = null
     if (dragOverRowRef.current) {
       dragOverRowRef.current.classList.remove(
-        'smtcmp-row-drag-over-before',
-        'smtcmp-row-drag-over-after',
+        'yolo-row-drag-over-before',
+        'yolo-row-drag-over-after',
       )
       dragOverRowRef.current = null
     }
     lastDropPosRef.current = null
     lastInsertIndexRef.current = null
     // remove dragging visuals from any row still marked
-    const dragging = document.querySelector('tr.smtcmp-row-dragging')
-    if (dragging) dragging.classList.remove('smtcmp-row-dragging')
+    const dragging = document.querySelector('tr.yolo-row-dragging')
+    if (dragging) dragging.classList.remove('yolo-row-dragging')
     const activeHandle = document.querySelector(
-      '.smtcmp-drag-handle.smtcmp-drag-handle--active',
+      '.yolo-drag-handle.yolo-drag-handle--active',
     )
-    if (activeHandle)
-      activeHandle.classList.remove('smtcmp-drag-handle--active')
+    if (activeHandle) activeHandle.classList.remove('yolo-drag-handle--active')
   }
 
   const handleDrop = (
@@ -265,16 +267,16 @@ export function ChatModelsSubSection({
         new Notice('Failed to reorder chat models.')
       } finally {
         rowEl?.classList.remove(
-          'smtcmp-row-drag-over-before',
-          'smtcmp-row-drag-over-after',
+          'yolo-row-drag-over-before',
+          'yolo-row-drag-over-after',
         )
-        const dragging = document.querySelector('tr.smtcmp-row-dragging')
-        if (dragging) dragging.classList.remove('smtcmp-row-dragging')
+        const dragging = document.querySelector('tr.yolo-row-dragging')
+        if (dragging) dragging.classList.remove('yolo-row-dragging')
         const activeHandle = document.querySelector(
-          '.smtcmp-drag-handle.smtcmp-drag-handle--active',
+          '.yolo-drag-handle.yolo-drag-handle--active',
         )
         if (activeHandle)
-          activeHandle.classList.remove('smtcmp-drag-handle--active')
+          activeHandle.classList.remove('yolo-drag-handle--active')
 
         dragOverRowRef.current = null
         lastDropPosRef.current = null
@@ -285,11 +287,11 @@ export function ChatModelsSubSection({
 
   return (
     <div>
-      <div className="smtcmp-settings-sub-header">Chat models</div>
-      <div className="smtcmp-settings-desc">Models used for chat and apply</div>
+      <div className="yolo-settings-sub-header">Chat models</div>
+      <div className="yolo-settings-desc">Models used for chat and apply</div>
 
-      <div className="smtcmp-settings-table-container">
-        <table className="smtcmp-settings-table">
+      <div className="yolo-settings-table-container">
+        <table className="yolo-settings-table">
           <colgroup>
             <col width={16} />
             <col />
@@ -321,7 +323,7 @@ export function ChatModelsSubSection({
               >
                 <td>
                   <span
-                    className="smtcmp-drag-handle"
+                    className="yolo-drag-handle"
                     aria-label="Drag to reorder"
                   >
                     <GripVertical />
@@ -339,7 +341,7 @@ export function ChatModelsSubSection({
                   />
                 </td>
                 <td>
-                  <div className="smtcmp-settings-actions">
+                  <div className="yolo-settings-actions">
                     {!DEFAULT_CHAT_MODELS.some(
                       (v) => v.id === chatModel.id,
                     ) && (

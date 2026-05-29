@@ -1,6 +1,6 @@
 import { z } from 'zod'
 
-const baseEmbeddingModelSchema = z.object({
+export const embeddingModelSchema = z.object({
   providerId: z
     .string({
       required_error: 'provider ID is required',
@@ -19,61 +19,9 @@ const baseEmbeddingModelSchema = z.object({
   // Optional display name for UI. When absent, UI should fallback to showing `model`.
   name: z.string().optional(),
   dimension: z.number(),
+  // Native output dimension probed when the model was first added.
+  // Used to decide whether to send `dimensions` parameter at runtime.
+  nativeDimension: z.number().int().positive().optional(),
 })
-
-export const embeddingModelSchema = z.discriminatedUnion('providerType', [
-  z.object({
-    providerType: z.literal('openai'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('anthropic'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('gemini'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('groq'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('openrouter'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('ollama'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('lm-studio'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('deepseek'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('perplexity'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('mistral'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('morph'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('azure-openai'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-  z.object({
-    providerType: z.literal('openai-compatible'),
-    ...baseEmbeddingModelSchema.shape,
-  }),
-])
 
 export type EmbeddingModel = z.infer<typeof embeddingModelSchema>

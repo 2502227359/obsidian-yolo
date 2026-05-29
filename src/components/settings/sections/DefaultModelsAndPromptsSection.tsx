@@ -1,20 +1,29 @@
-import { useCallback, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import {
   DEFAULT_CHAT_TITLE_PROMPT,
-  RECOMMENDED_MODELS_FOR_APPLY,
   RECOMMENDED_MODELS_FOR_CHAT,
+  RECOMMENDED_MODELS_FOR_CHAT_TITLE,
 } from '../../../constants'
 import { useLanguage } from '../../../contexts/language-context'
 import { useSettings } from '../../../contexts/settings-context'
+import { DEFAULT_MODEL_REQUEST_TIMEOUT_MS } from '../../../settings/schema/setting.types'
 import {
   ObsidianDropdown,
   type ObsidianDropdownOptionGroup,
 } from '../../common/ObsidianDropdown'
 import { ObsidianSetting } from '../../common/ObsidianSetting'
 import { ObsidianTextArea } from '../../common/ObsidianTextArea'
+import { ObsidianTextInput } from '../../common/ObsidianTextInput'
+import { ObsidianToggle } from '../../common/ObsidianToggle'
 
-export function DefaultModelsAndPromptsSection() {
+type DefaultModelsAndPromptsSectionProps = {
+  className?: string
+}
+
+export function DefaultModelsAndPromptsSection({
+  className,
+}: DefaultModelsAndPromptsSectionProps = {}) {
   const { settings, setSettings } = useSettings()
   const { t, language } = useLanguage()
 
@@ -83,8 +92,8 @@ export function DefaultModelsAndPromptsSection() {
     [enabledChatModels, orderedProviderIds, t],
   )
 
-  const applyModelGroupedOptions = useMemo(
-    () => buildGroupedChatOptions(RECOMMENDED_MODELS_FOR_APPLY),
+  const chatTitleModelGroupedOptions = useMemo(
+    () => buildGroupedChatOptions(RECOMMENDED_MODELS_FOR_CHAT_TITLE),
     [buildGroupedChatOptions],
   )
 
@@ -95,107 +104,190 @@ export function DefaultModelsAndPromptsSection() {
 
   const defaultTitlePrompt =
     DEFAULT_CHAT_TITLE_PROMPT[language] ?? DEFAULT_CHAT_TITLE_PROMPT.en
+  const streamFallbackRecoveryEnabled =
+    settings.continuationOptions.streamFallbackRecoveryEnabled ?? true
+  const primaryRequestTimeoutMs =
+    settings.continuationOptions.primaryRequestTimeoutMs ??
+    DEFAULT_MODEL_REQUEST_TIMEOUT_MS
+  const [
+    primaryRequestTimeoutSecondsInput,
+    setPrimaryRequestTimeoutSecondsInput,
+  ] = useState(String(Math.round(primaryRequestTimeoutMs / 1000)))
 
   const chatTitlePromptValue =
     (settings.chatOptions.chatTitlePrompt ?? '').trim().length > 0
       ? settings.chatOptions.chatTitlePrompt!
       : defaultTitlePrompt
 
-  const baseModelSpecialPromptValue =
-    settings.chatOptions.baseModelSpecialPrompt ?? ''
+  useEffect(() => {
+    setPrimaryRequestTimeoutSecondsInput(
+      String(Math.round(primaryRequestTimeoutMs / 1000)),
+    )
+  }, [primaryRequestTimeoutMs])
+
+  const parseIntegerInput = (value: string) => {
+    const trimmed = value.trim()
+    if (trimmed.length === 0) return null
+    if (!/^-?\d+$/.test(trimmed)) return null
+    return parseInt(trimmed, 10)
+  }
 
   return (
-    <div className="smtcmp-settings-section">
-      <div className="smtcmp-settings-header">
-        {t('settings.defaults.title')}
-      </div>
+    <div
+      className={['yolo-settings-section', className].filter(Boolean).join(' ')}
+    >
+      <section className="yolo-models-block yolo-default-models-block">
+        <div className="yolo-models-block-head">
+          <div className="yolo-models-block-head-title-row">
+            <div className="yolo-settings-sub-header yolo-models-block-title">
+              {t('settings.defaults.title')}
+            </div>
+          </div>
+        </div>
 
-      <ObsidianSetting
-        name={t('settings.defaults.defaultChatModel')}
-        desc={t('settings.defaults.defaultChatModelDesc')}
-      >
-        <ObsidianDropdown
-          value={settings.chatModelId}
-          groupedOptions={chatModelGroupedOptions}
-          onChange={(value) => {
-            commitSettingsUpdate({ chatModelId: value }, 'chatModelId')
-          }}
-        />
-      </ObsidianSetting>
+        <div className="yolo-models-block-content">
+          <ObsidianSetting
+            name={t('settings.defaults.defaultChatModel')}
+            desc={t('settings.defaults.defaultChatModelDesc')}
+            className="yolo-models-select-card"
+          >
+            <ObsidianDropdown
+              value={settings.chatModelId}
+              groupedOptions={chatModelGroupedOptions}
+              onChange={(value) => {
+                commitSettingsUpdate({ chatModelId: value }, 'chatModelId')
+              }}
+            />
+          </ObsidianSetting>
 
-      <ObsidianSetting
-        name={t('settings.defaults.toolModel')}
-        desc={t('settings.defaults.toolModelDesc')}
-      >
-        <ObsidianDropdown
-          value={settings.applyModelId}
-          groupedOptions={applyModelGroupedOptions}
-          onChange={(value) => {
-            commitSettingsUpdate({ applyModelId: value }, 'applyModelId')
-          }}
-        />
-      </ObsidianSetting>
+          <ObsidianSetting
+            name={t('settings.defaults.chatTitleModel')}
+            desc={t('settings.defaults.chatTitleModelDesc')}
+            className="yolo-models-select-card"
+          >
+            <ObsidianDropdown
+              value={settings.chatTitleModelId}
+              groupedOptions={chatTitleModelGroupedOptions}
+              onChange={(value) => {
+                commitSettingsUpdate(
+                  { chatTitleModelId: value },
+                  'chatTitleModelId',
+                )
+              }}
+            />
+          </ObsidianSetting>
 
-      <ObsidianSetting
-        name={t('settings.defaults.globalSystemPrompt')}
-        desc={t('settings.defaults.globalSystemPromptDesc')}
-        className="smtcmp-settings-textarea-header"
-      />
+          <ObsidianSetting
+            name={t('settings.defaults.streamFallbackRecovery')}
+            desc={t('settings.defaults.streamFallbackRecoveryDesc')}
+            className="yolo-models-select-card"
+          >
+            <ObsidianToggle
+              value={streamFallbackRecoveryEnabled}
+              onChange={(value) => {
+                commitSettingsUpdate(
+                  {
+                    continuationOptions: {
+                      ...settings.continuationOptions,
+                      streamFallbackRecoveryEnabled: value,
+                    },
+                  },
+                  'streamFallbackRecoveryEnabled',
+                )
+              }}
+            />
+          </ObsidianSetting>
 
-      <ObsidianSetting className="smtcmp-settings-textarea">
-        <ObsidianTextArea
-          value={settings.systemPrompt}
-          onChange={(value: string) => {
-            commitSettingsUpdate({ systemPrompt: value }, 'systemPrompt')
-          }}
-        />
-      </ObsidianSetting>
+          <ObsidianSetting
+            name={t('settings.defaults.primaryRequestTimeout')}
+            desc={t('settings.defaults.primaryRequestTimeoutDesc')}
+            className="yolo-models-select-card"
+          >
+            <ObsidianTextInput
+              type="number"
+              value={primaryRequestTimeoutSecondsInput}
+              onChange={(value) => {
+                setPrimaryRequestTimeoutSecondsInput(value)
+                const nextSeconds = parseIntegerInput(value)
+                if (nextSeconds === null) return
+                const clampedSeconds = Math.min(600, Math.max(1, nextSeconds))
+                commitSettingsUpdate(
+                  {
+                    continuationOptions: {
+                      ...settings.continuationOptions,
+                      primaryRequestTimeoutMs: clampedSeconds * 1000,
+                    },
+                  },
+                  'primaryRequestTimeoutMs',
+                )
+              }}
+              onBlur={() => {
+                const parsedSeconds = parseIntegerInput(
+                  primaryRequestTimeoutSecondsInput,
+                )
+                const nextSeconds =
+                  parsedSeconds === null
+                    ? Math.round(primaryRequestTimeoutMs / 1000)
+                    : Math.min(600, Math.max(1, parsedSeconds))
+                setPrimaryRequestTimeoutSecondsInput(String(nextSeconds))
+                if (nextSeconds * 1000 !== primaryRequestTimeoutMs) {
+                  commitSettingsUpdate(
+                    {
+                      continuationOptions: {
+                        ...settings.continuationOptions,
+                        primaryRequestTimeoutMs: nextSeconds * 1000,
+                      },
+                    },
+                    'primaryRequestTimeoutMs',
+                  )
+                }
+              }}
+            />
+          </ObsidianSetting>
 
-      <ObsidianSetting
-        name={t('settings.defaults.chatTitlePrompt')}
-        desc={t('settings.defaults.chatTitlePromptDesc')}
-        className="smtcmp-settings-textarea-header"
-      />
+          <div className="yolo-models-textarea-card">
+            <ObsidianSetting
+              name={t('settings.defaults.globalSystemPrompt')}
+              desc={t('settings.defaults.globalSystemPromptDesc')}
+              className="yolo-settings-textarea-header yolo-models-textarea-card-header yolo-settings-desc-copyable"
+            />
 
-      <ObsidianSetting className="smtcmp-settings-textarea">
-        <ObsidianTextArea
-          value={chatTitlePromptValue}
-          onChange={(value: string) => {
-            commitSettingsUpdate(
-              {
-                chatOptions: {
-                  ...settings.chatOptions,
-                  chatTitlePrompt: value,
-                },
-              },
-              'chatTitlePrompt',
-            )
-          }}
-        />
-      </ObsidianSetting>
+            <ObsidianSetting className="yolo-settings-textarea yolo-models-textarea-card-body">
+              <ObsidianTextArea
+                value={settings.systemPrompt}
+                onChange={(value: string) => {
+                  commitSettingsUpdate({ systemPrompt: value }, 'systemPrompt')
+                }}
+              />
+            </ObsidianSetting>
+          </div>
 
-      <ObsidianSetting
-        name={t('settings.defaults.baseModelSpecialPrompt')}
-        desc={t('settings.defaults.baseModelSpecialPromptDesc')}
-        className="smtcmp-settings-textarea-header"
-      />
+          <div className="yolo-models-textarea-card">
+            <ObsidianSetting
+              name={t('settings.defaults.chatTitlePrompt')}
+              desc={t('settings.defaults.chatTitlePromptDesc')}
+              className="yolo-settings-textarea-header yolo-models-textarea-card-header"
+            />
 
-      <ObsidianSetting className="smtcmp-settings-textarea">
-        <ObsidianTextArea
-          value={baseModelSpecialPromptValue}
-          onChange={(value: string) => {
-            commitSettingsUpdate(
-              {
-                chatOptions: {
-                  ...settings.chatOptions,
-                  baseModelSpecialPrompt: value,
-                },
-              },
-              'baseModelSpecialPrompt',
-            )
-          }}
-        />
-      </ObsidianSetting>
+            <ObsidianSetting className="yolo-settings-textarea yolo-models-textarea-card-body">
+              <ObsidianTextArea
+                value={chatTitlePromptValue}
+                onChange={(value: string) => {
+                  commitSettingsUpdate(
+                    {
+                      chatOptions: {
+                        ...settings.chatOptions,
+                        chatTitlePrompt: value,
+                      },
+                    },
+                    'chatTitlePrompt',
+                  )
+                }}
+              />
+            </ObsidianSetting>
+          </div>
+        </div>
+      </section>
     </div>
   )
 }

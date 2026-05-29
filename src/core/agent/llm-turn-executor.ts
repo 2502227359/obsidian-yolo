@@ -1,32 +1,55 @@
-import { TFile } from 'obsidian'
 import { v4 as uuidv4 } from 'uuid'
 
+import type { AssistantToolPreference } from '../../types/assistant.types'
+import {
+  ChatAssistantMessage,
+  ChatConversationCompactionLike,
+  ChatMessage,
+} from '../../types/chat'
+import { ChatModel } from '../../types/chat-model.types'
+import { LLMProvider, LLMProviderApiType } from '../../types/provider.types'
 import {
   ReasoningLevel,
-  reasoningLevelToConfig,
-} from '../../components/chat-view/chat-input/ReasoningSelect'
-import { ChatAssistantMessage, ChatMessage } from '../../types/chat'
-import { ChatModel } from '../../types/chat-model.types'
-import { RequestTool } from '../../types/llm/request'
-import { LLMProvider } from '../../types/provider.types'
+  resolveRequestReasoningLevel,
+} from '../../types/reasoning'
 import { ToolCallRequest } from '../../types/tool-call.types'
-import { PromptGenerator } from '../../utils/chat/promptGenerator'
+import type { ContextualInjection } from '../../utils/chat/contextual-injections'
+import { RequestContextBuilder } from '../../utils/chat/requestContextBuilder'
+import { formatErrorMessageWithCauses } from '../../utils/error-message'
 import { executeSingleTurn } from '../ai/single-turn'
 import { BaseLLMProvider } from '../llm/base'
-import { getLocalFileToolServerName } from '../mcp/localFileTools'
+import {
+  createLLMDebugTrace,
+  isLLMDebugCaptureEnabled,
+  registerLLMDebugTraceForTurn,
+  updateLLMDebugTrace,
+} from '../llm/debugCapture'
+import {
+  LOCAL_FILE_TOOL_SHORT_NAMES,
+  getLocalFileToolServerName,
+} from '../mcp/localFileTools'
 import { McpManager } from '../mcp/mcpManager'
-import { parseToolName } from '../mcp/tool-name-utils'
+
+import { CONTEXT_COMPACT_TOOL_NAME } from './compaction'
+import { selectAllowedTools } from './tool-selection'
 
 type AgentLlmTurnExecutorInput = {
   providerClient: BaseLLMProvider<LLMProvider>
   model: ChatModel
-  promptGenerator: PromptGenerator
+  requestContextBuilder: RequestContextBuilder
   mcpManager: McpManager
   conversationId: string
   messages: ChatMessage[]
+  branchId?: string
+  sourceUserMessageId?: string
+  branchLabel?: string
+  compaction?: ChatConversationCompactionLike | null
   enableTools: boolean
   includeBuiltinTools: boolean
+  apiType?: LLMProviderApiType | null
   allowedToolNames?: string[]
+  enableToolDisclosure?: boolean
+  toolPreferences?: Record<string, AssistantToolPreference>
   allowedSkillIds?: string[]
   allowedSkillNames?: string[]
   abortSignal?: AbortSignal
@@ -36,10 +59,10 @@ type AgentLlmTurnExecutorInput = {
     temperature?: number
     top_p?: number
     max_tokens?: number
+    primaryRequestTimeoutMs?: number
+    streamFallbackRecoveryEnabled?: boolean
   }
-  maxContextOverride?: number
-  currentFileContextMode?: 'full' | 'summary'
-  currentFileOverride?: TFile | null
+  contextualInjections?: ContextualInjection[]
   geminiTools?: {
     useWebSearch?: boolean
     useUrlContext?: boolean
@@ -50,115 +73,192 @@ type AgentLlmTurnExecutorInput = {
 type AgentLlmTurnExecutorOutput = {
   assistantMessage: ChatAssistantMessage
   toolCallRequests: ToolCallRequest[]
-  modelTerminated: boolean
+  hasAssistantOutput: boolean
+  debugTraceId?: string
 }
 
 export class AgentLlmTurnExecutor {
   private static readonly LOCAL_TOOL_NAMES = new Set([
-    'fs_list',
-    'fs_search',
-    'fs_read',
-    'fs_edit',
-    'fs_write',
-    'open_skill',
+    ...LOCAL_FILE_TOOL_SHORT_NAMES,
+    CONTEXT_COMPACT_TOOL_NAME,
   ])
 
-  private readonly allowedToolNames?: Set<string>
-  private readonly allowedSkillIds?: Set<string>
-  private readonly allowedSkillNames?: Set<string>
-
-  constructor(private readonly input: AgentLlmTurnExecutorInput) {
-    this.allowedToolNames = input.allowedToolNames
-      ? new Set(input.allowedToolNames)
-      : undefined
-    this.allowedSkillIds = input.allowedSkillIds
-      ? new Set(input.allowedSkillIds.map((id) => id.toLowerCase()))
-      : undefined
-    this.allowedSkillNames = input.allowedSkillNames
-      ? new Set(input.allowedSkillNames.map((name) => name.toLowerCase()))
-      : undefined
-  }
+  constructor(private readonly input: AgentLlmTurnExecutorInput) {}
 
   async run(): Promise<AgentLlmTurnExecutorOutput> {
     const availableTools = this.input.enableTools
       ? await this.input.mcpManager.listAvailableTools({
           includeBuiltinTools: this.input.includeBuiltinTools,
+          // Pass the active model's modalities so built-in tool schemas
+          // (notably fs_read's modality enum) are tailored — PDF-capable
+          // models see ['text','pdf'], vision-capable see ['text','image'],
+          // text-only see no modality field at all.
+          chatModelModalities: this.input.model.modalities,
         })
       : []
-    const filteredTools = availableTools.filter((tool) =>
-      this.isToolAllowed(tool.name),
-    )
-
-    const hasTools = filteredTools.length > 0
+    const {
+      hasTools,
+      hasMemoryTools,
+      requestTools: tools,
+    } = selectAllowedTools({
+      availableTools,
+      allowedToolNames: this.input.allowedToolNames,
+      allowedSkillIds: this.input.allowedSkillIds,
+      allowedSkillNames: this.input.allowedSkillNames,
+      toolPreferences: this.input.toolPreferences,
+      apiType: this.input.apiType,
+      enableToolDisclosure: this.input.enableToolDisclosure,
+      jsSandboxSettings: this.input.mcpManager.getJsSandboxSettings(),
+    })
     const requestMessages =
-      await this.input.promptGenerator.generateRequestMessages({
+      await this.input.requestContextBuilder.generateRequestMessages({
         messages: this.input.messages,
         hasTools,
-        maxContextOverride: this.input.maxContextOverride,
+        hasMemoryTools,
         model: this.input.model,
         conversationId: this.input.conversationId,
-        currentFileContextMode: this.input.currentFileContextMode,
-        currentFileOverride: this.input.currentFileOverride,
+        compaction: this.input.compaction,
+        contextualInjections: this.input.contextualInjections,
       })
 
-    const tools: RequestTool[] | undefined =
-      filteredTools.length > 0
-        ? filteredTools.map((tool) => ({
-            type: 'function',
-            function: {
-              name: tool.name,
-              description: tool.description,
-              parameters: {
-                ...tool.inputSchema,
-                properties: tool.inputSchema.properties ?? {},
-              },
-            },
-          }))
-        : undefined
-
     const responseStart = Date.now()
-    const effectiveModel = this.getEffectiveModel()
+    const model = this.input.model
+    const assistantMessageId = uuidv4()
+    const debugTrace = isLLMDebugCaptureEnabled()
+      ? createLLMDebugTrace({
+          assistantMessageId,
+          model,
+          requestKind:
+            this.input.requestParams?.stream === false
+              ? 'non-streaming'
+              : 'streaming',
+        })
+      : null
+    if (debugTrace && this.input.sourceUserMessageId) {
+      registerLLMDebugTraceForTurn({
+        conversationId: this.input.conversationId,
+        sourceUserMessageId: this.input.sourceUserMessageId,
+        traceId: debugTrace.id,
+      })
+    }
     const assistantMessage: ChatAssistantMessage = {
       role: 'assistant',
-      id: uuidv4(),
+      id: assistantMessageId,
       content: '',
       metadata: {
-        model: effectiveModel,
+        model,
         generationState: 'streaming',
+        ...(debugTrace ? { llmDebugTraceId: debugTrace.id } : {}),
+        branchConversationId: this.input.conversationId,
+        sourceUserMessageId: this.input.sourceUserMessageId,
+        branchId: this.input.branchId,
+        branchModelId: model.id,
+        branchLabel:
+          this.input.branchLabel ?? model.name ?? model.model ?? model.id,
       },
     }
     this.input.onAssistantMessage(assistantMessage)
 
-    const turnResult = await executeSingleTurn({
-      providerClient: this.input.providerClient,
-      model: effectiveModel,
-      request: {
-        model: effectiveModel.model,
-        messages: requestMessages,
-        temperature: this.input.requestParams?.temperature,
-        top_p: this.input.requestParams?.top_p,
-        max_tokens: this.input.requestParams?.max_tokens,
-      },
-      tools,
-      signal: this.input.abortSignal,
-      stream: this.input.requestParams?.stream ?? true,
-      geminiTools: this.input.geminiTools,
-      onStreamDelta: ({ contentDelta, reasoningDelta, chunk }) => {
-        if (contentDelta) {
-          assistantMessage.content += contentDelta
-        }
-        if (reasoningDelta) {
-          assistantMessage.reasoning = `${assistantMessage.reasoning ?? ''}${reasoningDelta}`
-        }
-        if (chunk.usage) {
-          assistantMessage.metadata = {
-            ...assistantMessage.metadata,
-            usage: chunk.usage,
+    let turnResult: Awaited<ReturnType<typeof executeSingleTurn>>
+    try {
+      const resolvedReasoning = resolveRequestReasoningLevel(
+        this.input.model,
+        this.input.reasoningLevel,
+      )
+      turnResult = await executeSingleTurn({
+        providerClient: this.input.providerClient,
+        model: this.input.model,
+        request: {
+          model: this.input.model.model,
+          messages: requestMessages,
+          temperature: this.input.requestParams?.temperature,
+          top_p: this.input.requestParams?.top_p,
+          max_tokens: this.input.requestParams?.max_tokens,
+          ...(resolvedReasoning !== undefined
+            ? { reasoningLevel: resolvedReasoning }
+            : {}),
+        },
+        tools,
+        signal: this.input.abortSignal,
+        stream: this.input.requestParams?.stream ?? true,
+        primaryRequestTimeoutMs:
+          this.input.requestParams?.primaryRequestTimeoutMs,
+        streamFallbackRecoveryEnabled:
+          this.input.requestParams?.streamFallbackRecoveryEnabled,
+        geminiTools: this.input.geminiTools,
+        debugTraceId: debugTrace?.id,
+        onStreamDelta: ({ contentDelta, reasoningDelta, chunk, toolCalls }) => {
+          if (contentDelta) {
+            assistantMessage.content += contentDelta
           }
-        }
-        this.input.onAssistantMessage(assistantMessage)
-      },
-    })
+          if (reasoningDelta) {
+            assistantMessage.reasoning = `${assistantMessage.reasoning ?? ''}${reasoningDelta}`
+          }
+          if (toolCalls && toolCalls.length > 0) {
+            const streamedToolCallRequests = toolCalls
+              .map((toolCall) => {
+                const name = toolCall.function?.name?.trim()
+                if (!name) {
+                  return null
+                }
+
+                const normalizedName = this.normalizeToolCallName(name)
+
+                return {
+                  id:
+                    toolCall.id ??
+                    `${assistantMessage.id}-stream-tool-${toolCall.index}`,
+                  name: normalizedName,
+                  arguments: toolCall.function?.arguments,
+                  metadata: toolCall.metadata,
+                }
+              })
+              .filter((toolCall): toolCall is NonNullable<typeof toolCall> =>
+                Boolean(toolCall),
+              )
+
+            if (streamedToolCallRequests.length > 0) {
+              assistantMessage.toolCallRequests = streamedToolCallRequests
+            }
+          }
+          if (chunk.usage) {
+            assistantMessage.metadata = {
+              ...assistantMessage.metadata,
+              usage: chunk.usage,
+            }
+          }
+          if (chunk.choices?.[0]?.delta?.providerMetadata) {
+            assistantMessage.metadata = {
+              ...assistantMessage.metadata,
+              providerMetadata: chunk.choices[0].delta.providerMetadata,
+            }
+          }
+          this.input.onAssistantMessage(assistantMessage)
+        },
+      })
+    } catch (error) {
+      const isAborted =
+        this.input.abortSignal?.aborted ||
+        (error instanceof Error && error.name === 'AbortError')
+      const errorMessage = isAborted
+        ? undefined
+        : formatErrorMessageWithCauses(error)
+
+      assistantMessage.metadata = {
+        ...assistantMessage.metadata,
+        durationMs: Date.now() - responseStart,
+        generationState: isAborted ? 'aborted' : 'error',
+        errorMessage,
+      }
+      updateLLMDebugTrace(debugTrace?.id, {
+        completedAt: Date.now(),
+        durationMs: assistantMessage.metadata.durationMs,
+        generationState: assistantMessage.metadata.generationState,
+        errorMessage,
+      })
+      this.input.onAssistantMessage(assistantMessage)
+      throw error
+    }
 
     if (!this.input.requestParams?.stream) {
       assistantMessage.content = turnResult.content
@@ -170,29 +270,38 @@ export class AgentLlmTurnExecutor {
     assistantMessage.annotations = turnResult.annotations
     assistantMessage.metadata = {
       ...assistantMessage.metadata,
-      usage: turnResult.usage,
+      usage: turnResult.usage ?? assistantMessage.metadata?.usage,
       durationMs: Date.now() - responseStart,
       generationState: this.input.abortSignal?.aborted
         ? 'aborted'
         : 'completed',
+      providerMetadata: turnResult.providerMetadata,
     }
 
     const toolCallRequests = turnResult.toolCalls.map((toolCall) => ({
       id: toolCall.id ?? uuidv4(),
       name: this.normalizeToolCallName(toolCall.name),
       arguments: toolCall.arguments,
+      metadata: toolCall.metadata,
     }))
 
     assistantMessage.toolCallRequests =
       toolCallRequests.length > 0 ? toolCallRequests : undefined
+    updateLLMDebugTrace(debugTrace?.id, {
+      completedAt: Date.now(),
+      durationMs: assistantMessage.metadata.durationMs,
+      generationState: assistantMessage.metadata.generationState,
+      usage: assistantMessage.metadata.usage,
+      hasToolCalls: toolCallRequests.length > 0,
+      toolCallNames: toolCallRequests.map((toolCall) => toolCall.name),
+    })
     this.input.onAssistantMessage(assistantMessage)
 
     return {
       assistantMessage,
       toolCallRequests,
-      modelTerminated: this.isModelTerminationFinishReason(
-        turnResult.finishReason,
-      ),
+      hasAssistantOutput: assistantMessage.content.trim().length > 0,
+      debugTraceId: debugTrace?.id,
     }
   }
 
@@ -204,61 +313,5 @@ export class AgentLlmTurnExecutor {
       return toolName
     }
     return `${getLocalFileToolServerName()}${McpManager.TOOL_NAME_DELIMITER}${toolName}`
-  }
-
-  private isToolAllowed(toolName: string): boolean {
-    if (this.isOpenSkillToolName(toolName)) {
-      const hasAllowedSkills =
-        (this.allowedSkillIds?.size ?? 0) > 0 ||
-        (this.allowedSkillNames?.size ?? 0) > 0
-      if (!hasAllowedSkills) {
-        return false
-      }
-    }
-
-    if (!this.allowedToolNames) {
-      return true
-    }
-    return this.allowedToolNames.has(toolName)
-  }
-
-  private isOpenSkillToolName(toolName: string): boolean {
-    try {
-      const parsed = parseToolName(toolName)
-      return (
-        parsed.serverName === getLocalFileToolServerName() &&
-        parsed.toolName === 'open_skill'
-      )
-    } catch {
-      return false
-    }
-  }
-
-  private getEffectiveModel(): ChatModel {
-    if (!this.input.reasoningLevel) {
-      return this.input.model
-    }
-
-    return {
-      ...this.input.model,
-      ...reasoningLevelToConfig(this.input.reasoningLevel, this.input.model),
-    } as ChatModel
-  }
-
-  private isModelTerminationFinishReason(
-    finishReason: string | null | undefined,
-  ): boolean {
-    if (!finishReason) {
-      return false
-    }
-    const normalized = finishReason.toLowerCase()
-    if (
-      normalized === 'tool_calls' ||
-      normalized === 'tool_call' ||
-      normalized === 'function_call'
-    ) {
-      return false
-    }
-    return true
   }
 }

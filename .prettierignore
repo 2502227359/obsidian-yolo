@@ -1,5 +1,6 @@
 # compiled output
 main.js
+styles.css
 /node_modules
 
 # Logs
@@ -45,9 +46,17 @@ version-bump.mjs
 versions.json
 package.json
 manifest.json
+src/database/migrations.json
 
 # Obsidian
 .obsidian
+.opencode
+
+# Large non-source trees
+Reference
+Design
+vendor
+runtime
 
 # Markdown
 *.md

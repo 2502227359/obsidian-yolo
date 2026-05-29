@@ -1,18 +1,17 @@
-import cx from 'clsx'
 import { X } from 'lucide-react'
 import { PropsWithChildren } from 'react'
 
-import { useApp } from '../../../contexts/app-context'
 import { useLanguage } from '../../../contexts/language-context'
 import {
   Mentionable,
+  MentionableAssistantQuote,
   MentionableBlock,
-  MentionableCurrentFile,
   MentionableFile,
   MentionableFolder,
   MentionableImage,
+  MentionableModel,
+  MentionablePDF,
   MentionableUrl,
-  MentionableVault,
 } from '../../../types/mentionable'
 import { getBlockMentionableCountInfo } from '../../../utils/chat/mentionable'
 
@@ -23,7 +22,8 @@ function BadgeBase({
   onDelete,
   onClick,
   isFocused,
-  isExpanded,
+  title,
+  isExpanded: _isExpanded,
   onToggleExpand,
   showExpandButton = false,
   showDeleteButton = true,
@@ -31,6 +31,7 @@ function BadgeBase({
   onDelete: () => void
   onClick: () => void
   isFocused: boolean
+  title?: string
   isExpanded?: boolean
   onToggleExpand?: () => void
   showExpandButton?: boolean
@@ -38,12 +39,13 @@ function BadgeBase({
 }>) {
   return (
     <div
-      className={`smtcmp-chat-user-input-file-badge ${isFocused ? 'smtcmp-chat-user-input-file-badge-focused' : ''}`}
+      className={`yolo-chat-user-input-file-badge ${isFocused ? 'yolo-chat-user-input-file-badge-focused' : ''}`}
       onClick={onClick}
+      title={title}
     >
       {showExpandButton && (
         <div
-          className="smtcmp-chat-user-input-file-badge-expand"
+          className="yolo-chat-user-input-file-badge-expand"
           onClick={(evt) => {
             evt.stopPropagation()
             onToggleExpand?.()
@@ -53,7 +55,7 @@ function BadgeBase({
       {children}
       {showDeleteButton && (
         <div
-          className="smtcmp-chat-user-input-file-badge-delete"
+          className="yolo-chat-user-input-file-badge-delete"
           onClick={(evt) => {
             evt.stopPropagation()
             onDelete()
@@ -94,11 +96,11 @@ function FileBadge({
       showExpandButton={false}
       showDeleteButton={showDeleteButton}
     >
-      <div className="smtcmp-chat-user-input-file-badge-name">
+      <div className="yolo-chat-user-input-file-badge-name">
         {Icon && (
           <Icon
             size={12}
-            className="smtcmp-chat-user-input-file-badge-name-icon"
+            className="yolo-chat-user-input-file-badge-name-icon"
           />
         )}
         <span>{mentionable.file.name}</span>
@@ -129,104 +131,14 @@ function FolderBadge({
       showExpandButton={false}
       showDeleteButton={showDeleteButton}
     >
-      <div className="smtcmp-chat-user-input-file-badge-name">
+      <div className="yolo-chat-user-input-file-badge-name">
         {Icon && (
           <Icon
             size={12}
-            className="smtcmp-chat-user-input-file-badge-name-icon"
+            className="yolo-chat-user-input-file-badge-name-icon"
           />
         )}
         <span>{mentionable.folder.name}</span>
-      </div>
-    </BadgeBase>
-  )
-}
-
-function VaultBadge({
-  mentionable,
-  onDelete,
-  onClick,
-  isFocused,
-  showDeleteButton,
-}: {
-  mentionable: MentionableVault
-  onDelete: () => void
-  onClick: () => void
-  isFocused: boolean
-  showDeleteButton?: boolean
-}) {
-  const Icon = getMentionableIcon(mentionable)
-  return (
-    <BadgeBase
-      onDelete={onDelete}
-      onClick={onClick}
-      isFocused={isFocused}
-      showExpandButton={false}
-      showDeleteButton={showDeleteButton}
-    >
-      <div className="smtcmp-chat-user-input-file-badge-name">
-        {Icon && (
-          <Icon
-            size={12}
-            className="smtcmp-chat-user-input-file-badge-name-icon"
-          />
-        )}
-        <span>Vault</span>
-      </div>
-    </BadgeBase>
-  )
-}
-
-function CurrentFileBadge({
-  mentionable,
-  onDelete,
-  onClick,
-  isFocused,
-  isExpanded,
-  onToggleExpand,
-  showDeleteButton,
-}: {
-  mentionable: MentionableCurrentFile
-  onDelete: () => void
-  onClick: () => void
-  isFocused: boolean
-  isExpanded?: boolean
-  onToggleExpand?: () => void
-  showDeleteButton?: boolean
-}) {
-  const app = useApp()
-
-  const Icon = getMentionableIcon(mentionable)
-  return (
-    <BadgeBase
-      onDelete={onDelete}
-      onClick={onClick}
-      isFocused={isFocused}
-      isExpanded={isExpanded}
-      onToggleExpand={onToggleExpand}
-      showExpandButton={false}
-      showDeleteButton={showDeleteButton}
-    >
-      <div className="smtcmp-chat-user-input-file-badge-name">
-        {Icon && (
-          <Icon
-            size={12}
-            className="smtcmp-chat-user-input-file-badge-name-icon"
-          />
-        )}
-        <span className={cx(!mentionable.file && 'smtcmp-excluded-content')}>
-          {mentionable.file?.name ??
-            app.workspace.getActiveFile()?.name ??
-            'Current file'}
-        </span>
-      </div>
-      <div
-        className={cx(
-          'smtcmp-chat-user-input-file-badge-name-suffix',
-          !mentionable.file && 'smtcmp-excluded-content',
-        )}
-      >
-        {' (Current file)'}
       </div>
     </BadgeBase>
   )
@@ -251,8 +163,17 @@ function BlockBadge({
 }) {
   const Icon = getMentionableIcon(mentionable)
   const { t } = useLanguage()
-  const { count } = getBlockMentionableCountInfo(mentionable.content)
-  const unitLabel = t('common.characters', 'chars')
+  const info = getBlockMentionableCountInfo(mentionable.content)
+  const count = mentionable.contentCount ?? info.count
+  const unit = mentionable.contentUnit ?? info.unit
+  const unitLabel = t(`common.${unit}`, unit)
+
+  // PDF selection: show "Page N" instead of character count
+  const suffix =
+    mentionable.pageNumber !== undefined
+      ? ` (${t('mentionable.pdfPage', 'Page {{page}}').replace('{{page}}', String(mentionable.pageNumber))})`
+      : ` (${count} ${unitLabel})`
+
   return (
     <BadgeBase
       onDelete={onDelete}
@@ -263,17 +184,17 @@ function BlockBadge({
       showExpandButton={false}
       showDeleteButton={showDeleteButton}
     >
-      <div className="smtcmp-chat-user-input-file-badge-name">
+      <div className="yolo-chat-user-input-file-badge-name">
         {Icon && (
           <Icon
             size={12}
-            className="smtcmp-chat-user-input-file-badge-name-icon"
+            className="yolo-chat-user-input-file-badge-name-icon"
           />
         )}
         <span>{mentionable.file.name}</span>
       </div>
-      <div className="smtcmp-chat-user-input-file-badge-name-suffix">
-        {` (${count} ${unitLabel})`}
+      <div className="yolo-chat-user-input-file-badge-name-suffix">
+        {suffix}
       </div>
     </BadgeBase>
   )
@@ -301,14 +222,60 @@ function UrlBadge({
       showExpandButton={false}
       showDeleteButton={showDeleteButton}
     >
-      <div className="smtcmp-chat-user-input-file-badge-name">
+      <div className="yolo-chat-user-input-file-badge-name">
         {Icon && (
           <Icon
             size={12}
-            className="smtcmp-chat-user-input-file-badge-name-icon"
+            className="yolo-chat-user-input-file-badge-name-icon"
           />
         )}
         <span>{mentionable.url}</span>
+      </div>
+    </BadgeBase>
+  )
+}
+
+function AssistantQuoteBadge({
+  mentionable,
+  onDelete,
+  onClick,
+  isFocused,
+  showDeleteButton,
+}: {
+  mentionable: MentionableAssistantQuote
+  onDelete: () => void
+  onClick: () => void
+  isFocused: boolean
+  showDeleteButton?: boolean
+}) {
+  const Icon = getMentionableIcon(mentionable)
+  const { t } = useLanguage()
+  const info = getBlockMentionableCountInfo(mentionable.content)
+  const count = mentionable.contentCount ?? info.count
+  const unit = mentionable.contentUnit ?? info.unit
+  const unitLabel = t(`common.${unit}`, unit)
+  const quoteLabel = t('chat.assistantQuote.badge', '回复引用')
+
+  return (
+    <BadgeBase
+      onDelete={onDelete}
+      onClick={onClick}
+      isFocused={isFocused}
+      showExpandButton={false}
+      showDeleteButton={showDeleteButton}
+      title={mentionable.content}
+    >
+      <div className="yolo-chat-user-input-file-badge-name">
+        {Icon && (
+          <Icon
+            size={12}
+            className="yolo-chat-user-input-file-badge-name-icon"
+          />
+        )}
+        <span>{quoteLabel}</span>
+      </div>
+      <div className="yolo-chat-user-input-file-badge-name-suffix">
+        {` (${count} ${unitLabel})`}
       </div>
     </BadgeBase>
   )
@@ -342,11 +309,82 @@ function ImageBadge({
       showExpandButton={false}
       showDeleteButton={showDeleteButton}
     >
-      <div className="smtcmp-chat-user-input-file-badge-name">
+      <div className="yolo-chat-user-input-file-badge-name">
         {Icon && (
           <Icon
             size={12}
-            className="smtcmp-chat-user-input-file-badge-name-icon"
+            className="yolo-chat-user-input-file-badge-name-icon"
+          />
+        )}
+        <span>{mentionable.name}</span>
+      </div>
+    </BadgeBase>
+  )
+}
+
+function PdfBadge({
+  mentionable,
+  onDelete,
+  onClick,
+  isFocused,
+  showDeleteButton,
+}: {
+  mentionable: MentionablePDF
+  onDelete: () => void
+  onClick: () => void
+  isFocused: boolean
+  showDeleteButton?: boolean
+}) {
+  const Icon = getMentionableIcon(mentionable)
+  return (
+    <BadgeBase
+      onDelete={onDelete}
+      onClick={onClick}
+      isFocused={isFocused}
+      showExpandButton={false}
+      showDeleteButton={showDeleteButton}
+      title={mentionable.name}
+    >
+      <div className="yolo-chat-user-input-file-badge-name">
+        {Icon && (
+          <Icon
+            size={12}
+            className="yolo-chat-user-input-file-badge-name-icon"
+          />
+        )}
+        <span>{mentionable.name}</span>
+      </div>
+    </BadgeBase>
+  )
+}
+
+function ModelBadge({
+  mentionable,
+  onDelete,
+  onClick,
+  isFocused,
+  showDeleteButton,
+}: {
+  mentionable: MentionableModel
+  onDelete: () => void
+  onClick: () => void
+  isFocused: boolean
+  showDeleteButton?: boolean
+}) {
+  const Icon = getMentionableIcon(mentionable)
+  return (
+    <BadgeBase
+      onDelete={onDelete}
+      onClick={onClick}
+      isFocused={isFocused}
+      showExpandButton={false}
+      showDeleteButton={showDeleteButton}
+    >
+      <div className="yolo-chat-user-input-file-badge-name">
+        {Icon && (
+          <Icon
+            size={12}
+            className="yolo-chat-user-input-file-badge-name-icon"
           />
         )}
         <span>{mentionable.name}</span>
@@ -395,28 +433,6 @@ export default function MentionableBadge({
           showDeleteButton={showDeleteButton}
         />
       )
-    case 'vault':
-      return (
-        <VaultBadge
-          mentionable={mentionable}
-          onDelete={onDelete}
-          onClick={onClick}
-          isFocused={isFocused}
-          showDeleteButton={showDeleteButton}
-        />
-      )
-    case 'current-file':
-      return (
-        <CurrentFileBadge
-          mentionable={mentionable}
-          onDelete={onDelete}
-          onClick={onClick}
-          isFocused={isFocused}
-          isExpanded={isExpanded}
-          onToggleExpand={onToggleExpand}
-          showDeleteButton={showDeleteButton}
-        />
-      )
     case 'block':
       return (
         <BlockBadge
@@ -426,6 +442,16 @@ export default function MentionableBadge({
           isFocused={isFocused}
           isExpanded={isExpanded}
           onToggleExpand={onToggleExpand}
+          showDeleteButton={showDeleteButton}
+        />
+      )
+    case 'assistant-quote':
+      return (
+        <AssistantQuoteBadge
+          mentionable={mentionable}
+          onDelete={onDelete}
+          onClick={onClick}
+          isFocused={isFocused}
           showDeleteButton={showDeleteButton}
         />
       )
@@ -448,6 +474,26 @@ export default function MentionableBadge({
           isFocused={isFocused}
           isExpanded={isExpanded}
           onToggleExpand={onToggleExpand}
+          showDeleteButton={showDeleteButton}
+        />
+      )
+    case 'pdf':
+      return (
+        <PdfBadge
+          mentionable={mentionable}
+          onDelete={onDelete}
+          onClick={onClick}
+          isFocused={isFocused}
+          showDeleteButton={showDeleteButton}
+        />
+      )
+    case 'model':
+      return (
+        <ModelBadge
+          mentionable={mentionable}
+          onDelete={onDelete}
+          onClick={onClick}
+          isFocused={isFocused}
           showDeleteButton={showDeleteButton}
         />
       )

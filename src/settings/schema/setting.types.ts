@@ -1,6 +1,10 @@
 import { z } from 'zod'
 
-import { DEFAULT_APPLY_MODEL_ID, DEFAULT_CHAT_MODELS } from '../../constants'
+import {
+  DEFAULT_CHAT_MODELS,
+  DEFAULT_CHAT_TITLE_MODEL_ID,
+} from '../../constants'
+import { webSearchSettingsSchema } from '../../core/web-search/types'
 import { assistantSchema } from '../../types/assistant.types'
 import { chatModelSchema } from '../../types/chat-model.types'
 import { embeddingModelSchema } from '../../types/embedding-model.types'
@@ -9,8 +13,20 @@ import {
   mcpServerToolOptionsSchema,
 } from '../../types/mcp.types'
 import { llmProviderSchema } from '../../types/provider.types'
+import { REASONING_LEVELS, ReasoningLevel } from '../../types/reasoning'
 
 import { SETTINGS_SCHEMA_VERSION } from './migrations'
+
+const resilientArraySchema = <T extends z.ZodTypeAny>(itemSchema: T) =>
+  z
+    .array(z.unknown())
+    .transform((items): Array<z.infer<T>> => {
+      return items.flatMap((item) => {
+        const parsed = itemSchema.safeParse(item)
+        return parsed.success ? [parsed.data] : []
+      })
+    })
+    .catch([])
 
 const ragOptionsSchema = z.object({
   enabled: z.boolean().catch(true),
@@ -18,11 +34,19 @@ const ragOptionsSchema = z.object({
   thresholdTokens: z.number().catch(20000),
   minSimilarity: z.number().catch(0.0),
   limit: z.number().catch(10),
+  /**
+   * Max parallel embedding requests during indexing. Lower this when the
+   * embedding provider returns 429 / rate-limit errors (e.g. Azure S0 tier
+   * or per-minute-quota free tiers). Clamped to [1, 24] at the call site.
+   */
+  embeddingConcurrency: z.number().catch(10),
   excludePatterns: z.array(z.string()).catch([]),
   includePatterns: z.array(z.string()).catch([]),
+  /** When true, index `.pdf` files for RAG (text extraction). */
+  indexPdf: z.boolean().catch(true),
   // auto update options
-  autoUpdateEnabled: z.boolean().catch(false),
-  autoUpdateIntervalHours: z.number().catch(24),
+  autoUpdateEnabled: z.boolean().catch(true),
+  autoUpdateIntervalHours: z.number().catch(0),
   lastAutoUpdateAt: z.number().catch(0),
 })
 
@@ -36,6 +60,7 @@ type TabCompletionOptionDefaults = {
   maxSuggestionLength: number
   temperature: number
   requestTimeoutMs: number
+  reasoningLevel: ReasoningLevel
 }
 
 // Legacy fields for migration compatibility
@@ -66,6 +91,11 @@ export const DEFAULT_TAB_COMPLETION_SYSTEM_PROMPT =
 export const DEFAULT_TAB_COMPLETION_LENGTH_PRESET: TabCompletionLengthPreset =
   'medium'
 
+export const notificationChannelSchema = z.enum(['sound', 'system', 'both'])
+export type NotificationChannel = z.infer<typeof notificationChannelSchema>
+export const notificationTimingSchema = z.enum(['always', 'when-unfocused'])
+export type NotificationTiming = z.infer<typeof notificationTimingSchema>
+
 export const DEFAULT_TAB_COMPLETION_OPTIONS: TabCompletionOptionDefaults = {
   idleTriggerEnabled: false,
   autoTriggerDelayMs: 3000,
@@ -76,7 +106,27 @@ export const DEFAULT_TAB_COMPLETION_OPTIONS: TabCompletionOptionDefaults = {
   maxSuggestionLength: 2000,
   temperature: 0.5,
   requestTimeoutMs: 12000,
+  // Tab 补全是延迟敏感场景，默认关闭推理；用户可在设置中改为 low / auto 以适配强制推理的模型（如 gpt-oss）
+  reasoningLevel: 'off',
 }
+
+export const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 60000
+
+const notificationOptionsSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    channel: notificationChannelSchema.optional(),
+    timing: notificationTimingSchema.optional(),
+    notifyOnApprovalRequired: z.boolean().optional(),
+    notifyOnTaskCompleted: z.boolean().optional(),
+  })
+  .catch({
+    enabled: false,
+    channel: 'sound',
+    timing: 'when-unfocused',
+    notifyOnApprovalRequired: true,
+    notifyOnTaskCompleted: true,
+  })
 
 export const DEFAULT_TAB_COMPLETION_TRIGGERS: TabCompletionTrigger[] = [
   {
@@ -177,6 +227,9 @@ const tabCompletionOptionsSchema = z
       .min(1000)
       .max(60000)
       .catch(DEFAULT_TAB_COMPLETION_OPTIONS.requestTimeoutMs),
+    reasoningLevel: z
+      .enum(REASONING_LEVELS)
+      .catch(DEFAULT_TAB_COMPLETION_OPTIONS.reasoningLevel),
     // Legacy fields kept for migration compatibility (will be removed in future)
     maxBeforeChars: z.number().optional(),
     maxAfterChars: z.number().optional(),
@@ -184,6 +237,34 @@ const tabCompletionOptionsSchema = z
     maxRetries: z.number().optional(),
   })
   .catch({ ...DEFAULT_TAB_COMPLETION_OPTIONS })
+
+export const jsSandboxSettingsSchema = z.object({
+  allowDbQuery: z.boolean().optional(),
+  allowFetch: z.boolean().optional(),
+  fetchMode: z.enum(['whitelist', 'blacklist']).optional(),
+  fetchDomains: z.array(z.string()).optional(),
+  fetchMaxConcurrent: z.number().optional(),
+  fetchMaxResponseKb: z.number().optional(),
+  allowVaultRead: z.boolean().optional(),
+  // Maximum size (in KB) returned by $vault.readText / $vault.readBinary.
+  // Files exceeding this are truncated (text) or refused (binary).
+  vaultReadMaxKb: z.number().optional(),
+  allowExternalScripts: z.boolean().optional(),
+  // Execution timeout cap, in milliseconds. The LLM may pass a smaller
+  // timeoutMs in its tool args, but the host clamps the effective value
+  // to this cap. Undefined means use the built-in default.
+  timeoutMs: z.number().optional(),
+  // Maximum rows returned by $db.search / $db.find. The LLM may request a
+  // smaller limit per call but never larger. Undefined falls back to a
+  // built-in default.
+  dbQueryMaxLimit: z.number().optional(),
+  // Maximum size (in KB) of the tool's serialized JSON result returned to
+  // the model. Output above this is truncated with a prefix. Undefined
+  // uses the built-in default. Host enforces a hard ceiling.
+  outputMaxKb: z.number().optional(),
+})
+
+export type JsSandboxSettings = z.infer<typeof jsSandboxSettingsSchema>
 
 const tabCompletionTriggerSchema = z
   .object({
@@ -204,18 +285,18 @@ const tabCompletionTriggerSchema = z
  * Settings
  */
 
-export const smartComposerSettingsSchema = z.object({
+export const yoloSettingsSchema = z.object({
   // Version
   version: z.literal(SETTINGS_SCHEMA_VERSION).catch(SETTINGS_SCHEMA_VERSION),
 
-  providers: z.array(llmProviderSchema).catch([]),
+  providers: resilientArraySchema(llmProviderSchema),
 
-  chatModels: z.array(chatModelSchema).catch([]),
+  chatModels: resilientArraySchema(chatModelSchema),
 
-  embeddingModels: z.array(embeddingModelSchema).catch([]),
+  embeddingModels: resilientArraySchema(embeddingModelSchema),
 
   chatModelId: z.string().catch(''), // model for default chat feature
-  applyModelId: z.string().catch(''), // model for apply feature
+  chatTitleModelId: z.string().catch(''), // model for automatic conversation naming and compact summaries
   embeddingModelId: z.string().catch(''), // model for embedding
 
   // System Prompt
@@ -228,23 +309,44 @@ export const smartComposerSettingsSchema = z.object({
     thresholdTokens: 20000,
     minSimilarity: 0.0,
     limit: 10,
+    embeddingConcurrency: 10,
     excludePatterns: [],
     includePatterns: [],
-    autoUpdateEnabled: false,
-    autoUpdateIntervalHours: 24,
+    indexPdf: true,
+    autoUpdateEnabled: true,
+    autoUpdateIntervalHours: 0,
     lastAutoUpdateAt: 0,
   }),
 
   // MCP configuration
   mcp: z
     .object({
-      servers: z.array(mcpServerConfigSchema).catch([]),
+      servers: resilientArraySchema(mcpServerConfigSchema),
       builtinToolOptions: mcpServerToolOptionsSchema.catch({}),
+      enableToolDisclosure: z.boolean().catch(false),
     })
     .catch({
       servers: [],
       builtinToolOptions: {},
+      enableToolDisclosure: false,
     }),
+
+  // JS sandbox (js_eval) configuration. Global because the capability surface
+  // (network / vault read / $db / external scripts) is sensitive enough that
+  // we don't want it implicitly varying per agent — toggling any extension
+  // capability forces approval for every agent that has js_eval enabled.
+  jsSandbox: jsSandboxSettingsSchema.catch({}),
+
+  // Web search configuration (built-in agent tool)
+  webSearch: webSearchSettingsSchema.catch({
+    providers: [],
+    defaultProviderId: undefined,
+    common: {
+      resultSize: 10,
+      searchTimeoutMs: 120000,
+      scrapeTimeoutMs: 20000,
+    },
+  }),
 
   // Skills configuration
   skills: z
@@ -264,40 +366,80 @@ export const smartComposerSettingsSchema = z.object({
       baseDir: 'YOLO',
     }),
 
+  debug: z
+    .object({
+      captureRawRequestDebug: z.boolean().optional(),
+    })
+    .catch({
+      captureRawRequestDebug: false,
+    }),
+
   // Chat options
   chatOptions: z
     .object({
       includeCurrentFileContent: z.boolean(),
       mentionDisplayMode: z.enum(['inline', 'badge']).optional(),
+      mentionContextMode: z.enum(['light', 'full']).optional(),
+      chatInputHeight: z.number().int().min(80).max(520).optional(),
+      chatApplyMode: z.enum(['review-required', 'direct-apply']).optional(),
       chatTitlePrompt: z.string().optional(),
-      baseModelSpecialPrompt: z.string().optional(),
       // Chat mode (chat/agent)
       chatMode: z.enum(['chat', 'agent']).optional(),
       // Whether the user has acknowledged the first-time agent mode warning
       agentModeWarningConfirmed: z.boolean().optional(),
       // Persist preferred reasoning level per model id in Chat input
       reasoningLevelByModelId: z
-        .record(
-          z.string(),
-          z.enum(['off', 'on', 'auto', 'low', 'medium', 'high', 'extra-high']),
-        )
+        .record(z.string(), z.enum(REASONING_LEVELS))
         .optional(),
-      // Collapse older non-pinned conversations into an archive group
-      historyArchiveEnabled: z.boolean().optional(),
-      // Maximum number of recent non-pinned conversations shown before archive
-      historyArchiveThreshold: z.number().int().min(20).max(500).optional(),
+      // Auto context compaction before next user send (based on last assistant usage)
+      autoContextCompactionEnabled: z.boolean().optional(),
+      autoContextCompactionThresholdMode: z
+        .enum(['tokens', 'ratio'])
+        .optional(),
+      autoContextCompactionThresholdTokens: z.number().int().min(1).optional(),
+      autoContextCompactionThresholdRatio: z.number().min(0).max(1).optional(),
+      // Font scale factor for chat messages (1 = default)
+      chatFontScale: z.number().min(0.7).max(1.5).optional(),
+      // Image reading & compression for vision tool calls
+      imageReadingEnabled: z.boolean().optional(),
+      imageCompressionEnabled: z.boolean().optional(),
+      imageCompressionQuality: z.number().min(1).max(100).optional(),
+      // Fetch external (http/https) image URLs referenced in Markdown
+      externalImageFetchEnabled: z.boolean().optional(),
+      // Where the ribbon icon should open the Chat view
+      ribbonClickAction: z
+        .enum(['sidebar', 'tab', 'split', 'window', 'last'])
+        .optional(),
+      // Last placement actually used to open a chat leaf; only consulted when
+      // `ribbonClickAction === 'last'`
+      lastChatPlacement: z
+        .enum(['sidebar', 'tab', 'split', 'window'])
+        .optional(),
     })
     .catch({
       includeCurrentFileContent: true,
       mentionDisplayMode: 'inline',
+      mentionContextMode: 'light',
+      chatInputHeight: undefined,
+      chatApplyMode: 'review-required',
       chatTitlePrompt: '',
-      baseModelSpecialPrompt: '',
-      chatMode: 'chat',
+      chatMode: 'agent',
       agentModeWarningConfirmed: false,
       reasoningLevelByModelId: {},
-      historyArchiveEnabled: true,
-      historyArchiveThreshold: 50,
+      autoContextCompactionEnabled: false,
+      autoContextCompactionThresholdMode: 'tokens',
+      autoContextCompactionThresholdTokens: 24000,
+      autoContextCompactionThresholdRatio: 0.8,
+      chatFontScale: undefined,
+      imageReadingEnabled: true,
+      imageCompressionEnabled: true,
+      imageCompressionQuality: 85,
+      externalImageFetchEnabled: false,
+      ribbonClickAction: 'sidebar',
+      lastChatPlacement: undefined,
     }),
+
+  notificationOptions: notificationOptionsSchema,
 
   // Continuation (续写) options
   continuationOptions: z
@@ -321,8 +463,6 @@ export const smartComposerSettingsSchema = z.object({
       topP: z.number().min(0).max(1).optional(),
       // enable or disable streaming responses for continuation results
       stream: z.boolean().optional(),
-      // whether continuation requests should include RAG / vault search context
-      useVaultSearch: z.boolean().optional(),
       // cap on how many characters of context to send with continuation requests
       maxContinuationChars: z.number().int().min(0).optional(),
       // enable tab completion based on prefix suggestion
@@ -363,8 +503,11 @@ export const smartComposerSettingsSchema = z.object({
             id: z.string(),
             label: z.string(),
             instruction: z.string(),
-            mode: z.enum(['ask', 'rewrite', 'chat-input']).optional(),
+            mode: z
+              .enum(['ask', 'rewrite', 'chat-input', 'chat-send'])
+              .optional(),
             rewriteBehavior: z.enum(['custom', 'preset']).optional(),
+            assistantId: z.string().optional(),
             enabled: z.boolean().default(true),
           }),
         )
@@ -380,19 +523,30 @@ export const smartComposerSettingsSchema = z.object({
       enableQuickAsk: z.boolean().optional(),
       // trigger character for quick ask (default: @)
       quickAskTrigger: z.string().optional(),
-      // quick ask mode: 'ask' for Q&A, 'edit' for document editing with preview, 'edit-direct' for direct editing
-      quickAskMode: z.enum(['ask', 'edit', 'edit-direct']).optional(),
+      // quick ask mode: support legacy ask/edit values and current chat/agent values
+      quickAskMode: z
+        .enum(['ask', 'edit', 'edit-direct', 'chat', 'agent'])
+        .optional(),
       // auto dock quick ask to editor top right after sending
       quickAskAutoDockToTopRight: z.boolean().optional(),
       // quick ask context chars before cursor
       quickAskContextBeforeChars: z.number().int().min(0).optional(),
       // quick ask context chars after cursor
       quickAskContextAfterChars: z.number().int().min(0).optional(),
+      // whether a failed streaming primary request should recover once with non-stream fallback
+      streamFallbackRecoveryEnabled: z.boolean().optional(),
+      // timeout for the primary request before recovery is considered
+      primaryRequestTimeoutMs: z
+        .number()
+        .int()
+        .min(1000)
+        .max(600000)
+        .optional(),
     })
     .catch({
       continuationModelId:
-        DEFAULT_CHAT_MODELS.find((v) => v.id === DEFAULT_APPLY_MODEL_ID)?.id ??
-        '',
+        DEFAULT_CHAT_MODELS.find((v) => v.id === DEFAULT_CHAT_TITLE_MODEL_ID)
+          ?.id ?? '',
       enableSmartSpace: true,
       enableSelectionChat: true,
       manualContextEnabled: false,
@@ -400,12 +554,11 @@ export const smartComposerSettingsSchema = z.object({
       referenceRuleFolders: [],
       knowledgeBaseFolders: [],
       stream: true,
-      useVaultSearch: false,
       maxContinuationChars: 8000,
       enableTabCompletion: false,
       tabCompletionModelId:
-        DEFAULT_CHAT_MODELS.find((v) => v.id === DEFAULT_APPLY_MODEL_ID)?.id ??
-        '',
+        DEFAULT_CHAT_MODELS.find((v) => v.id === DEFAULT_CHAT_TITLE_MODEL_ID)
+          ?.id ?? '',
       tabCompletionOptions: { ...DEFAULT_TAB_COMPLETION_OPTIONS },
       tabCompletionTriggers: [...DEFAULT_TAB_COMPLETION_TRIGGERS],
       tabCompletionSystemPrompt: DEFAULT_TAB_COMPLETION_SYSTEM_PROMPT,
@@ -418,14 +571,16 @@ export const smartComposerSettingsSchema = z.object({
       smartSpaceUseUrlContext: false,
       enableQuickAsk: true,
       quickAskTrigger: '@',
-      quickAskMode: 'ask',
+      quickAskMode: 'chat',
       quickAskAutoDockToTopRight: true,
       quickAskContextBeforeChars: 5000,
       quickAskContextAfterChars: 2000,
+      streamFallbackRecoveryEnabled: true,
+      primaryRequestTimeoutMs: DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
     }),
 
   // Assistant list
-  assistants: z.array(assistantSchema).catch([]),
+  assistants: resilientArraySchema(assistantSchema),
 
   // Currently selected assistant ID
   currentAssistantId: z.string().optional(),
@@ -433,7 +588,7 @@ export const smartComposerSettingsSchema = z.object({
   // Quick Ask selected assistant ID
   quickAskAssistantId: z.string().optional(),
 })
-export type SmartComposerSettings = z.infer<typeof smartComposerSettingsSchema>
+export type YoloSettings = z.infer<typeof yoloSettingsSchema>
 
 export type SettingMigration = {
   fromVersion: number

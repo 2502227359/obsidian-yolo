@@ -31,9 +31,13 @@ const customVector = customType<{ data: number[] }>({
 export type VectorMetaData = {
   startLine: number
   endLine: number
+  /** PDF page number (1-based). Omitted for Markdown chunks. */
+  page?: number
 }
 
-// important: dimensions must be less than 2000!
+// pgvector HNSW: index dimensions follow supported list.
+// Note: pgvector HNSW indexes support at most 2000 dimensions;
+// 3072 (e.g. text-embedding-3-large) is excluded and falls back to sequential scan.
 export const supportedDimensionsForIndex = [
   128, 256, 384, 512, 768, 1024, 1280, 1536, 1792,
 ]
@@ -45,6 +49,7 @@ export const embeddingTable = pgTable(
     path: text('path').notNull(), // path to the file
     mtime: bigint('mtime', { mode: 'number' }).notNull(), // mtime of the file
     content: text('content').notNull(), // content of the file
+    content_hash: text('content_hash'), // sha256 hex prefix of chunk content for incremental updates
     model: text('model').notNull(), // model id
     dimension: smallint('dimension').notNull(), // dimension of the vector
     embedding: customVector('embedding'), // embedding of the file

@@ -1,15 +1,23 @@
 import React, { useMemo, useState } from 'react'
 
+import type { ChatLeafPlacement } from '../../features/chat/chatLeafSessionManager'
+
 import Chat, { ChatProps, ChatRef } from './Chat'
 
 type ChatSidebarTabsProps = {
   chatRef: React.RefObject<ChatRef>
+  placement: ChatLeafPlacement
   initialChatProps?: ChatProps
+  onConversationContextChange?: ChatProps['onConversationContextChange']
+  onRuntimeSnapshotChange?: ChatProps['onRuntimeSnapshotChange']
 }
 
 const ChatSidebarTabs: React.FC<ChatSidebarTabsProps> = ({
   chatRef,
+  placement,
   initialChatProps,
+  onConversationContextChange,
+  onRuntimeSnapshotChange,
 }) => {
   const [activeTab, setActiveTab] = useState<'chat' | 'composer'>('chat')
 
@@ -17,12 +25,15 @@ const ChatSidebarTabs: React.FC<ChatSidebarTabsProps> = ({
   const chatProps = useMemo(() => initialChatProps, [initialChatProps])
 
   return (
-    <div className="smtcmp-sidebar-root">
-      <div className="smtcmp-sidebar-panels">
-        <div className="smtcmp-sidebar-pane is-active" aria-hidden={false}>
+    <div className="yolo-sidebar-root">
+      <div className="yolo-sidebar-panels">
+        <div className="yolo-sidebar-pane is-active" aria-hidden={false}>
           <Chat
             ref={chatRef}
             {...(chatProps ?? {})}
+            placement={placement}
+            onConversationContextChange={onConversationContextChange}
+            onRuntimeSnapshotChange={onRuntimeSnapshotChange}
             activeView={activeTab}
             onChangeView={(view) => setActiveTab(view)}
           />

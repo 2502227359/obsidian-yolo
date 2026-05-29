@@ -1,6 +1,4 @@
 <h1 align="center">YOLO</h1>
-<p align="center"><b>You Orchestrate, LLM Operates.</b></p>
-
 <p align="center">
   Assistente AI native per Obsidian — chat, scrittura, knowledge base e orchestrazione, tutto in un unico posto.
 </p>
@@ -23,6 +21,16 @@
   <a href="./README.md">English</a> | <a href="./README_zh-CN.md">简体中文</a> | <b>Italiano</b>
 </p>
 
+## Novita recenti
+
+- `1.5.7`: YOLO ora percepisce cosa stai leggendo—la sincronizzazione del focus mantiene l'AI aggiornata sul file e sulla posizione corrente, con supporto avanzato per PDF: lettura visiva, sincronizzazione della selezione e screenshot di regioni.
+- `1.5.6`: La ricerca web integrata è disponibile—gli Agent possono ora navigare su internet direttamente, con più provider di ricerca e scraping web unificato.
+- `1.5.5`: Motore della knowledge base rinnovato, ricerca ibrida e indicizzazione completamente aggiornate, con risultati di ricerca piu intelligenti.
+- `1.5.4`: Per sessioni lunghe e compiti complessi—introduzione di potatura e compressione del contesto, conversazioni multi-modello, timeline virtualizzata per chat lunghe e compressione automatica.
+- `1.5.3`: Chat multi-finestra nativa e Agent in background per un'automazione piu scorrevole.
+- `1.5.2`: Il nuovo sistema di memoria e ora disponibile e permette a YOLO di ricordare in modo piu naturale le tue preferenze, abitudini e il contesto a lungo termine tra conversazioni diverse.
+- `1.5.1`: YOLO introduce una nuovissima modalita Agent: l'AI non si limita piu a rispondere, ma puo usare strumenti, organizzare passaggi e partecipare davvero al lavoro da svolgere.
+
 ## Highlights
 
 ### 🤖 Modalità Agent
@@ -34,12 +42,17 @@ La modalità Agent di YOLO permette ai LLM di andare oltre le semplici "macchine
 | ![Agent Tools](./assets/agenttools.gif) | ![Agent Skills](./assets/agentskills.gif) |
 | Configura liberamente le catene di strumenti per permettere agli Agent di leggere, scrivere, modificare e organizzare i tuoi file direttamente | Incapsula esperienze e SOP in skill riutilizzabili, invoca con una singola frase — lascia che l'Agent funzioni come te |
 
-### 🧠 Q&A Knowledge Base + ✍️ Smart Space & Quick Ask
+| Chat Multi-Finestra | Quick Ask |
+|:--:|:--:|
+| ![Chat Window](./assets/chatwindow.gif) | ![Quick Ask](./assets/Quickask.gif) |
+| Gestisci in parallelo task e contesti diversi su più finestre di chat, rendendo il multitasking più naturale | Attivalo con un carattere (predefinito `@`) per un assistente inline che supporta Q&A, modifica e continuazione, rendendo l'editing dei documenti senza interruzioni |
 
-| Q&A Knowledge Base | Smart Space | Quick Ask |
-|:--:|:--:|:--:|
-| ![RAG Vault](./assets/ragvault.gif) | ![Smart Space](./assets/Smartspace.gif) | ![Quick Ask](./assets/Quickask.gif) |
-| Trasforma l'intero Vault nella knowledge base dell'AI: con RAG, YOLO risponde usando il contesto reale dei tuoi appunti invece di output generici | Richiamalo ovunque per continuare liberamente il tuo flusso creativo con una generazione di contenuti fluida | Attivalo con un carattere (predefinito `@`) per un assistente inline che supporta Q&A, modifica e continuazione, rendendo l'editing dei documenti senza interruzioni |
+### 🧠 Q&A Knowledge Base + ✍️ Smart Space
+
+| Q&A Knowledge Base | Smart Space |
+|:--:|:--:|
+| ![RAG Vault](./assets/ragvault.gif) | ![Smart Space](./assets/Smartspace.gif) |
+| Trasforma l'intero Vault nella knowledge base dell'AI: con RAG, YOLO risponde usando il contesto reale dei tuoi appunti invece di output generici | Richiamalo ovunque per continuare liberamente il tuo flusso creativo con una generazione di contenuti fluida |
 
 ## Funzionalità
 
@@ -48,6 +61,7 @@ Oltre alle capacità principali sopra descritte, YOLO fornisce anche:
 | Funzionalità | Descrizione |
 |--------------|-------------|
 | 💬 Chat Sidebar | Conversazione seamless con LLM, iniezione di contesto, prompt preimpostati, parsing smart di Markdown |
+| 🧠 Sistema di memoria | Permette a YOLO di ricordare preferenze, abitudini e contesto a lungo termine per conversazioni piu coerenti |
 | 🪡 Cursor Chat | Aggiunta contesto con un click, conversazione a portata di mano |
 | ⌨️ Completamento Tab | Completamento AI in tempo reale per una scrittura più fluida e naturale |
 | 🎛️ Supporto Multi-Modello | OpenAI, Claude, Gemini, DeepSeek e altri modelli mainstream, liberamente commutabili |
@@ -58,7 +72,7 @@ Oltre alle capacità principali sopra descritte, YOLO fornisce anche:
 
 1. Apri Impostazioni Obsidian → Plugin Community → Browse → Cerca **"YOLO"**
 2. Installa e abilita
-3. Configura la tua API key nelle impostazioni del plugin:
+3. Configura la tua API key nelle impostazioni del plugin, oppure usa il tuo ChatGPT OAuth / Gemini OAuth:
    - [OpenAI](https://platform.openai.com/api-keys) / [Anthropic](https://console.anthropic.com/settings/keys) / [Gemini](https://aistudio.google.com/apikey) / [Groq](https://console.groq.com/keys)
 4. Apri la sidebar per iniziare a chattare — oppure prova Quick Ask digitando `@` nell'editor
 
@@ -77,9 +91,15 @@ Vedi Quick Start sopra.
 > [!WARNING]
 > YOLO non può coesistere con [Smart Composer](https://github.com/glowingjade/obsidian-smart-composer). Disabilita o disinstalla Smart Composer prima di usare YOLO.
 
+## Nota sul supporto mobile
+
+A causa delle differenze di capacità tra Obsidian mobile e desktop, nel breve periodo YOLO non può allineare completamente su mobile tutte le funzionalità e l'esperienza disponibili su desktop. Inoltre, dato il tempo limitato che posso dedicare alla manutenzione del progetto, al momento posso garantire solo che YOLO rimanga utilizzabile su mobile, non che ogni funzione raggiunga lo stesso livello del desktop.
+
+Se usi YOLO su mobile, potresti comunque incontrare funzionalità non disponibili, comportamenti non del tutto coerenti o adattamenti ancora incompleti in alcuni flussi di lavoro. Ti ringrazio per la comprensione.
+
 ## Roadmap
 
-- [ ] Ricerca Vault AI migliore e più forte
+- [x] Ricerca Vault AI migliore e più forte
 - [ ] Agent in Background (automazione task lunghi)
 - [ ] Task programmati Cron
 - [ ] Orchestrazione Multi-Agent

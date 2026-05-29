@@ -27,15 +27,45 @@ import { migrateFrom30To31 } from './30_to_31'
 import { migrateFrom31To32 } from './31_to_32'
 import { migrateFrom32To33 } from './32_to_33'
 import { migrateFrom33To34 } from './33_to_34'
+import { migrateFrom34To35 } from './34_to_35'
+import { migrateFrom35To36 } from './35_to_36'
+import { migrateFrom36To37 } from './36_to_37'
+import { migrateFrom37To38 } from './37_to_38'
+import { migrateFrom38To39 } from './38_to_39'
+import { migrateFrom39To40 } from './39_to_40'
 import { migrateFrom3To4 } from './3_to_4'
+import { migrateFrom40To41 } from './40_to_41'
+import { migrateFrom41To42 } from './41_to_42'
+import { migrateFrom42To43 } from './42_to_43'
+import { migrateFrom43To44 } from './43_to_44'
+import { migrateFrom44To45 } from './44_to_45'
+import { migrateFrom45To46 } from './45_to_46'
+import { migrateFrom46To47 } from './46_to_47'
+import { migrateFrom47To48 } from './47_to_48'
+import { migrateFrom48To49 } from './48_to_49'
+import { migrateFrom49To50 } from './49_to_50'
 import { migrateFrom4To5 } from './4_to_5'
+import { migrateFrom50To51 } from './50_to_51'
+import { migrateFrom51To52 } from './51_to_52'
+import { migrateFrom52To53 } from './52_to_53'
+import { migrateFrom53To54 } from './53_to_54'
+import { migrateFrom54To55 } from './54_to_55'
+import { migrateFrom55To56 } from './55_to_56'
+import { migrateFrom56To57 } from './56_to_57'
+import { migrateFrom57To58 } from './57_to_58'
+import { migrateFrom58To59 } from './58_to_59'
+import { migrateFrom59To60 } from './59_to_60'
 import { migrateFrom5To6 } from './5_to_6'
+import { migrateFrom60To61 } from './60_to_61'
+import { migrateFrom61To62 } from './61_to_62'
+import { migrateFrom62To63 } from './62_to_63'
+import { migrateFrom63To64 } from './63_to_64'
 import { migrateFrom6To7 } from './6_to_7'
 import { migrateFrom7To8 } from './7_to_8'
 import { migrateFrom8To9 } from './8_to_9'
 import { migrateFrom9To10 } from './9_to_10'
 
-export const SETTINGS_SCHEMA_VERSION = 34
+export const SETTINGS_SCHEMA_VERSION = 64
 
 export const SETTING_MIGRATIONS: SettingMigration[] = [
   {
@@ -207,5 +237,155 @@ export const SETTING_MIGRATIONS: SettingMigration[] = [
     fromVersion: 33,
     toVersion: 34,
     migrate: migrateFrom33To34,
+  },
+  {
+    fromVersion: 34,
+    toVersion: 35,
+    migrate: migrateFrom34To35,
+  },
+  {
+    fromVersion: 35,
+    toVersion: 36,
+    migrate: migrateFrom35To36,
+  },
+  {
+    fromVersion: 36,
+    toVersion: 37,
+    migrate: migrateFrom36To37,
+  },
+  {
+    fromVersion: 37,
+    toVersion: 38,
+    migrate: migrateFrom37To38,
+  },
+  {
+    fromVersion: 38,
+    toVersion: 39,
+    migrate: migrateFrom38To39,
+  },
+  {
+    fromVersion: 39,
+    toVersion: 40,
+    migrate: migrateFrom39To40,
+  },
+  {
+    fromVersion: 40,
+    toVersion: 41,
+    migrate: migrateFrom40To41,
+  },
+  {
+    fromVersion: 41,
+    toVersion: 42,
+    migrate: migrateFrom41To42,
+  },
+  {
+    fromVersion: 42,
+    toVersion: 43,
+    migrate: migrateFrom42To43,
+  },
+  {
+    fromVersion: 43,
+    toVersion: 44,
+    migrate: migrateFrom43To44,
+  },
+  {
+    fromVersion: 44,
+    toVersion: 45,
+    migrate: migrateFrom44To45,
+  },
+  {
+    fromVersion: 45,
+    toVersion: 46,
+    migrate: migrateFrom45To46,
+  },
+  {
+    fromVersion: 46,
+    toVersion: 47,
+    migrate: migrateFrom46To47,
+  },
+  {
+    fromVersion: 47,
+    toVersion: 48,
+    migrate: migrateFrom47To48,
+  },
+  {
+    fromVersion: 48,
+    toVersion: 49,
+    migrate: migrateFrom48To49,
+  },
+  {
+    fromVersion: 49,
+    toVersion: 50,
+    migrate: migrateFrom49To50,
+  },
+  {
+    fromVersion: 50,
+    toVersion: 51,
+    migrate: migrateFrom50To51,
+  },
+  {
+    fromVersion: 51,
+    toVersion: 52,
+    migrate: migrateFrom51To52,
+  },
+  {
+    fromVersion: 52,
+    toVersion: 53,
+    migrate: migrateFrom52To53,
+  },
+  {
+    fromVersion: 53,
+    toVersion: 54,
+    migrate: migrateFrom53To54,
+  },
+  {
+    fromVersion: 54,
+    toVersion: 55,
+    migrate: migrateFrom54To55,
+  },
+  {
+    fromVersion: 55,
+    toVersion: 56,
+    migrate: migrateFrom55To56,
+  },
+  {
+    fromVersion: 56,
+    toVersion: 57,
+    migrate: migrateFrom56To57,
+  },
+  {
+    fromVersion: 57,
+    toVersion: 58,
+    migrate: migrateFrom57To58,
+  },
+  {
+    fromVersion: 58,
+    toVersion: 59,
+    migrate: migrateFrom58To59,
+  },
+  {
+    fromVersion: 59,
+    toVersion: 60,
+    migrate: migrateFrom59To60,
+  },
+  {
+    fromVersion: 60,
+    toVersion: 61,
+    migrate: migrateFrom60To61,
+  },
+  {
+    fromVersion: 61,
+    toVersion: 62,
+    migrate: migrateFrom61To62,
+  },
+  {
+    fromVersion: 62,
+    toVersion: 63,
+    migrate: migrateFrom62To63,
+  },
+  {
+    fromVersion: 63,
+    toVersion: 64,
+    migrate: migrateFrom63To64,
   },
 ]

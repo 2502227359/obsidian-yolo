@@ -1,3 +1,4 @@
+import { Settings } from 'lucide-react'
 import { App } from 'obsidian'
 import { useMemo } from 'react'
 
@@ -6,67 +7,46 @@ import {
   SettingsProvider,
   useSettings,
 } from '../../../contexts/settings-context'
-import { getLocalFileTools } from '../../../core/mcp/localFileTools'
-import SmartComposerPlugin from '../../../main'
+import {
+  BUILTIN_TOOL_CATEGORY_I18N,
+  BUILTIN_TOOL_CATEGORY_ORDER,
+  BuiltinToolCategory,
+  FILE_OPS_GROUP_TOOL_NAME,
+  MEMORY_OPS_GROUP_TOOL_NAME,
+  WEB_OPS_GROUP_TOOL_NAME,
+  WEB_OPS_SPLIT_ACTION_TOOL_NAMES,
+  getBuiltinToolCategory,
+  getBuiltinToolDisplayIndex,
+  getBuiltinToolUiMeta,
+} from '../../../core/agent/builtinToolUiMeta'
+import { JS_SANDBOX_TOOL_NAME } from '../../../core/mcp/jsSandboxTool'
+import {
+  LOCAL_FS_SPLIT_ACTION_TOOL_NAMES,
+  LOCAL_MEMORY_SPLIT_ACTION_TOOL_NAMES,
+  getLocalFileTools,
+} from '../../../core/mcp/localFileTools'
+import YoloPlugin from '../../../main'
 import { ObsidianToggle } from '../../common/ObsidianToggle'
 import { ReactModal } from '../../common/ReactModal'
+import { CollapsibleToolDescription } from '../common/CollapsibleToolDescription'
 import { McpSection } from '../sections/McpSection'
+
+import { JsSandboxConfigModal } from './JsSandboxConfigModal'
+import { WebSearchSettingsModal } from './WebSearchSettingsModal'
 
 type AgentToolsModalProps = {
   app: App
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
 }
 
-const BUILTIN_TOOL_I18N_KEYS: Record<
-  string,
-  {
-    labelKey: string
-    descKey: string
-    labelFallback: string
-    descFallback: string
-  }
-> = {
-  fs_list: {
-    labelKey: 'settings.agent.builtinFsListLabel',
-    descKey: 'settings.agent.builtinFsListDesc',
-    labelFallback: 'Read Vault',
-    descFallback:
-      'List directory structure under a vault path. Useful for workspace orientation.',
-  },
-  fs_search: {
-    labelKey: 'settings.agent.builtinFsSearchLabel',
-    descKey: 'settings.agent.builtinFsSearchDesc',
-    labelFallback: 'Search Vault',
-    descFallback: 'Search files, folders, or markdown content in vault.',
-  },
-  fs_read: {
-    labelKey: 'settings.agent.builtinFsReadLabel',
-    descKey: 'settings.agent.builtinFsReadDesc',
-    labelFallback: 'Read File',
-    descFallback: 'Read line ranges from multiple vault files by path.',
-  },
-  fs_edit: {
-    labelKey: 'settings.agent.builtinFsEditLabel',
-    descKey: 'settings.agent.builtinFsEditDesc',
-    labelFallback: 'Edit File',
-    descFallback: 'Apply exact text replacement within a single file.',
-  },
-  fs_write: {
-    labelKey: 'settings.agent.builtinFsWriteLabel',
-    descKey: 'settings.agent.builtinFsWriteDesc',
-    labelFallback: 'Write Vault',
-    descFallback: 'Execute vault write operations for files and folders.',
-  },
-  open_skill: {
-    labelKey: 'settings.agent.builtinOpenSkillLabel',
-    descKey: 'settings.agent.builtinOpenSkillDesc',
-    labelFallback: 'Open Skill',
-    descFallback: 'Load a skill markdown file by id or name.',
-  },
-}
+const SPLIT_FS_TOOL_NAME_SET = new Set<string>(LOCAL_FS_SPLIT_ACTION_TOOL_NAMES)
+const SPLIT_MEMORY_TOOL_NAME_SET = new Set<string>(
+  LOCAL_MEMORY_SPLIT_ACTION_TOOL_NAMES,
+)
+const SPLIT_WEB_TOOL_NAME_SET = new Set<string>(WEB_OPS_SPLIT_ACTION_TOOL_NAMES)
 
 export class AgentToolsModal extends ReactModal<AgentToolsModalProps> {
-  constructor(app: App, plugin: SmartComposerPlugin) {
+  constructor(app: App, plugin: YoloPlugin) {
     super({
       app,
       Component: AgentToolsModalWrapper,
@@ -76,7 +56,7 @@ export class AgentToolsModal extends ReactModal<AgentToolsModalProps> {
       },
       plugin,
     })
-    this.modalEl.classList.add('smtcmp-modal--wide')
+    this.modalEl.classList.add('yolo-modal--wide')
   }
 }
 
@@ -103,89 +83,226 @@ function AgentToolsModalContent({
   plugin,
 }: {
   app: App
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
 }) {
   const { t } = useLanguage()
   const { settings, setSettings } = useSettings()
 
-  const builtinTools = useMemo(
-    () =>
-      getLocalFileTools().map((tool) => {
-        const meta = BUILTIN_TOOL_I18N_KEYS[tool.name]
+  const builtinToolGroups = useMemo(() => {
+    const toolOptions = settings.mcp.builtinToolOptions
+    const tools = getLocalFileTools()
+      .filter(
+        (tool) =>
+          !SPLIT_FS_TOOL_NAME_SET.has(tool.name) &&
+          !SPLIT_MEMORY_TOOL_NAME_SET.has(tool.name) &&
+          !SPLIT_WEB_TOOL_NAME_SET.has(tool.name),
+      )
+      .map((tool) => {
+        const meta = getBuiltinToolUiMeta(tool.name)
         return {
           id: tool.name,
           label: meta ? t(meta.labelKey, meta.labelFallback) : tool.name,
           description: meta
-            ? t(meta.descKey, meta.descFallback)
+            ? t(meta.descKey ?? '', meta.descFallback)
             : tool.description,
-          enabled: !(
-            settings.mcp.builtinToolOptions[tool.name]?.disabled ?? false
-          ),
+          enabled: !(toolOptions[tool.name]?.disabled ?? false),
+          hasSettings: tool.name === JS_SANDBOX_TOOL_NAME,
         }
+      })
+
+    const splitToolEnabled = LOCAL_FS_SPLIT_ACTION_TOOL_NAMES.every(
+      (toolName) =>
+        !(toolOptions[toolName]?.disabled ?? false) &&
+        !(toolOptions[FILE_OPS_GROUP_TOOL_NAME]?.disabled ?? false),
+    )
+    const fileOpsMeta = getBuiltinToolUiMeta(FILE_OPS_GROUP_TOOL_NAME)
+    if (!fileOpsMeta) {
+      throw new Error('Missing built-in tool UI metadata for fs_file_ops')
+    }
+    const fileOpsTool = {
+      id: FILE_OPS_GROUP_TOOL_NAME,
+      label: t(fileOpsMeta.labelKey, fileOpsMeta.labelFallback),
+      description: t(fileOpsMeta.descKey ?? '', fileOpsMeta.descFallback),
+      enabled: splitToolEnabled,
+      hasSettings: false,
+    }
+
+    const memorySplitToolEnabled = LOCAL_MEMORY_SPLIT_ACTION_TOOL_NAMES.every(
+      (toolName) =>
+        !(toolOptions[toolName]?.disabled ?? false) &&
+        !(toolOptions[MEMORY_OPS_GROUP_TOOL_NAME]?.disabled ?? false),
+    )
+    const memoryOpsMeta = getBuiltinToolUiMeta(MEMORY_OPS_GROUP_TOOL_NAME)
+    if (!memoryOpsMeta) {
+      throw new Error('Missing built-in tool UI metadata for memory_ops')
+    }
+    const memoryOpsTool = {
+      id: MEMORY_OPS_GROUP_TOOL_NAME,
+      label: t(memoryOpsMeta.labelKey, memoryOpsMeta.labelFallback),
+      description: t(memoryOpsMeta.descKey ?? '', memoryOpsMeta.descFallback),
+      enabled: memorySplitToolEnabled,
+      hasSettings: false,
+    }
+
+    const webSplitToolEnabled = WEB_OPS_SPLIT_ACTION_TOOL_NAMES.every(
+      (toolName) =>
+        !(toolOptions[toolName]?.disabled ?? false) &&
+        !(toolOptions[WEB_OPS_GROUP_TOOL_NAME]?.disabled ?? false),
+    )
+    const webOpsMeta = getBuiltinToolUiMeta(WEB_OPS_GROUP_TOOL_NAME)
+    if (!webOpsMeta) {
+      throw new Error('Missing built-in tool UI metadata for web_ops')
+    }
+    const webOpsTool = {
+      id: WEB_OPS_GROUP_TOOL_NAME,
+      label: t(webOpsMeta.labelKey, webOpsMeta.labelFallback),
+      description: t(webOpsMeta.descKey ?? '', webOpsMeta.descFallback),
+      enabled: webSplitToolEnabled,
+      hasSettings: true,
+    }
+
+    const allTools = [...tools, fileOpsTool, memoryOpsTool, webOpsTool]
+
+    const byCategory = new Map<BuiltinToolCategory, typeof allTools>()
+    for (const category of BUILTIN_TOOL_CATEGORY_ORDER) {
+      byCategory.set(category, [])
+    }
+    for (const tool of allTools) {
+      const category = getBuiltinToolCategory(tool.id) ?? 'vault'
+      byCategory.get(category)!.push(tool)
+    }
+
+    return BUILTIN_TOOL_CATEGORY_ORDER.map((category) => ({
+      category,
+      title: t(
+        BUILTIN_TOOL_CATEGORY_I18N[category].key,
+        BUILTIN_TOOL_CATEGORY_I18N[category].fallback,
+      ),
+      tools: (byCategory.get(category) ?? []).slice().sort((a, b) => {
+        return (
+          getBuiltinToolDisplayIndex(category, a.id) -
+          getBuiltinToolDisplayIndex(category, b.id)
+        )
       }),
-    [settings.mcp.builtinToolOptions, t],
-  )
+    })).filter((group) => group.tools.length > 0)
+  }, [settings.mcp.builtinToolOptions, t])
 
   const handleToggleBuiltinTool = (toolName: string, enabled: boolean) => {
+    const targets =
+      toolName === FILE_OPS_GROUP_TOOL_NAME
+        ? [FILE_OPS_GROUP_TOOL_NAME, ...LOCAL_FS_SPLIT_ACTION_TOOL_NAMES]
+        : toolName === MEMORY_OPS_GROUP_TOOL_NAME
+          ? [
+              MEMORY_OPS_GROUP_TOOL_NAME,
+              ...LOCAL_MEMORY_SPLIT_ACTION_TOOL_NAMES,
+            ]
+          : toolName === WEB_OPS_GROUP_TOOL_NAME
+            ? [WEB_OPS_GROUP_TOOL_NAME, ...WEB_OPS_SPLIT_ACTION_TOOL_NAMES]
+            : [toolName]
+    const nextBuiltinToolOptions = { ...settings.mcp.builtinToolOptions }
+    for (const target of targets) {
+      nextBuiltinToolOptions[target] = {
+        ...settings.mcp.builtinToolOptions[target],
+        disabled: !enabled,
+      }
+    }
+
     void setSettings({
       ...settings,
       mcp: {
         ...settings.mcp,
-        builtinToolOptions: {
-          ...settings.mcp.builtinToolOptions,
-          [toolName]: {
-            ...settings.mcp.builtinToolOptions[toolName],
-            disabled: !enabled,
-          },
-        },
+        builtinToolOptions: nextBuiltinToolOptions,
       },
     })
   }
 
   return (
-    <div className="smtcmp-settings-section">
-      <div className="smtcmp-settings-desc smtcmp-settings-callout">
+    <div className="yolo-settings-section">
+      <div className="yolo-settings-desc yolo-settings-callout">
         {t(
           'settings.agent.desc',
           'Manage global capabilities and configure your agents.',
         )}
       </div>
 
-      <div className="smtcmp-settings-sub-header">
-        <span className="smtcmp-agent-tools-section-title">
-          <span>{t('settings.agent.toolSourceBuiltin', 'Built-in')}</span>
-        </span>
-      </div>
-      <div className="smtcmp-mcp-servers-container smtcmp-builtin-tools-table">
-        <div className="smtcmp-mcp-servers-header smtcmp-builtin-tools-table-header">
-          <div>{t('settings.mcp.tools', 'Tools')}</div>
-          <div>{t('settings.agent.descriptionColumn', 'Description')}</div>
-          <div>{t('settings.mcp.enabled', 'Enabled')}</div>
-        </div>
-        <div className="smtcmp-mcp-server smtcmp-builtin-tools-table-body">
-          {builtinTools.map((tool) => (
-            <div
-              key={tool.id}
-              className="smtcmp-mcp-server-row smtcmp-builtin-tools-table-row"
-            >
-              <div className="smtcmp-mcp-server-name">{tool.label}</div>
-              <div className="smtcmp-mcp-server-status smtcmp-builtin-tools-table-description">
-                <div className="smtcmp-mcp-tool-description">
-                  {tool.description}
-                </div>
-              </div>
-              <div className="smtcmp-mcp-server-toggle">
-                <ObsidianToggle
-                  value={tool.enabled}
-                  onChange={(enabled) =>
-                    handleToggleBuiltinTool(tool.id, enabled)
-                  }
-                />
-              </div>
+      {builtinToolGroups.map((group) => (
+        <div key={group.category}>
+          <div className="yolo-settings-sub-header">
+            <span className="yolo-agent-tools-section-title">
+              <span>{group.title}</span>
+            </span>
+          </div>
+          <div className="yolo-mcp-servers-container yolo-builtin-tools-table">
+            <div className="yolo-mcp-servers-header yolo-builtin-tools-table-header">
+              <div>{t('settings.mcp.tools', 'Tools')}</div>
+              <div>{t('settings.agent.descriptionColumn', 'Description')}</div>
+              <div />
+              <div>{t('settings.mcp.enabled', 'Enabled')}</div>
             </div>
-          ))}
+            <div className="yolo-mcp-server yolo-builtin-tools-table-body">
+              {group.tools.map((tool) => (
+                <div
+                  key={tool.id}
+                  className="yolo-mcp-server-row yolo-builtin-tools-table-row"
+                >
+                  <div className="yolo-mcp-server-name">{tool.label}</div>
+                  <div className="yolo-mcp-server-status yolo-builtin-tools-table-description">
+                    <CollapsibleToolDescription
+                      description={tool.description}
+                    />
+                  </div>
+                  <div />
+                  <div className="yolo-builtin-tools-table-control">
+                    {tool.hasSettings ? (
+                      <button
+                        type="button"
+                        className="clickable-icon"
+                        aria-label={
+                          tool.id === JS_SANDBOX_TOOL_NAME
+                            ? t(
+                                'settings.jsSandbox.openSettings',
+                                'Configure JavaScript execution',
+                              )
+                            : t(
+                                'settings.webSearch.openSettings',
+                                'Configure web search providers',
+                              )
+                        }
+                        onClick={() => {
+                          if (tool.id === JS_SANDBOX_TOOL_NAME) {
+                            new JsSandboxConfigModal(app, {
+                              title: t(
+                                'settings.jsSandbox.openSettings',
+                                'Configure JavaScript execution',
+                              ),
+                              value: settings.jsSandbox,
+                              onChange: (next) =>
+                                void setSettings({
+                                  ...settings,
+                                  jsSandbox: next,
+                                }),
+                            }).open()
+                            return
+                          }
+                          new WebSearchSettingsModal(app, plugin).open()
+                        }}
+                      >
+                        <Settings size={16} />
+                      </button>
+                    ) : null}
+                    <ObsidianToggle
+                      value={tool.enabled}
+                      onChange={(enabled) =>
+                        handleToggleBuiltinTool(tool.id, enabled)
+                      }
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
-      </div>
+      ))}
 
       <McpSection app={app} plugin={plugin} embedded />
     </div>

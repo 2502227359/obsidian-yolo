@@ -1,4 +1,4 @@
-import { SmartComposerSettings } from '../../settings/schema/setting.types'
+import { YoloSettings } from '../../settings/schema/setting.types'
 import { EmbeddingModelClient } from '../../types/embedding'
 import { getProviderClient } from '../llm/manager'
 
@@ -6,7 +6,7 @@ export const getEmbeddingModelClient = ({
   settings,
   embeddingModelId,
 }: {
-  settings: SmartComposerSettings
+  settings: YoloSettings
   embeddingModelId: string
 }): EmbeddingModelClient => {
   const embeddingModel = settings.embeddingModels.find(
@@ -24,7 +24,24 @@ export const getEmbeddingModelClient = ({
   return {
     id: embeddingModel.id,
     dimension: embeddingModel.dimension,
-    getEmbedding: (text: string) =>
-      providerClient.getEmbedding(embeddingModel.model, text),
+    getEmbedding: async (text: string) => {
+      const shouldSendDimensions =
+        embeddingModel.nativeDimension != null &&
+        embeddingModel.dimension !== embeddingModel.nativeDimension
+
+      const vector = await providerClient.getEmbedding(
+        embeddingModel.model,
+        text,
+        shouldSendDimensions
+          ? { dimensions: embeddingModel.dimension }
+          : undefined,
+      )
+      if (vector.length !== embeddingModel.dimension) {
+        throw new Error(
+          `Embedding model "${embeddingModel.id}" returned ${vector.length}-dimensional vector, but it is configured as ${embeddingModel.dimension}-dimensional. Update the model's dimension in settings or re-add the model.`,
+        )
+      }
+      return vector
+    },
   }
 }

@@ -1,69 +1,123 @@
 import { EditorView } from '@codemirror/view'
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
-  $createParagraphNode,
-  $createTextNode,
   $getRoot,
   $nodesOfType,
   LexicalEditor,
   SerializedEditorState,
 } from 'lexical'
 import {
-  Check,
   ChevronDown,
   ChevronUp,
-  CopyIcon,
+  PencilLine,
   RotateCcw,
   Send,
   Square,
   X,
 } from 'lucide-react'
-import { Component, Editor, MarkdownRenderer, Notice } from 'obsidian'
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Editor, Notice, TFile } from 'obsidian'
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { v4 as uuidv4 } from 'uuid'
 
 import { useApp } from '../../../contexts/app-context'
 import { useLanguage } from '../../../contexts/language-context'
 import { useMcp } from '../../../contexts/mcp-context'
-import { useRAG } from '../../../contexts/rag-context'
 import { useSettings } from '../../../contexts/settings-context'
+import { getEnabledAssistantToolNames } from '../../../core/agent/tool-preferences'
+import { materializeTextEditPlan } from '../../../core/edits/textEditEngine'
+import { parseTextEditPlan } from '../../../core/edits/textEditPlan'
+import { LLMModelNotFoundException } from '../../../core/llm/exception'
 import { getChatModelClient } from '../../../core/llm/manager'
+import { listLiteSkillEntries } from '../../../core/skills/liteSkills'
+import { isSkillEnabledForAssistant } from '../../../core/skills/skillPolicy'
+import type {
+  QuickAskLaunchMode,
+  QuickAskSelectionScope,
+} from '../../../features/editor/quick-ask/quickAsk.types'
+import { QUICK_ASK_CURSOR_MARKER } from '../../../features/editor/quick-ask/quickAskController'
+import { selectionHighlightController } from '../../../features/editor/selection-highlight/selectionHighlightController'
 import { useChatHistory } from '../../../hooks/useChatHistory'
-import SmartComposerPlugin from '../../../main'
+import YoloPlugin from '../../../main'
 import type { ApplyViewState } from '../../../types/apply-view.types'
 import { Assistant } from '../../../types/assistant.types'
 import {
+  AssistantToolMessageGroup,
   ChatAssistantMessage,
   ChatMessage,
+  ChatToolMessage,
   ChatUserMessage,
 } from '../../../types/chat'
-import { Mentionable, SerializedMentionable } from '../../../types/mentionable'
+import type { ChatTimelineItem } from '../../../types/chat-timeline'
+import {
+  Mentionable,
+  MentionableBlock,
+  SerializedMentionable,
+} from '../../../types/mentionable'
 import { renderAssistantIcon } from '../../../utils/assistant-icon'
-import { generateEditContent } from '../../../utils/chat/editMode'
+import type { EditorSnapshotInjection } from '../../../utils/chat/contextual-injections'
+import { generateEditPlan } from '../../../utils/chat/editMode'
 import {
   deserializeMentionable,
   getMentionableKey,
-  getMentionableName,
   serializeMentionable,
 } from '../../../utils/chat/mentionable'
-import { parseTagContents } from '../../../utils/chat/parse-tag-content'
-import { PromptGenerator } from '../../../utils/chat/promptGenerator'
-import { tryApplyStructuredEdits } from '../../../utils/chat/structured-edits'
+import { groupAssistantAndToolMessages } from '../../../utils/chat/message-groups'
+import { RequestContextBuilder } from '../../../utils/chat/requestContextBuilder'
+import { buildMessageTimelineItems } from '../../../utils/chat/timeline'
 import { readTFileContent } from '../../../utils/obsidian'
-import AssistantMessageReasoning from '../../chat-view/AssistantMessageReasoning'
-import ChatUserInput from '../../chat-view/chat-input/ChatUserInput'
+import AssistantToolMessageGroupItem from '../../chat-view/AssistantToolMessageGroupItem'
+import type { ChatUserInputRef } from '../../chat-view/chat-input/ChatUserInput'
 import LexicalContentEditable from '../../chat-view/chat-input/LexicalContentEditable'
 import { ModelSelect } from '../../chat-view/chat-input/ModelSelect'
-import {
-  $createMentionNode,
-  MentionNode,
-} from '../../chat-view/chat-input/plugins/mention/MentionNode'
+import { MentionNode } from '../../chat-view/chat-input/plugins/mention/MentionNode'
 import { NodeMutations } from '../../chat-view/chat-input/plugins/on-mutation/OnMutationPlugin'
 import { editorStateToPlainText } from '../../chat-view/chat-input/utils/editor-state-to-plain-text'
+import { resolveChatModeRuntime } from '../../chat-view/chat-runtime-profiles'
+import { getChatSurfacePreset } from '../../chat-view/chat-surface-presets'
+import { SharedConversationSurface } from '../../chat-view/SharedConversationSurface'
+import { useAutoScroll } from '../../chat-view/useAutoScroll'
+import UserMessageItem from '../../chat-view/UserMessageItem'
+import { YoloDropdownContent } from '../../common/popover'
 
 import { AssistantSelectMenu } from './AssistantSelectMenu'
 import { ModeSelect, QuickAskMode } from './ModeSelect'
+import { createQuickAskEditorState } from './utils/createQuickAskEditorState'
 
-const QUICK_ASK_MAX_ITERATIONS = 1
+type QuickAskExecutionMode = QuickAskMode | 'edit' | 'edit-direct'
+
+function normalizeQuickAskVisibleMode(
+  mode?: QuickAskLaunchMode | null,
+): QuickAskMode {
+  return mode === 'agent' ? 'agent' : 'chat'
+}
+
+function normalizeQuickAskExecutionMode(
+  mode?: QuickAskLaunchMode | null,
+): QuickAskExecutionMode {
+  if (mode === 'agent' || mode === 'edit' || mode === 'edit-direct') {
+    return mode
+  }
+
+  return 'chat'
+}
+
+function getSelectionMentionable(
+  mentionables: Mentionable[],
+): MentionableBlock | null {
+  return (
+    mentionables.find(
+      (mentionable): mentionable is MentionableBlock =>
+        mentionable.type === 'block' && mentionable.source === 'selection',
+    ) ?? null
+  )
+}
 
 function getSelectionEndPosition(
   from: { line: number; ch: number },
@@ -89,20 +143,24 @@ type QuickAskRunStatus =
   | 'modifying'
   | null
 
-type QuickAskPanelProps = {
-  plugin: SmartComposerPlugin
-  editor: Editor
-  view: EditorView
+/**
+ * QuickAskPanel props use a capabilities discriminated union so that
+ * edit-mode props (editor, view, editContextText, editSelectionFrom,
+ * selectionScope) are only accessible when capabilities.edit === true.
+ * This lets TypeScript enforce that PDF paths cannot accidentally invoke
+ * editor methods.
+ */
+type QuickAskPanelPropsBase = {
+  plugin: YoloPlugin
   contextText: string
   fileTitle: string
   sourceFilePath?: string
   initialPrompt?: string
   initialMentionables?: Mentionable[]
-  initialMode?: QuickAskMode
+  initialMode?: QuickAskLaunchMode
   initialInput?: string
-  editContextText?: string
-  editSelectionFrom?: { line: number; ch: number }
   autoSend?: boolean
+  initialAssistantId?: string
   onClose: () => void
   containerRef?: React.RefObject<HTMLDivElement>
   onOverlayStateChange?: (isOverlayActive: boolean) => void
@@ -111,74 +169,24 @@ type QuickAskPanelProps = {
   onDockToTopRight?: () => void
 }
 
-function createPlainTextEditorState(text: string): SerializedEditorState {
-  const state = {
-    root: {
-      children: [
-        {
-          children: [
-            {
-              detail: 0,
-              format: 0,
-              mode: 'normal',
-              style: '',
-              text,
-              type: 'text',
-              version: 1,
-            },
-          ],
-          direction: 'ltr',
-          format: '',
-          indent: 0,
-          type: 'paragraph',
-          version: 1,
-        },
-      ],
-      direction: 'ltr',
-      format: '',
-      indent: 0,
-      type: 'root',
-      version: 1,
-    },
-  } as unknown
-  return state as SerializedEditorState
-}
-
-// Simple markdown renderer component for Quick Ask
-function SimpleMarkdownContent({
-  content,
-  component,
-}: {
-  content: string
-  component: Component
-  scale?: 'xs' | 'sm' | 'base'
-}) {
-  const app = useApp()
-  const containerRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    if (containerRef.current && content) {
-      containerRef.current.replaceChildren()
-      void MarkdownRenderer.render(
-        app,
-        content,
-        containerRef.current,
-        '',
-        component,
-      )
-    }
-  }, [app, component, content])
-
-  return (
-    <div
-      ref={containerRef}
-      className="markdown-rendered smtcmp-markdown-rendered"
-    />
-  )
-}
+type QuickAskPanelProps =
+  | (QuickAskPanelPropsBase & {
+      capabilities: { edit: true }
+      editor: Editor
+      view: EditorView
+      editContextText?: string
+      editSelectionFrom?: { line: number; ch: number }
+      selectionScope?: QuickAskSelectionScope
+    })
+  | (QuickAskPanelPropsBase & {
+      capabilities: { edit: false }
+      editor: null
+      view: null
+    })
 
 export function QuickAskPanel({
   plugin,
+  capabilities,
   editor: _editor,
   view: _view,
   contextText,
@@ -188,21 +196,31 @@ export function QuickAskPanel({
   initialMentionables,
   initialMode,
   initialInput,
-  editContextText,
-  editSelectionFrom,
   autoSend,
+  initialAssistantId,
   onClose,
   containerRef,
   onOverlayStateChange,
   onDragOffset,
   onResize,
   onDockToTopRight,
+  ...editProps
 }: QuickAskPanelProps) {
+  const editContextText = capabilities.edit
+    ? (editProps as { editContextText?: string }).editContextText
+    : undefined
+  const editSelectionFrom = capabilities.edit
+    ? (editProps as { editSelectionFrom?: { line: number; ch: number } })
+        .editSelectionFrom
+    : undefined
+  const selectionScope = capabilities.edit
+    ? (editProps as { selectionScope?: QuickAskSelectionScope }).selectionScope
+    : undefined
+  const quickAskSurfacePreset = getChatSurfacePreset('quick-ask')
   const app = useApp()
   const { settings } = useSettings()
   const { setSettings } = useSettings()
   const { t } = useLanguage()
-  const { getRAGEngine } = useRAG()
   const { getMcpManager } = useMcp()
   const { createOrUpdateConversationImmediately, generateConversationTitle } =
     useChatHistory()
@@ -211,8 +229,17 @@ export function QuickAskPanel({
   const currentAssistantId = settings.quickAskAssistantId
 
   // State
+  // initialAssistantId (e.g. from a selection chat shortcut) is a one-shot
+  // override and takes precedence over the persisted quickAskAssistantId, but
+  // we do NOT write it back to settings — the user's persisted preference is
+  // preserved for future Quick Ask sessions. If the override does not match a
+  // known assistant (e.g. it was deleted), fall back to the persisted choice.
   const [selectedAssistant, setSelectedAssistant] = useState<Assistant | null>(
     () => {
+      const overrideAssistant = initialAssistantId
+        ? assistants.find((a) => a.id === initialAssistantId)
+        : null
+      if (overrideAssistant) return overrideAssistant
       if (currentAssistantId) {
         return assistants.find((a) => a.id === currentAssistantId) || null
       }
@@ -223,6 +250,19 @@ export function QuickAskPanel({
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [inputText, setInputText] = useState('')
   const [isStreaming, setIsStreaming] = useState(false)
+  // While the LLM is streaming, flip the QuickAsk-owned selection highlight
+  // into a "pending" shimmer so users get visible feedback that AI is working
+  // on the selected text. The highlight itself is created/cleared by
+  // QuickAskController; we only flip its visual state here.
+  useEffect(() => {
+    selectionHighlightController.updateVisualByOwner(
+      'quickask',
+      isStreaming ? 'pending' : 'selection',
+    )
+    return () => {
+      selectionHighlightController.updateVisualByOwner('quickask', 'selection')
+    }
+  }, [isStreaming])
   const [runStatus, setRunStatus] = useState<QuickAskRunStatus>(null)
   const [isAssistantMenuOpen, setIsAssistantMenuOpen] = useState(false)
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false)
@@ -231,39 +271,90 @@ export function QuickAskPanel({
   const [mentionMenuPlacement, setMentionMenuPlacement] = useState<
     'top' | 'bottom'
   >('top')
-  const [mentionables, setMentionables] = useState<Mentionable[]>([])
-  const [copied, setCopied] = useState(false)
+  const [mentionables, setMentionables] = useState<Mentionable[]>(
+    () => initialMentionables ?? [],
+  )
+  const [activeSelectionScope, setActiveSelectionScope] =
+    useState<QuickAskSelectionScope | null>(() => selectionScope ?? null)
+  const [isApplying, setIsApplying] = useState(false)
+  const [activeApplyRequestKey, setActiveApplyRequestKey] = useState<
+    string | null
+  >(null)
   const hasDockedRef = useRef(false)
   const enableAutoDock =
     settings.continuationOptions.quickAskAutoDockToTopRight ?? true
-  const mentionableUnitLabel = useMemo(
-    () => t('common.characters', 'chars'),
+  const mentionableUnitLabels = useMemo(
+    () => ({
+      characters: t('common.characters', 'chars'),
+      words: t('common.words', 'words'),
+      wordsCharacters: t('common.wordsCharacters', 'words/chars'),
+    }),
     [t],
   )
-  const [mode, setMode] = useState<QuickAskMode>(
-    () => initialMode ?? settings.continuationOptions?.quickAskMode ?? 'ask',
+  const [mode, setMode] = useState<QuickAskMode>(() =>
+    normalizeQuickAskVisibleMode(
+      initialMode ?? settings.continuationOptions?.quickAskMode,
+    ),
   )
-  const assistantDropdownRef = useRef<HTMLDivElement | null>(null)
+  const [executionMode, setExecutionMode] = useState<QuickAskExecutionMode>(
+    () => {
+      const resolved = normalizeQuickAskExecutionMode(
+        initialMode ?? settings.continuationOptions?.quickAskMode,
+      )
+      // PDF path: edit modes are unavailable; fall back to 'chat'
+      if (
+        !capabilities.edit &&
+        (resolved === 'edit' || resolved === 'edit-direct')
+      ) {
+        return 'chat'
+      }
+      return resolved
+    },
+  )
   const assistantTriggerRef = useRef<HTMLButtonElement | null>(null)
   const modelTriggerRef = useRef<HTMLButtonElement | null>(null)
   const modeTriggerRef = useRef<HTMLButtonElement | null>(null)
-
   const inputRowRef = useRef<HTMLDivElement | null>(null)
   const contentEditableRef = useRef<HTMLDivElement>(null)
+  const chatUserInputRefs = useRef<Map<string, ChatUserInputRef>>(new Map())
   const lexicalEditorRef = useRef<LexicalEditor | null>(null)
   const chatAreaRef = useRef<HTMLDivElement>(null)
+  const [chatAreaElement, setChatAreaElement] = useState<HTMLElement | null>(
+    null,
+  )
+  const bottomAnchorRef = useRef<HTMLDivElement>(null)
+  const [timelineIsVirtualized, setTimelineIsVirtualized] = useState(false)
   const abortControllerRef = useRef<AbortController | null>(null)
-  const shouldAutoScrollRef = useRef(true)
-  const userDisabledAutoScrollRef = useRef(false)
-  const lastScrollTopRef = useRef(0)
+  const applyAbortControllerRef = useRef<AbortController | null>(null)
   const autoSendRef = useRef(false)
   const hasAppliedInitialInputRef = useRef(false)
+  const [focusedUserMessageId, setFocusedUserMessageId] = useState<
+    string | null
+  >(null)
 
   useEffect(() => {
     if (initialMode) {
-      setMode(initialMode)
+      setMode(normalizeQuickAskVisibleMode(initialMode))
+      const resolved = normalizeQuickAskExecutionMode(initialMode)
+      // PDF path: edit modes are unavailable; fall back to 'chat'
+      if (
+        !capabilities.edit &&
+        (resolved === 'edit' || resolved === 'edit-direct')
+      ) {
+        setExecutionMode('chat')
+      } else {
+        setExecutionMode(resolved)
+      }
     }
-  }, [initialMode])
+  }, [capabilities.edit, initialMode])
+
+  useEffect(() => {
+    setMentionables(initialMentionables ?? [])
+  }, [initialMentionables])
+
+  useEffect(() => {
+    setActiveSelectionScope(selectionScope ?? null)
+  }, [selectionScope])
 
   // Drag & Resize state
   const dragHandleRef = useRef<HTMLDivElement>(null)
@@ -294,74 +385,53 @@ export function QuickAskPanel({
     width: number
     height: number
   } | null>(null)
+  const compactMinHeightRef = useRef<number | null>(null)
+  const selectionMentionable = activeSelectionScope?.mentionable ?? null
+  const selectionEditContextText =
+    activeSelectionScope?.mentionable.content ?? editContextText ?? ''
+  const selectionEditFrom =
+    activeSelectionScope?.selectionFrom ?? editSelectionFrom
+  const hasScopedSelectionForEdit =
+    selectionEditContextText.trim().length > 0 && !!selectionEditFrom
+  const isTemporaryRewriteMode =
+    (executionMode === 'edit' || executionMode === 'edit-direct') &&
+    hasScopedSelectionForEdit
+  const modeTriggerLabel = isTemporaryRewriteMode
+    ? t('chatMode.rewrite', '改写')
+    : undefined
+  const modeTriggerIcon = isTemporaryRewriteMode ? (
+    <PencilLine size={14} />
+  ) : undefined
   const buildEditInstruction = useCallback(
     (instruction: string) => {
-      const context = editContextText?.trim()
+      const context = selectionEditContextText.trim()
       if (!context) return instruction
       return `${instruction}\n\nOnly modify the selected context below. Do not change other parts.\nSelected context:\n${context}`
     },
-    [editContextText],
+    [selectionEditContextText],
   )
+
+  useLayoutEffect(() => {
+    if (
+      chatMessages.length > 0 ||
+      panelSize?.height ||
+      !containerRef?.current
+    ) {
+      return
+    }
+
+    const rect = containerRef.current.getBoundingClientRect()
+    if (!Number.isFinite(rect.height) || rect.height <= 0) return
+
+    compactMinHeightRef.current = rect.height
+  }, [chatMessages.length, containerRef, panelSize?.height])
+
   const resolveEditTargetFile = useCallback(() => {
     if (sourceFilePath) {
       return app.vault.getFileByPath(sourceFilePath)
     }
     return app.workspace.getActiveFile()
   }, [app, sourceFilePath])
-  const renderAssistantBlocks = useCallback(
-    (
-      rawContent: string | undefined | null,
-      generationState?: 'streaming' | 'completed' | 'aborted',
-    ) => {
-      const parsed = parseTagContents(rawContent ?? '')
-      const rendered: React.JSX.Element[] = []
-
-      parsed.forEach((block, index) => {
-        if (block.type === 'think') {
-          if (!block.content.trim()) return
-          rendered.push(
-            <AssistantMessageReasoning
-              key={index}
-              reasoning={block.content}
-              content={rawContent ?? ''}
-              generationState={generationState}
-              MarkdownComponent={({ content }) => (
-                <SimpleMarkdownContent content={content} component={plugin} />
-              )}
-            />,
-          )
-          return
-        }
-
-        if (block.type === 'smtcmp_block') {
-          const normalizedContent =
-            block.language && block.language !== 'markdown'
-              ? `\`\`\`${block.language}\n${block.content}\n\`\`\``
-              : block.content
-          if (!normalizedContent.trim()) return
-          rendered.push(
-            <div key={index} className="smtcmp-quick-ask-assistant-block">
-              <SimpleMarkdownContent
-                content={normalizedContent}
-                component={plugin}
-              />
-            </div>,
-          )
-          return
-        }
-
-        if (!block.content.trim()) return
-        rendered.push(
-          <div key={index} className="smtcmp-quick-ask-assistant-block">
-            <SimpleMarkdownContent content={block.content} component={plugin} />
-          </div>,
-        )
-      })
-
-      return rendered
-    },
-    [plugin],
-  )
 
   const deriveAskRunStatus = useCallback(
     (
@@ -404,9 +474,55 @@ export function QuickAskPanel({
     return t('quickAsk.statusModifying', 'Modifying...')
   }, [runStatus, t])
 
-  const noop = useCallback(() => {}, [])
-  const noopSetMentionables = useCallback((_items: Mentionable[]) => {}, [])
+  const hasStreamingAssistantPlaceholder = useMemo(
+    () =>
+      chatMessages.some(
+        (message) =>
+          message.role === 'assistant' &&
+          message.metadata?.generationState === 'streaming',
+      ),
+    [chatMessages],
+  )
+  const hasVisibleAssistantOrToolMessages = useMemo(
+    () =>
+      chatMessages.some((message) => {
+        if (message.role === 'tool') {
+          return true
+        }
 
+        if (message.role !== 'assistant') {
+          return false
+        }
+
+        return (
+          message.content.trim().length > 0 ||
+          Boolean(message.reasoning?.trim().length) ||
+          Boolean(message.toolCallRequests?.length)
+        )
+      }),
+    [chatMessages],
+  )
+
+  const shouldShowInlineRunStatus =
+    isStreaming &&
+    !!runStatusLabel &&
+    ((executionMode !== 'agent' && executionMode !== 'chat') ||
+      (!hasStreamingAssistantPlaceholder && !hasVisibleAssistantOrToolMessages))
+
+  const noop = useCallback(() => {}, [])
+  const handleOpenEditSummaryFile = useCallback(
+    ({ path }: { path: string }) => {
+      const targetFile = app.vault.getAbstractFileByPath(path)
+      if (!(targetFile instanceof TFile)) {
+        new Notice(t('chat.editSummary.fileMissing', '文件不存在或已被移动。'))
+        return
+      }
+
+      const leaf = app.workspace.getLeaf(false)
+      void leaf.openFile(targetFile)
+    },
+    [app.vault, app.workspace, t],
+  )
   const updateMentionMenuPlacement = useCallback(() => {
     const container = inputRowRef.current
     if (!container) return
@@ -430,6 +546,9 @@ export function QuickAskPanel({
     (mutations: NodeMutations<MentionNode>) => {
       const destroyedMentionableKeys: string[] = []
       const addedMentionables: SerializedMentionable[] = []
+      const selectionMentionableKey = selectionMentionable
+        ? getMentionableKey(serializeMentionable(selectionMentionable))
+        : null
 
       mutations.forEach((mutation) => {
         const mentionable = mutation.node.getMentionable()
@@ -479,103 +598,90 @@ export function QuickAskPanel({
               .filter((v): v is Mentionable => !!v),
           ),
       )
+
+      if (
+        selectionMentionableKey &&
+        destroyedMentionableKeys.includes(selectionMentionableKey)
+      ) {
+        setActiveSelectionScope(null)
+      }
     },
-    [app, mentionables],
+    [app, mentionables, selectionMentionable],
   )
 
-  // Build promptGenerator with context
-  const promptGenerator = useMemo(() => {
+  // System prompt is intentionally minimal: Quick Ask's "current editor scene"
+  // (file path/title, cursor context, selection) is injected via the agent
+  // runtime's `contextualInjections` channel — see editorSnapshotInjection
+  // built below in the submit path.
+  const requestContextBuilder = useMemo(() => {
     const globalSystemPrompt = settings.systemPrompt || ''
     const assistantPrompt = selectedAssistant?.systemPrompt || ''
-    const trimmedTitle = fileTitle.trim()
-    const hasTitle = trimmedTitle.length > 0
-    const hasContext = contextText.trim().length > 0
-    const titleSection = hasTitle ? `File title: ${trimmedTitle}\n` : ''
-    const contextBlock = hasContext
-      ? `Here is the text around the cursor (context). The marker <<CURSOR>> indicates the cursor position:\n"""\n${contextText}\n"""\n`
-      : ''
-    const contextSection =
-      hasTitle || hasContext
-        ? `\n\nThe user is asking a question in the context of their current document.\n${titleSection}${contextBlock}\nAnswer the user's question based on this context when relevant.`
-        : ''
-
     const combinedSystemPrompt =
-      `${globalSystemPrompt}\n\n${assistantPrompt}${contextSection}`.trim()
+      `${globalSystemPrompt}\n\n${assistantPrompt}`.trim()
 
-    return new PromptGenerator(getRAGEngine, app, {
-      ...settings,
-      systemPrompt: combinedSystemPrompt,
-    })
-  }, [app, contextText, getRAGEngine, selectedAssistant, settings])
+    return new RequestContextBuilder(
+      app,
+      {
+        ...settings,
+        currentAssistantId: selectedAssistant?.id,
+        systemPrompt: combinedSystemPrompt,
+      },
+      {
+        includeSkills: executionMode === 'agent' || executionMode === 'chat',
+      },
+    )
+  }, [app, executionMode, selectedAssistant, settings])
 
-  // Track user scroll position to determine if we should auto-scroll
-  useEffect(() => {
-    const chatArea = chatAreaRef.current
-    if (!chatArea) return
+  const editorSnapshotInjection =
+    useMemo<EditorSnapshotInjection | null>(() => {
+      const trimmedTitle = fileTitle.trim()
+      const trimmedPath = sourceFilePath?.trim() ?? ''
+      const hasContext = contextText.trim().length > 0
+      const promptSelectionMentionable =
+        selectionMentionable ?? getSelectionMentionable(mentionables)
+      const hasSelection = Boolean(
+        promptSelectionMentionable?.content.trim().length,
+      )
 
-    const disableAutoScroll = () => {
-      shouldAutoScrollRef.current = false
-    }
-
-    const handleScroll = () => {
-      // Check if user is near the bottom (within 100px)
-      const distanceToBottom =
-        chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight
-      const isNearBottom = distanceToBottom < 100
-
-      const currentScrollTop = chatArea.scrollTop
-      const scrolledUp = currentScrollTop < lastScrollTopRef.current
-      lastScrollTopRef.current = currentScrollTop
-
-      if (scrolledUp) {
-        // 用户向上滚动，立即关闭自动滚动
-        userDisabledAutoScrollRef.current = true
-        shouldAutoScrollRef.current = false
-        return
+      if (!trimmedTitle && !trimmedPath && !hasContext && !hasSelection) {
+        return null
       }
 
-      if (userDisabledAutoScrollRef.current) {
-        // 只有用户手动滚回底部附近才恢复自动滚动
-        if (isNearBottom) {
-          userDisabledAutoScrollRef.current = false
-          shouldAutoScrollRef.current = true
-        }
-        return
+      return {
+        type: 'editor-snapshot',
+        filePath: trimmedPath,
+        fileTitle: trimmedTitle,
+        contextText,
+        cursorMarker: QUICK_ASK_CURSOR_MARKER,
+        selection: promptSelectionMentionable
+          ? {
+              content: promptSelectionMentionable.content,
+              filePath: promptSelectionMentionable.file.path,
+            }
+          : undefined,
       }
+    }, [
+      contextText,
+      fileTitle,
+      mentionables,
+      selectionMentionable,
+      sourceFilePath,
+    ])
 
-      shouldAutoScrollRef.current = isNearBottom
-    }
-
-    // Initialize state based on current position
-    handleScroll()
-
-    chatArea.addEventListener('scroll', handleScroll)
-    chatArea.addEventListener('wheel', disableAutoScroll, { passive: true })
-    chatArea.addEventListener('touchstart', disableAutoScroll, {
-      passive: true,
-    })
-    chatArea.addEventListener('pointerdown', disableAutoScroll)
-    return () => {
-      chatArea.removeEventListener('scroll', handleScroll)
-      chatArea.removeEventListener('wheel', disableAutoScroll)
-      chatArea.removeEventListener('touchstart', disableAutoScroll)
-      chatArea.removeEventListener('pointerdown', disableAutoScroll)
-    }
-  }, [chatMessages.length])
-
-  // Auto-scroll to bottom when messages change, but only if user hasn't scrolled up
-  useEffect(() => {
-    if (chatAreaRef.current && shouldAutoScrollRef.current) {
-      chatAreaRef.current.scrollTop = chatAreaRef.current.scrollHeight
-    }
-  }, [chatMessages])
-
-  // Focus input on mount
-  useEffect(() => {
-    setTimeout(() => {
-      contentEditableRef.current?.focus()
-    }, 100)
-  }, [])
+  const {
+    autoScrollToBottom,
+    followOutput,
+    onAtBottomStateChange,
+    forceScrollToBottom,
+    isAutoFollowEnabled,
+  } = useAutoScroll({
+    scrollContainerRef: chatAreaRef,
+    scrollContainerElement: chatAreaElement,
+    bottomAnchorRef,
+    isStreaming,
+    contentFollowMode: timelineIsVirtualized ? 'explicit' : 'observer',
+    followFromReactCommitsOnly: !timelineIsVirtualized,
+  })
 
   useEffect(() => {
     if (!isMentionMenuOpen) return
@@ -660,7 +766,9 @@ export function QuickAskPanel({
   }, [isAssistantMenuOpen])
 
   // Get model client
-  const { providerClient, model } = useMemo(() => {
+  const modelClient = useMemo((): ReturnType<
+    typeof getChatModelClient
+  > | null => {
     const continuationModelId =
       settings.continuationOptions?.continuationModelId
     const preferredModelId =
@@ -669,8 +777,167 @@ export function QuickAskPanel({
         ? continuationModelId
         : settings.chatModelId
 
-    return getChatModelClient({ settings, modelId: preferredModelId })
+    try {
+      return getChatModelClient({ settings, modelId: preferredModelId })
+    } catch (error) {
+      if (error instanceof LLMModelNotFoundException) {
+        if (settings.chatModels.length > 0) {
+          return getChatModelClient({
+            settings,
+            modelId: settings.chatModels[0].id,
+          })
+        }
+        return null
+      }
+      throw error
+    }
   }, [settings])
+  const providerClient = modelClient?.providerClient
+  const model = modelClient?.model
+
+  const readEditBaseContent = useCallback(
+    async (targetFilePath?: string): Promise<string> => {
+      // This callback is only called in edit mode where _editor is an Editor.
+      if (!capabilities.edit || !_editor) return ''
+      const activeFilePath = app.workspace.getActiveFile()?.path
+      if (
+        targetFilePath &&
+        (targetFilePath === sourceFilePath || targetFilePath === activeFilePath)
+      ) {
+        return _editor.getValue()
+      }
+      const fallbackFile = targetFilePath
+        ? app.vault.getFileByPath(targetFilePath)
+        : null
+      if (!fallbackFile) {
+        return _editor.getValue()
+      }
+      return readTFileContent(fallbackFile, app.vault)
+    },
+
+    [capabilities.edit, _editor, app, sourceFilePath],
+  )
+
+  const buildSelectionScopedContent = useCallback(
+    ({
+      currentContent,
+      selectedContext,
+      selectionFrom,
+    }: {
+      currentContent: string
+      selectedContext: string
+      selectionFrom?: { line: number; ch: number }
+    }): {
+      editSourceText: string
+      finalContent: string
+    } => {
+      if (!selectionFrom || selectedContext.trim().length === 0) {
+        return {
+          editSourceText: currentContent,
+          finalContent: currentContent,
+        }
+      }
+
+      // This callback is only reached in edit mode where _editor is an Editor.
+      if (!capabilities.edit || !_editor) {
+        return { editSourceText: currentContent, finalContent: currentContent }
+      }
+
+      const head = _editor.getRange({ line: 0, ch: 0 }, selectionFrom)
+      const tail = currentContent.slice(head.length + selectedContext.length)
+
+      return {
+        editSourceText: selectedContext,
+        finalContent: head + selectedContext + tail,
+      }
+    },
+
+    [capabilities.edit, _editor],
+  )
+
+  const generatePlannedEdit = useCallback(
+    async ({
+      instruction,
+      targetFile,
+      scopedToSelection,
+    }: {
+      instruction: string
+      targetFile: ReturnType<typeof resolveEditTargetFile>
+      scopedToSelection: boolean
+    }) => {
+      if (!targetFile || !providerClient || !model) {
+        return null
+      }
+
+      const currentContent = await readEditBaseContent(targetFile.path)
+      const selectedContext = selectionEditContextText
+      const selectionFrom = scopedToSelection ? selectionEditFrom : undefined
+      const scopedContent = buildSelectionScopedContent({
+        currentContent,
+        selectedContext,
+        selectionFrom,
+      })
+
+      const plan = await generateEditPlan({
+        instruction,
+        currentFile: targetFile,
+        currentFileContent: scopedContent.editSourceText,
+        scopedToSelection,
+        providerClient,
+        model,
+      })
+
+      if (!plan) {
+        return {
+          currentContent,
+          scopedSourceText: scopedContent.editSourceText,
+          scopedToSelection,
+          selectionFrom,
+          selectedContext,
+          materialized: null,
+        }
+      }
+
+      const materialized = materializeTextEditPlan({
+        content: scopedContent.editSourceText,
+        plan,
+      })
+
+      // generatePlannedEdit is only called in edit mode where _editor is Editor.
+      const finalContent =
+        selectionFrom && capabilities.edit && _editor
+          ? (() => {
+              const head = _editor.getRange({ line: 0, ch: 0 }, selectionFrom)
+              const tail = currentContent.slice(
+                head.length + scopedContent.editSourceText.length,
+              )
+              return head + materialized.newContent + tail
+            })()
+          : materialized.newContent
+
+      return {
+        currentContent,
+        scopedSourceText: scopedContent.editSourceText,
+        scopedToSelection,
+        selectionFrom,
+        selectedContext,
+        materialized: {
+          ...materialized,
+          finalContent,
+        },
+      }
+    },
+    [
+      capabilities.edit,
+      _editor,
+      buildSelectionScopedContent,
+      selectionEditContextText,
+      selectionEditFrom,
+      model,
+      providerClient,
+      readEditBaseContent,
+    ],
+  )
 
   useEffect(() => {
     if (hasDockedRef.current) return
@@ -686,17 +953,32 @@ export function QuickAskPanel({
       abortControllerRef.current.abort()
       abortControllerRef.current = null
     }
+    plugin.getAgentService().abortConversation(conversationId)
     setIsStreaming(false)
     setRunStatus(null)
-  }, [])
+  }, [conversationId, plugin])
 
   // Submit message
   const submitMessage = useCallback(
     async (
       editorState: SerializedEditorState,
       mentionablesOverride?: Mentionable[],
+      options?: {
+        baseMessages?: ChatMessage[]
+        userMessageId?: string
+      },
     ) => {
       if (isStreaming) return
+
+      if (!providerClient || !model) {
+        new Notice(
+          t(
+            'quickAsk.noModelConfigured',
+            'No chat model configured. Please add a model in settings.',
+          ),
+        )
+        return
+      }
 
       // Extract text from editor state
       const textContent = editorStateToPlainText(editorState)
@@ -705,6 +987,7 @@ export function QuickAskPanel({
       setIsStreaming(true)
       setRunStatus('requesting')
       setInputText('')
+      forceScrollToBottom()
 
       // Clear the lexical editor
       lexicalEditorRef.current?.update(() => {
@@ -716,103 +999,154 @@ export function QuickAskPanel({
         }
       })
 
-      // Create user message with all required fields
-      // Note: promptContent is set to null so that compileUserMessagePrompt will be called
-      // to properly process mentionables and include file contents
       const userMessage: ChatUserMessage = {
         role: 'user',
         content: editorState,
         promptContent: null,
-        id: uuidv4(),
+        id: options?.userMessageId ?? uuidv4(),
         mentionables: mentionablesOverride ?? mentionables,
       }
 
       // Clear mentionables after creating the message
       setMentionables([])
 
-      const newMessages: ChatMessage[] = [...chatMessages, userMessage]
+      const newMessages: ChatMessage[] = [
+        ...(options?.baseMessages ?? chatMessages),
+        userMessage,
+      ]
       setChatMessages(newMessages)
 
-      // Create abort controller
+      // Set up the abort controller before any awaits so that abortStream()
+      // works while we're still compiling mentionables.
       const abortController = new AbortController()
       abortControllerRef.current = abortController
       let unsubscribeRunner: (() => void) | null = null
 
+      // Compile mentionables into promptContent up front so the title model
+      // and the chat model see the same expanded context. Mirrors Chat.tsx.
+      let compiledMessages: ChatMessage[] = newMessages
+      try {
+        const { promptContent } =
+          await requestContextBuilder.compileUserMessagePrompt({
+            message: userMessage,
+          })
+        const compiledUserMessage: ChatUserMessage = {
+          ...userMessage,
+          promptContent,
+        }
+        compiledMessages = [
+          ...(options?.baseMessages ?? chatMessages),
+          compiledUserMessage,
+        ]
+      } catch (error) {
+        console.error('Failed to compile quick ask user message prompt', error)
+      }
+
+      if (abortController.signal.aborted) {
+        // Only clear shared state if we still own it — a follow-up submit may
+        // have already replaced the controller while we were compiling.
+        if (abortControllerRef.current === abortController) {
+          setIsStreaming(false)
+          setRunStatus(null)
+          abortControllerRef.current = null
+        }
+        return
+      }
+
+      void (async () => {
+        try {
+          await createOrUpdateConversationImmediately(
+            conversationId,
+            compiledMessages,
+          )
+        } catch (error) {
+          console.error('Failed to save quick ask conversation', error)
+          return
+        }
+
+        try {
+          await generateConversationTitle(conversationId, compiledMessages)
+        } catch (error) {
+          console.error(
+            'Failed to generate quick ask conversation title',
+            error,
+          )
+        }
+      })()
+
       try {
         const mcpManager = await getMcpManager()
 
-        const effectiveEnableTools = false
-        const effectiveIncludeBuiltinTools = false
+        const isAgentMode = executionMode === 'agent'
+        const chatModeRuntime = resolveChatModeRuntime({
+          mode: isAgentMode ? 'agent' : 'chat',
+          assistant: selectedAssistant,
+          assistantEnabledToolNames:
+            getEnabledAssistantToolNames(selectedAssistant),
+        })
+        const effectiveModel = model
+        const disabledSkillIds = settings.skills?.disabledSkillIds ?? []
+        const enabledSkillEntries = selectedAssistant
+          ? listLiteSkillEntries(app, { settings }).filter((skill) =>
+              isSkillEnabledForAssistant({
+                assistant: selectedAssistant,
+                skillId: skill.id,
+                disabledSkillIds,
+              }),
+            )
+          : []
+        const allowedSkillIds = enabledSkillEntries.map((skill) => skill.id)
+        const allowedSkillNames = enabledSkillEntries.map((skill) => skill.name)
 
         const agentService = plugin.getAgentService()
         unsubscribeRunner = agentService.subscribe(
           conversationId,
           (state) => {
             setRunStatus(deriveAskRunStatus(state.messages))
-            setChatMessages((prev) => {
-              const lastMessageIndex = prev.findIndex(
-                (m) => m.id === userMessage.id,
-              )
-              if (lastMessageIndex === -1) {
-                abortController.abort()
-                return prev
-              }
-              return [...prev.slice(0, lastMessageIndex + 1), ...state.messages]
-            })
+            setChatMessages(state.messages)
           },
           { emitCurrent: false },
         )
 
         await agentService.run({
           conversationId,
-          loopConfig: {
-            enableTools: effectiveEnableTools,
-            maxAutoIterations: QUICK_ASK_MAX_ITERATIONS,
-            includeBuiltinTools: effectiveIncludeBuiltinTools,
-          },
+          loopConfig: chatModeRuntime.loopConfig,
           input: {
             providerClient,
-            model,
-            messages: newMessages,
+            model: effectiveModel,
+            messages: compiledMessages,
             conversationId,
-            promptGenerator,
+            requestContextBuilder,
             mcpManager,
             abortSignal: abortController.signal,
-            allowedToolNames: effectiveEnableTools
-              ? selectedAssistant?.enabledToolNames
-              : undefined,
+            allowedToolNames: chatModeRuntime.allowedToolNames,
+            enableToolDisclosure: settings.mcp.enableToolDisclosure,
+            toolPreferences: chatModeRuntime.toolPreferences,
+            allowedSkillIds,
+            allowedSkillNames,
+            contextualInjections: editorSnapshotInjection
+              ? [editorSnapshotInjection]
+              : [],
             requestParams: {
               stream: true,
+              primaryRequestTimeoutMs:
+                settings.continuationOptions.primaryRequestTimeoutMs,
+              streamFallbackRecoveryEnabled:
+                settings.continuationOptions.streamFallbackRecoveryEnabled,
             },
-            currentFileContextMode: 'summary',
           },
         })
 
-        // Save conversation
-        const finalMessages = [...newMessages]
-        setChatMessages((current) => {
-          finalMessages.push(...current.slice(newMessages.length))
-          return current
-        })
+        const persistedMessages = agentService.getState(conversationId).messages
 
         void (async () => {
           try {
             await createOrUpdateConversationImmediately(
               conversationId,
-              finalMessages,
+              persistedMessages,
             )
           } catch (error) {
             console.error('Failed to save quick ask conversation', error)
-            return
-          }
-
-          try {
-            await generateConversationTitle(conversationId, finalMessages)
-          } catch (error) {
-            console.error(
-              'Failed to generate quick ask conversation title',
-              error,
-            )
           }
         })()
       } catch (error) {
@@ -840,50 +1174,239 @@ export function QuickAskPanel({
       getMcpManager,
       isStreaming,
       mentionables,
+      executionMode,
+      forceScrollToBottom,
       model,
       plugin,
-      promptGenerator,
+      requestContextBuilder,
       providerClient,
+      app,
       selectedAssistant,
+      settings,
       t,
+      editorSnapshotInjection,
     ],
   )
 
+  const handleToolMessageUpdate = useCallback(
+    (toolMessage: ChatToolMessage) => {
+      setChatMessages((prev) =>
+        prev.map((message) =>
+          message.id === toolMessage.id ? toolMessage : message,
+        ),
+      )
+    },
+    [],
+  )
+
+  const registerChatUserInputRef = useCallback(
+    (messageId: string, ref: ChatUserInputRef | null) => {
+      if (ref) {
+        chatUserInputRefs.current.set(messageId, ref)
+        return
+      }
+      chatUserInputRefs.current.delete(messageId)
+    },
+    [],
+  )
+
   useEffect(() => {
-    if (!initialInput || hasAppliedInitialInputRef.current) return
+    if (!focusedUserMessageId) {
+      return
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target
+      if (!(target instanceof HTMLElement)) {
+        return
+      }
+
+      if (target.closest('.yolo-popover-surface')) {
+        return
+      }
+
+      const activeMessageElement = chatAreaRef.current?.querySelector(
+        `[data-user-message-id="${focusedUserMessageId}"]`,
+      )
+      if (activeMessageElement?.contains(target)) {
+        return
+      }
+
+      setFocusedUserMessageId(null)
+    }
+
+    document.addEventListener('pointerdown', handlePointerDown, true)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true)
+    }
+  }, [focusedUserMessageId])
+
+  const handleDeleteGroup = useCallback(
+    (messageIds: string[]) => {
+      setChatMessages((prev) => {
+        const nextMessages = prev.filter(
+          (message) => !messageIds.includes(message.id),
+        )
+
+        void createOrUpdateConversationImmediately(
+          conversationId,
+          nextMessages,
+        ).catch((error) => {
+          console.error(
+            'Failed to persist quick ask conversation deletion',
+            error,
+          )
+        })
+
+        return nextMessages
+      })
+      setFocusedUserMessageId((prev) =>
+        prev && messageIds.includes(prev) ? null : prev,
+      )
+    },
+    [conversationId, createOrUpdateConversationImmediately],
+  )
+
+  const handleApply = useCallback(
+    async (
+      blockToApply: string,
+      applyRequestKey: string,
+      targetFilePath?: string,
+    ) => {
+      if (isApplying) {
+        if (activeApplyRequestKey === applyRequestKey) {
+          applyAbortControllerRef.current?.abort()
+          applyAbortControllerRef.current = null
+          setActiveApplyRequestKey(null)
+          setIsApplying(false)
+        }
+        return
+      }
+
+      const abortController = new AbortController()
+      applyAbortControllerRef.current = abortController
+      setActiveApplyRequestKey(applyRequestKey)
+      setIsApplying(true)
+
+      try {
+        if (abortController.signal.aborted) {
+          throw new DOMException('Apply aborted', 'AbortError')
+        }
+
+        const targetFile = targetFilePath
+          ? app.vault.getFileByPath(targetFilePath)
+          : resolveEditTargetFile()
+        if (!targetFile) {
+          throw new Error('No file is currently open to apply changes.')
+        }
+
+        const targetFileContent = await readTFileContent(targetFile, app.vault)
+        const plan = parseTextEditPlan(blockToApply, {
+          requireDocumentType: true,
+        })
+
+        if (!plan) {
+          throw new Error('当前内容不包含可应用的编辑计划。')
+        }
+
+        const materialized = materializeTextEditPlan({
+          content: targetFileContent,
+          plan,
+        })
+
+        if (materialized.errors.length > 0) {
+          console.warn('[Quick Ask Apply] Some planned edits failed.', {
+            filePath: targetFile.path,
+            errors: materialized.errors,
+          })
+        }
+
+        if (materialized.appliedCount === 0) {
+          throw new Error('当前编辑计划未匹配到可修改内容，请重新生成。')
+        }
+
+        await plugin.openApplyReview({
+          file: targetFile,
+          originalContent: targetFileContent,
+          newContent: materialized.newContent,
+          reviewMode: 'full',
+        } satisfies ApplyViewState)
+      } catch (error) {
+        if (
+          (error instanceof Error && error.name === 'AbortError') ||
+          (error instanceof Error && /abort/i.test(error.message))
+        ) {
+          return
+        }
+
+        if (error instanceof Error) {
+          new Notice(error.message)
+          console.error('Failed to apply changes in quick ask', error)
+          return
+        }
+
+        new Notice('Failed to apply changes')
+        console.error('Failed to apply changes in quick ask', error)
+      } finally {
+        applyAbortControllerRef.current = null
+        setActiveApplyRequestKey(null)
+        setIsApplying(false)
+      }
+    },
+    [activeApplyRequestKey, app, isApplying, plugin, resolveEditTargetFile],
+  )
+
+  useEffect(() => {
+    if (
+      autoSend ||
+      hasAppliedInitialInputRef.current ||
+      (!initialInput && (initialMentionables?.length ?? 0) === 0)
+    ) {
+      return
+    }
 
     let cancelled = false
-    const applyInitialInput = () => {
+    const applyInitialState = () => {
       if (cancelled || hasAppliedInitialInputRef.current) return
       const editor = lexicalEditorRef.current
       if (!editor) {
-        requestAnimationFrame(applyInitialInput)
+        requestAnimationFrame(applyInitialState)
         return
       }
 
       hasAppliedInitialInputRef.current = true
-      editor.update(() => {
-        const root = $getRoot()
-        root.clear()
-        const paragraph = $createParagraphNode()
-        root.append(paragraph)
-        paragraph.append($createTextNode(initialInput))
-        paragraph.selectEnd()
+      const editorState = createQuickAskEditorState({
+        prompt: initialInput ?? '',
+        mentionables: initialMentionables ?? [],
+        mentionableUnitLabels,
       })
-      setInputText(initialInput)
+      editor.setEditorState(editor.parseEditorState(editorState))
+      // setEditorState 会重置选区并让 contentEditable 失焦，这里把焦点/光标拿回来
+      editor.focus(undefined, { defaultSelection: 'rootEnd' })
     }
 
-    requestAnimationFrame(applyInitialInput)
+    requestAnimationFrame(applyInitialState)
     return () => {
       cancelled = true
     }
-  }, [initialInput])
+  }, [autoSend, initialInput, initialMentionables, mentionableUnitLabels])
 
-  // Submit edit mode - generate SEARCH/REPLACE and open ApplyView
+  // Submit edit mode - generate a text edit plan and open ApplyView
   const submitEditMode = useCallback(
     async (instruction: string) => {
       if (isStreaming) return
       if (!instruction.trim()) return
+
+      if (!providerClient || !model) {
+        new Notice(
+          t(
+            'quickAsk.noModelConfigured',
+            'No chat model configured. Please add a model in settings.',
+          ),
+        )
+        return
+      }
+
       const resolvedInstruction = buildEditInstruction(instruction.trim())
 
       const targetFile = resolveEditTargetFile()
@@ -908,79 +1431,36 @@ export function QuickAskPanel({
 
       let closedForReview = false
       try {
-        const currentContent = await readTFileContent(targetFile, app.vault)
-        const selectedContext = editContextText ?? ''
         const scopedToSelection =
-          mode === 'edit' &&
-          selectedContext.trim().length > 0 &&
-          !!editSelectionFrom
+          executionMode === 'edit' && hasScopedSelectionForEdit
 
-        const editSourceText = scopedToSelection
-          ? selectedContext
-          : currentContent
-
-        // Generate SEARCH/REPLACE blocks
-        const response = await generateEditContent({
+        const editResult = await generatePlannedEdit({
           instruction: resolvedInstruction,
-          currentFile: targetFile,
-          currentFileContent: editSourceText,
-          providerClient,
-          model,
+          targetFile,
+          scopedToSelection,
         })
 
         setRunStatus('modifying')
 
-        const structuredEditResult = tryApplyStructuredEdits({
-          rawEdits: response,
-          originalContent: editSourceText,
-        })
-        if (!structuredEditResult) {
+        if (!editResult?.materialized) {
           new Notice(
             t('quickAsk.editNoChanges', 'No valid changes returned by model'),
           )
           return
         }
 
-        const { newContent, errors, appliedCount, blocks } =
-          structuredEditResult
-
-        const finalContent =
-          scopedToSelection && editSelectionFrom
-            ? (() => {
-                const head = _editor.getRange(
-                  { line: 0, ch: 0 },
-                  editSelectionFrom,
-                )
-                const tail = currentContent.slice(
-                  head.length + selectedContext.length,
-                )
-                return head + newContent + tail
-              })()
-            : newContent
-
-        const canApplyStructuredLocally =
-          structuredEditResult.isPureStructuredScript && appliedCount > 0
-
-        if (!canApplyStructuredLocally) {
-          console.error(
-            '[QuickAsk Edit] Structured edits did not match file.',
-            {
-              filePath: targetFile.path,
-              blockCount: blocks.length,
-              appliedCount,
-              errors,
-            },
-          )
-          new Notice(
-            t(
-              'quickAsk.editNoChanges',
-              'No valid structured changes returned by model.',
-            ),
-          )
-          return
-        }
+        const { materialized, currentContent, selectionFrom, selectedContext } =
+          editResult
+        const { errors, appliedCount, totalOperations, finalContent } =
+          materialized
 
         if (appliedCount === 0) {
+          console.error('[QuickAsk Edit] Edit plan did not produce changes.', {
+            filePath: targetFile.path,
+            operationCount: totalOperations,
+            appliedCount,
+            errors,
+          })
           new Notice(
             t(
               'quickAsk.editNoChanges',
@@ -991,10 +1471,17 @@ export function QuickAskPanel({
         }
 
         if (errors.length > 0) {
-          console.warn('Some replacements failed:', errors)
+          console.warn('Some planned edits failed:', errors)
         }
 
-        // Close Quick Ask before opening review to avoid layout jump
+        // Close Quick Ask before opening review to avoid layout jump.
+        // Tear down the QuickAsk-owned selection highlight *synchronously*
+        // here, instead of relying on the controller's local close (which
+        // runs ~200ms later, after the close animation). Otherwise the
+        // pending shimmer keeps painting over the selection through the
+        // review and stays visible after the user rejects the diff, because
+        // ApplyView never touches owner='quickask' entries.
+        selectionHighlightController.clearByOwner('quickask')
         setIsStreaming(false)
         setRunStatus(null)
         closedForReview = true
@@ -1005,25 +1492,14 @@ export function QuickAskPanel({
           originalContent: currentContent,
           newContent: finalContent,
           reviewMode:
-            scopedToSelection && editSelectionFrom
-              ? 'selection-focus'
-              : undefined,
+            scopedToSelection && selectionFrom ? 'selection-focus' : undefined,
           selectionRange:
-            scopedToSelection && editSelectionFrom
+            scopedToSelection && selectionFrom
               ? {
-                  from: editSelectionFrom,
-                  to: getSelectionEndPosition(
-                    editSelectionFrom,
-                    selectedContext,
-                  ),
+                  from: selectionFrom,
+                  to: getSelectionEndPosition(selectionFrom, selectedContext),
                 }
               : undefined,
-          selectionOriginalText:
-            scopedToSelection && editSelectionFrom
-              ? selectedContext
-              : undefined,
-          selectionNewText:
-            scopedToSelection && editSelectionFrom ? newContent : undefined,
         } satisfies ApplyViewState)
       } catch (error) {
         console.error('Edit mode failed:', error)
@@ -1036,17 +1512,13 @@ export function QuickAskPanel({
       }
     },
     [
-      app,
       buildEditInstruction,
-      editContextText,
-      editSelectionFrom,
-      _editor,
+      executionMode,
+      generatePlannedEdit,
+      hasScopedSelectionForEdit,
       isStreaming,
-      mode,
-      model,
       onClose,
       plugin,
-      providerClient,
       resolveEditTargetFile,
       t,
     ],
@@ -1057,6 +1529,17 @@ export function QuickAskPanel({
     async (instruction: string) => {
       if (isStreaming) return
       if (!instruction.trim()) return
+
+      if (!providerClient || !model) {
+        new Notice(
+          t(
+            'quickAsk.noModelConfigured',
+            'No chat model configured. Please add a model in settings.',
+          ),
+        )
+        return
+      }
+
       const resolvedInstruction = buildEditInstruction(instruction.trim())
 
       const targetFile = resolveEditTargetFile()
@@ -1080,79 +1563,38 @@ export function QuickAskPanel({
       setInputText('')
 
       try {
-        const currentContent = await readTFileContent(targetFile, app.vault)
-        const selectedContext = editContextText ?? ''
         const scopedToSelection =
-          mode === 'edit-direct' &&
-          selectedContext.trim().length > 0 &&
-          !!editSelectionFrom
+          executionMode === 'edit-direct' && hasScopedSelectionForEdit
 
-        const editSourceText = scopedToSelection
-          ? selectedContext
-          : currentContent
-
-        // Generate edit blocks
-        const response = await generateEditContent({
+        const editResult = await generatePlannedEdit({
           instruction: resolvedInstruction,
-          currentFile: targetFile,
-          currentFileContent: editSourceText,
-          providerClient,
-          model,
+          targetFile,
+          scopedToSelection,
         })
 
         setRunStatus('modifying')
 
-        const structuredEditResult = tryApplyStructuredEdits({
-          rawEdits: response,
-          originalContent: editSourceText,
-        })
-        if (!structuredEditResult) {
+        if (!editResult?.materialized) {
           new Notice(
             t('quickAsk.editNoChanges', 'No valid changes returned by model'),
           )
           return
         }
 
-        const { newContent, errors, appliedCount, blocks } =
-          structuredEditResult
+        const { materialized } = editResult
+        const { errors, appliedCount, totalOperations, finalContent } =
+          materialized
 
-        const finalContent =
-          scopedToSelection && editSelectionFrom
-            ? (() => {
-                const head = _editor.getRange(
-                  { line: 0, ch: 0 },
-                  editSelectionFrom,
-                )
-                const tail = currentContent.slice(
-                  head.length + selectedContext.length,
-                )
-                return head + newContent + tail
-              })()
-            : newContent
-
-        const canApplyStructuredLocally =
-          structuredEditResult.isPureStructuredScript && appliedCount > 0
-
-        if (!canApplyStructuredLocally) {
+        if (appliedCount === 0) {
           console.error(
-            '[QuickAsk Edit-Direct] Structured edits did not match file.',
+            '[QuickAsk Edit-Direct] Edit plan did not produce changes.',
             {
               filePath: targetFile.path,
-              blockCount: blocks.length,
+              operationCount: totalOperations,
               appliedCount,
               errors,
             },
           )
-          new Notice(
-            t(
-              'quickAsk.editNoChanges',
-              'No valid structured changes returned by model.',
-            ),
-          )
-          return
-        }
-
-        if (appliedCount === 0) {
           new Notice(
             t(
               'quickAsk.editNoChanges',
@@ -1169,7 +1611,7 @@ export function QuickAskPanel({
             `Applied {appliedCount} of {totalEdits} edits. Check console for details.`,
           )
             .replace('{appliedCount}', String(appliedCount))
-            .replace('{totalEdits}', String(blocks.length))
+            .replace('{totalEdits}', String(totalOperations))
           new Notice(partialMessage)
         }
 
@@ -1197,14 +1639,11 @@ export function QuickAskPanel({
     [
       app,
       buildEditInstruction,
-      editContextText,
-      editSelectionFrom,
-      _editor,
+      executionMode,
+      generatePlannedEdit,
+      hasScopedSelectionForEdit,
       isStreaming,
-      mode,
-      model,
       onClose,
-      providerClient,
       resolveEditTargetFile,
       t,
     ],
@@ -1226,12 +1665,12 @@ export function QuickAskPanel({
 
       autoSendRef.current = true
 
-      if (mode === 'edit') {
+      if (executionMode === 'edit') {
         void submitEditMode(prompt)
         return
       }
 
-      if (mode === 'edit-direct') {
+      if (executionMode === 'edit-direct') {
         void submitEditDirect(prompt)
         return
       }
@@ -1241,28 +1680,12 @@ export function QuickAskPanel({
         setMentionables(mentionablesToInsert)
       }
 
-      editor.update(() => {
-        const root = $getRoot()
-        root.clear()
-        const paragraph = $createParagraphNode()
-        root.append(paragraph)
-
-        mentionablesToInsert.forEach((mentionable) => {
-          const mentionNode = $createMentionNode(
-            getMentionableName(mentionable, {
-              unitLabel: mentionableUnitLabel,
-            }),
-            serializeMentionable(mentionable),
-          )
-          paragraph.append(mentionNode)
-          paragraph.append($createTextNode(' '))
-        })
-
-        paragraph.append($createTextNode(prompt))
-        paragraph.selectEnd()
+      const editorState = createQuickAskEditorState({
+        prompt,
+        mentionables: mentionablesToInsert,
+        mentionableUnitLabels,
       })
-
-      const editorState = createPlainTextEditorState(prompt)
+      editor.setEditorState(editor.parseEditorState(editorState))
       void submitMessage(editorState, mentionablesToInsert)
     }
 
@@ -1274,8 +1697,8 @@ export function QuickAskPanel({
     autoSend,
     initialMentionables,
     initialPrompt,
-    mentionableUnitLabel,
-    mode,
+    mentionableUnitLabels,
+    executionMode,
     submitEditDirect,
     submitEditMode,
     submitMessage,
@@ -1285,6 +1708,7 @@ export function QuickAskPanel({
   const handleModeChange = useCallback(
     (newMode: QuickAskMode) => {
       setMode(newMode)
+      setExecutionMode(newMode)
       void setSettings({
         ...settings,
         continuationOptions: {
@@ -1306,55 +1730,95 @@ export function QuickAskPanel({
         const editorState = lexicalEditor.getEditorState().toJSON()
         const textContent = editorStateToPlainText(editorState)
 
-        if (mode === 'edit') {
+        if (executionMode === 'edit') {
           void submitEditMode(textContent)
-        } else if (mode === 'edit-direct') {
+        } else if (executionMode === 'edit-direct') {
           void submitEditDirect(textContent)
         } else {
           void submitMessage(editorState)
         }
       }
     },
-    [mode, submitEditMode, submitEditDirect, submitMessage],
+    [executionMode, submitEditMode, submitEditDirect, submitMessage],
   )
-
-  // Copy last assistant message
-  const copyLastResponse = useCallback(() => {
-    const lastAssistantMessage = [...chatMessages]
-      .reverse()
-      .find((m) => m.role === 'assistant')
-    if (lastAssistantMessage && lastAssistantMessage.role === 'assistant') {
-      void navigator.clipboard
-        .writeText(lastAssistantMessage.content || '')
-        .then(() => {
-          setCopied(true)
-          window.setTimeout(() => setCopied(false), 1500)
-        })
-        .catch((error) => {
-          console.error('Failed to copy to clipboard', error)
-        })
-    }
-  }, [chatMessages])
 
   // Clear conversation
   const clearConversation = useCallback(() => {
     setChatMessages([])
     new Notice(t('quickAsk.cleared', 'Conversation cleared'))
-    // Re-enable auto-scroll after clearing
-    shouldAutoScrollRef.current = true
-    userDisabledAutoScrollRef.current = false
+    // Re-enable follow mode after clearing.
+    forceScrollToBottom()
     // Focus input after clearing
     setTimeout(() => {
       contentEditableRef.current?.focus()
     }, 0)
-  }, [t])
+  }, [forceScrollToBottom, t])
 
   // Open in sidebar
   const hasMessages = chatMessages.length > 0
-  const lastAssistantMessageId = useMemo(
-    () => [...chatMessages].reverse().find((m) => m.role === 'assistant')?.id,
-    [chatMessages],
+  const isResizedEmptyState = !hasMessages && !!panelSize?.height
+  const groupedChatMessages: (ChatUserMessage | AssistantToolMessageGroup)[] =
+    useMemo(() => groupAssistantAndToolMessages(chatMessages), [chatMessages])
+  const activeStreamingMessageId = useMemo(() => {
+    for (let index = chatMessages.length - 1; index >= 0; index -= 1) {
+      const message = chatMessages[index]
+      if (
+        message.role === 'assistant' &&
+        message.metadata?.generationState === 'streaming'
+      ) {
+        return message.id
+      }
+    }
+
+    return null
+  }, [chatMessages])
+  const quickAskTimelineItems = useMemo(
+    () =>
+      buildMessageTimelineItems({
+        groupedChatMessages,
+        activeEditableMessageId: focusedUserMessageId,
+        activeStreamingMessageId,
+        includeBottomAnchor: true,
+      }),
+    [activeStreamingMessageId, focusedUserMessageId, groupedChatMessages],
   )
+  const hideScrollbarWhileFollowing =
+    isStreaming && isAutoFollowEnabled && hasMessages
+  const quickAskChatShellClassName = 'yolo-quick-ask-chat-shell'
+  const quickAskChatAreaClassName = useMemo(
+    () =>
+      `yolo-chat-messages yolo-quick-ask-chat-area yolo-quick-ask-chat-area--shared${hideScrollbarWhileFollowing ? ' yolo-quick-ask-chat-area--hide-scrollbar' : ''}`,
+    [hideScrollbarWhileFollowing],
+  )
+  const latestTimelineAssistantToolGroupKey = useMemo(() => {
+    for (let index = quickAskTimelineItems.length - 1; index >= 0; index -= 1) {
+      const candidate = quickAskTimelineItems[index]
+      if (candidate.kind === 'assistant-group') {
+        return candidate.renderKey
+      }
+    }
+
+    return null
+  }, [quickAskTimelineItems])
+
+  useLayoutEffect(() => {
+    if (timelineIsVirtualized) {
+      return
+    }
+
+    if (chatMessages.length === 0 || !isStreaming) {
+      return
+    }
+
+    autoScrollToBottom()
+  }, [
+    activeStreamingMessageId,
+    autoScrollToBottom,
+    chatMessages,
+    isAutoFollowEnabled,
+    isStreaming,
+    timelineIsVirtualized,
+  ])
 
   // Global key handling to match palette UX (Esc closes, even when dropdown is open)
   useEffect(() => {
@@ -1412,19 +1876,19 @@ export function QuickAskPanel({
 
     document.addEventListener('mousemove', handleMouseMove)
     document.addEventListener('mouseup', handleMouseUp)
-    document.body.classList.add('smtcmp-quick-ask-global-interaction')
+    document.body.classList.add('yolo-quick-ask-global-interaction')
     document.body.setCssProps({
-      '--smtcmp-quick-ask-global-cursor': 'grabbing',
-      '--smtcmp-quick-ask-global-user-select': 'none',
+      '--yolo-quick-ask-global-cursor': 'grabbing',
+      '--yolo-quick-ask-global-user-select': 'none',
     })
 
     return () => {
       document.removeEventListener('mousemove', handleMouseMove)
       document.removeEventListener('mouseup', handleMouseUp)
-      document.body.classList.remove('smtcmp-quick-ask-global-interaction')
+      document.body.classList.remove('yolo-quick-ask-global-interaction')
       document.body.setCssProps({
-        '--smtcmp-quick-ask-global-cursor': '',
-        '--smtcmp-quick-ask-global-user-select': '',
+        '--yolo-quick-ask-global-cursor': '',
+        '--yolo-quick-ask-global-user-select': '',
       })
     }
   }, [isDragging, containerRef, onDragOffset])
@@ -1453,6 +1917,9 @@ export function QuickAskPanel({
       let newHeight = resizeStartRef.current.height
       let newX = resizeStartRef.current.panelX
       const newY = resizeStartRef.current.panelY
+      const minHeight = hasMessages
+        ? 200
+        : (compactMinHeightRef.current ?? resizeStartRef.current.height)
 
       if (
         resizeStartRef.current.direction === 'right' ||
@@ -1471,10 +1938,10 @@ export function QuickAskPanel({
         resizeStartRef.current.direction === 'bottom' ||
         resizeStartRef.current.direction === 'bottom-right'
       ) {
-        newHeight = Math.max(200, resizeStartRef.current.height + deltaY)
+        newHeight = Math.max(minHeight, resizeStartRef.current.height + deltaY)
       }
       if (resizeStartRef.current.direction === 'bottom-left') {
-        newHeight = Math.max(200, resizeStartRef.current.height + deltaY)
+        newHeight = Math.max(minHeight, resizeStartRef.current.height + deltaY)
       }
 
       setPanelSize({ width: newWidth, height: newHeight })
@@ -1494,22 +1961,22 @@ export function QuickAskPanel({
 
     document.addEventListener('mousemove', handleMouseMove)
     document.addEventListener('mouseup', handleMouseUp)
-    document.body.classList.add('smtcmp-quick-ask-global-interaction')
+    document.body.classList.add('yolo-quick-ask-global-interaction')
     document.body.setCssProps({
-      '--smtcmp-quick-ask-global-cursor': cursor,
-      '--smtcmp-quick-ask-global-user-select': 'none',
+      '--yolo-quick-ask-global-cursor': cursor,
+      '--yolo-quick-ask-global-user-select': 'none',
     })
 
     return () => {
       document.removeEventListener('mousemove', handleMouseMove)
       document.removeEventListener('mouseup', handleMouseUp)
-      document.body.classList.remove('smtcmp-quick-ask-global-interaction')
+      document.body.classList.remove('yolo-quick-ask-global-interaction')
       document.body.setCssProps({
-        '--smtcmp-quick-ask-global-cursor': '',
-        '--smtcmp-quick-ask-global-user-select': '',
+        '--yolo-quick-ask-global-cursor': '',
+        '--yolo-quick-ask-global-user-select': '',
       })
     }
-  }, [isResizing, containerRef, onResize])
+  }, [hasMessages, isResizing, containerRef, onDragOffset, onResize])
 
   // Drag handle mouse down
   const handleDragStart = useCallback(
@@ -1552,205 +2019,362 @@ export function QuickAskPanel({
     [containerRef],
   )
 
+  const renderQuickAskTimelineItem = useCallback(
+    (timelineItem: ChatTimelineItem) => {
+      if (timelineItem.kind === 'assistant-group') {
+        return (
+          <AssistantToolMessageGroupItem
+            messages={timelineItem.messages}
+            conversationId={conversationId}
+            suppressFooter={
+              isStreaming &&
+              timelineItem.renderKey === latestTimelineAssistantToolGroupKey
+            }
+            showInlineInfo={
+              quickAskSurfacePreset.assistantActions.showInlineInfo
+            }
+            showRetryAction={
+              quickAskSurfacePreset.assistantActions.showRetryAction
+            }
+            showInsertAction={
+              quickAskSurfacePreset.assistantActions.showInsertAction
+            }
+            showCopyAction={
+              quickAskSurfacePreset.assistantActions.showCopyAction
+            }
+            showBranchAction={
+              quickAskSurfacePreset.assistantActions.showBranchAction
+            }
+            showEditAction={
+              quickAskSurfacePreset.assistantActions.showEditAction
+            }
+            showDeleteAction={
+              quickAskSurfacePreset.assistantActions.showDeleteAction
+            }
+            isApplying={isApplying}
+            activeApplyRequestKey={activeApplyRequestKey}
+            onApply={handleApply}
+            onToolMessageUpdate={handleToolMessageUpdate}
+            onEditStart={noop}
+            onEditCancel={noop}
+            onEditSave={noop}
+            onDeleteGroup={handleDeleteGroup}
+            onRetryGroup={noop}
+            onBranchGroup={noop}
+            onQuoteAssistantSelection={noop}
+            onOpenEditSummaryFile={handleOpenEditSummaryFile}
+            showQuoteAction={
+              quickAskSurfacePreset.assistantActions.showQuoteAction
+            }
+            showRunningToolFooter={false}
+          />
+        )
+      }
+
+      if (timelineItem.kind === 'user-message') {
+        const messageOrGroup = timelineItem.message
+        const groupedMessageIndex = groupedChatMessages.findIndex(
+          (candidate) =>
+            !Array.isArray(candidate) && candidate.id === messageOrGroup.id,
+        )
+
+        return (
+          <div
+            data-user-message-id={messageOrGroup.id}
+            className={`yolo-quick-ask-user-message${focusedUserMessageId === messageOrGroup.id ? ' yolo-quick-ask-user-message--editing' : ''}`}
+          >
+            <UserMessageItem
+              message={messageOrGroup}
+              isFocused={focusedUserMessageId === messageOrGroup.id}
+              displayMentionables={messageOrGroup.mentionables}
+              chatUserInputRef={(ref) =>
+                registerChatUserInputRef(messageOrGroup.id, ref)
+              }
+              onBlur={() => {
+                setFocusedUserMessageId(null)
+              }}
+              onInputChange={(content) => {
+                setChatMessages((prev) =>
+                  prev.map((message) =>
+                    message.role === 'user' && message.id === messageOrGroup.id
+                      ? {
+                          ...message,
+                          content,
+                          promptContent: null,
+                        }
+                      : message,
+                  ),
+                )
+              }}
+              onSubmit={(content) => {
+                if (
+                  editorStateToPlainText(content).trim() === '' &&
+                  messageOrGroup.mentionables.length === 0
+                ) {
+                  return
+                }
+
+                const baseMessages = groupedChatMessages
+                  .slice(0, groupedMessageIndex)
+                  .flatMap((group): ChatMessage[] =>
+                    Array.isArray(group) ? group : [group],
+                  )
+
+                void submitMessage(content, messageOrGroup.mentionables, {
+                  baseMessages,
+                  userMessageId: messageOrGroup.id,
+                })
+                setFocusedUserMessageId(null)
+                requestAnimationFrame(() => {
+                  contentEditableRef.current?.focus()
+                })
+              }}
+              onFocus={() => {
+                setFocusedUserMessageId(messageOrGroup.id)
+              }}
+              onMentionablesChange={(mentionables) => {
+                setChatMessages((prev) =>
+                  prev.map((message) =>
+                    message.role === 'user' && message.id === messageOrGroup.id
+                      ? {
+                          ...message,
+                          mentionables,
+                          promptContent: null,
+                        }
+                      : message,
+                  ),
+                )
+              }}
+              modelId={
+                settings.continuationOptions?.continuationModelId &&
+                settings.chatModels.some(
+                  (model) =>
+                    model.id ===
+                    settings.continuationOptions?.continuationModelId,
+                )
+                  ? settings.continuationOptions?.continuationModelId
+                  : settings.chatModelId
+              }
+              onModelChange={(modelId) => {
+                void setSettings({
+                  ...settings,
+                  continuationOptions: {
+                    ...settings.continuationOptions,
+                    continuationModelId: modelId,
+                  },
+                })
+              }}
+              showReasoningSelect={
+                quickAskSurfacePreset.userMessage.showReasoningSelect
+              }
+              showPlaceholder={false}
+              currentAssistantId={selectedAssistant?.id}
+              currentChatMode={mode}
+              allowAgentModeOption={
+                quickAskSurfacePreset.userMessage.allowAgentModeOption
+              }
+            />
+          </div>
+        )
+      }
+
+      if (timelineItem.kind === 'bottom-anchor') {
+        return (
+          <div
+            ref={bottomAnchorRef}
+            className="yolo-chat-bottom-anchor"
+            aria-hidden="true"
+          />
+        )
+      }
+
+      return null
+    },
+    [
+      activeApplyRequestKey,
+      conversationId,
+      focusedUserMessageId,
+      groupedChatMessages,
+      handleApply,
+      handleDeleteGroup,
+      handleOpenEditSummaryFile,
+      handleToolMessageUpdate,
+      isStreaming,
+      isApplying,
+      latestTimelineAssistantToolGroupKey,
+      quickAskChatAreaClassName,
+      quickAskSurfacePreset,
+      registerChatUserInputRef,
+      selectedAssistant?.id,
+      setSettings,
+      settings,
+      submitMessage,
+      mode,
+    ],
+  )
+
   return (
     <div
-      className={`smtcmp-quick-ask-panel ${hasMessages ? 'has-messages' : ''} ${isDragging ? 'is-dragging' : ''} ${isResizing ? 'is-resizing' : ''}`}
+      className={`yolo-quick-ask-panel ${hasMessages ? 'has-messages' : ''} ${isResizedEmptyState ? 'is-resized-empty' : ''} ${isDragging ? 'is-dragging' : ''} ${isResizing ? 'is-resizing' : ''}`}
       ref={containerRef ?? undefined}
       style={
         panelSize
           ? {
               width: panelSize.width,
-              maxWidth: panelSize.width, // Override CSS max-width constraint
+              maxWidth: panelSize.width,
               ...(panelSize.height
                 ? {
                     height: panelSize.height,
-                    maxHeight: panelSize.height, // Override CSS max-height constraint
+                    maxHeight: panelSize.height,
                   }
                 : {}),
             }
           : undefined
       }
     >
-      {/* Drag handle */}
+      <button
+        type="button"
+        className="yolo-quick-ask-close-button"
+        onClick={onClose}
+        aria-label={t('quickAsk.close', 'Close')}
+      >
+        <X size={14} />
+      </button>
+
       <div
         ref={dragHandleRef}
-        className="smtcmp-quick-ask-drag-handle"
+        className="yolo-quick-ask-drag-handle"
         onMouseDown={handleDragStart}
       >
-        <div className="smtcmp-quick-ask-drag-indicator" />
+        <div className="yolo-quick-ask-drag-indicator" />
       </div>
 
-      {/* Top: Input row with close button (Cursor style) */}
-      <div className="smtcmp-quick-ask-input-row" ref={inputRowRef}>
-        <div
-          className={`smtcmp-quick-ask-input ${isStreaming ? 'is-disabled' : ''}`}
-        >
-          {!isStreaming && (
-            <LexicalContentEditable
-              editorRef={lexicalEditorRef}
-              contentEditableRef={contentEditableRef}
-              onTextContentChange={setInputText}
-              onEnter={handleEnter}
-              onKeyDown={(event) => {
-                if (event.key === 'ArrowDown') {
-                  event.preventDefault()
-                  assistantTriggerRef.current?.focus()
-                }
-              }}
-              onMentionMenuToggle={(open) => {
-                setIsMentionMenuOpen(open)
-                if (open) updateMentionMenuPlacement()
-              }}
-              onMentionNodeMutation={handleMentionNodeMutation}
-              mentionMenuContainerRef={inputRowRef}
-              mentionMenuPlacement={mentionMenuPlacement}
-              autoFocus
-              contentClassName="smtcmp-obsidian-textarea smtcmp-content-editable smtcmp-quick-ask-content-editable"
-            />
-          )}
-          {inputText.length === 0 && !isStreaming && (
-            <div className="smtcmp-quick-ask-input-placeholder">
-              {t('quickAsk.inputPlaceholder', 'Ask a question...')}
-            </div>
-          )}
-          {isStreaming && runStatusLabel && (
-            <div className="smtcmp-quick-ask-run-status" aria-live="polite">
-              <span
-                className="smtcmp-quick-ask-run-status-dot"
-                aria-hidden="true"
+      {/* Top: Input row */}
+      {(!isStreaming || shouldShowInlineRunStatus) && (
+        <div className="yolo-quick-ask-input-row" ref={inputRowRef}>
+          <div
+            className={`yolo-quick-ask-input ${isStreaming ? 'is-disabled' : ''}`}
+          >
+            {!isStreaming && (
+              <LexicalContentEditable
+                editorRef={lexicalEditorRef}
+                contentEditableRef={contentEditableRef}
+                onTextContentChange={setInputText}
+                onEnter={handleEnter}
+                onKeyDown={(event) => {
+                  if (event.key === 'ArrowDown') {
+                    event.preventDefault()
+                    assistantTriggerRef.current?.focus()
+                  }
+                }}
+                onMentionMenuToggle={(open) => {
+                  setIsMentionMenuOpen(open)
+                  if (open) updateMentionMenuPlacement()
+                }}
+                onMentionNodeMutation={handleMentionNodeMutation}
+                mentionMenuPlacement={mentionMenuPlacement}
+                autoFocus
+                contentClassName="yolo-obsidian-textarea yolo-content-editable yolo-quick-ask-content-editable"
               />
-              <span>{runStatusLabel}</span>
-            </div>
-          )}
-        </div>
-        <button
-          className="smtcmp-quick-ask-close-button"
-          onClick={onClose}
-          aria-label={t('quickAsk.close', 'Close')}
-        >
-          <X size={14} />
-        </button>
-      </div>
-
-      {/* Chat area - only shown when there are messages */}
-      {hasMessages && (
-        <div
-          className="smtcmp-quick-ask-chat-area"
-          ref={chatAreaRef}
-          style={panelSize?.height ? { maxHeight: 'none' } : undefined}
-        >
-          {chatMessages.map((message) => {
-            if (message.role === 'user') {
-              return (
-                <div key={message.id} className="smtcmp-quick-ask-user-message">
-                  <ChatUserInput
-                    initialSerializedEditorState={message.content}
-                    onChange={noop}
-                    onSubmit={noop}
-                    onFocus={noop}
-                    onBlur={noop}
-                    mentionables={message.mentionables ?? []}
-                    setMentionables={noopSetMentionables}
-                    compact={true}
-                  />
-                </div>
-              )
-            }
-            if (message.role === 'assistant') {
-              const isLatestAssistant = message.id === lastAssistantMessageId
-              return (
-                <div
-                  key={message.id}
-                  className="smtcmp-quick-ask-assistant-message"
-                >
-                  {message.reasoning?.trim() && (
-                    <AssistantMessageReasoning
-                      reasoning={message.reasoning}
-                      content={message.content}
-                      generationState={message.metadata?.generationState}
-                      MarkdownComponent={({ content }) => (
-                        <SimpleMarkdownContent
-                          content={content}
-                          component={plugin}
-                        />
-                      )}
-                    />
-                  )}
-                  {renderAssistantBlocks(
-                    message.content,
-                    message.metadata?.generationState,
-                  )}
-                  {isLatestAssistant && (
-                    <div className="smtcmp-quick-ask-assistant-footer">
-                      <div className="smtcmp-assistant-message-actions">
-                        <button
-                          className="clickable-icon"
-                          onClick={copyLastResponse}
-                          title={t('quickAsk.copy', 'Copy')}
-                        >
-                          {copied ? (
-                            <Check size={12} />
-                          ) : (
-                            <CopyIcon size={12} />
-                          )}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )
-            }
-            return null
-          })}
+            )}
+            {inputText.length === 0 && !isStreaming && (
+              <div className="yolo-quick-ask-input-placeholder">
+                {t('quickAsk.inputPlaceholder', 'Ask a question...')}
+              </div>
+            )}
+            {shouldShowInlineRunStatus && (
+              <div className="yolo-quick-ask-run-status" aria-live="polite">
+                <span
+                  className="yolo-quick-ask-run-status-dot"
+                  aria-hidden="true"
+                />
+                <span>{runStatusLabel}</span>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
-      {/* Bottom toolbar (Cursor style): assistant selector left, actions right */}
-      <div className="smtcmp-quick-ask-toolbar">
-        {/* Left: Assistant selector */}
-        <div className="smtcmp-quick-ask-toolbar-left">
-          <button
-            ref={assistantTriggerRef}
-            className="smtcmp-quick-ask-assistant-trigger"
-            onClick={() => setIsAssistantMenuOpen(!isAssistantMenuOpen)}
-            onKeyDown={(event) => {
-              if (!isAssistantMenuOpen) {
-                if (event.key === 'ArrowUp') {
-                  event.preventDefault()
-                  event.stopPropagation()
-                  contentEditableRef.current?.focus()
-                  return
-                }
-                if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
-                  event.preventDefault()
-                  event.stopPropagation()
-                  modelTriggerRef.current?.focus()
-                  return
-                }
-              }
-            }}
-          >
-            {selectedAssistant && (
-              <span className="smtcmp-quick-ask-assistant-icon">
-                {renderAssistantIcon(selectedAssistant.icon, 14)}
-              </span>
-            )}
-            <span className="smtcmp-quick-ask-assistant-name">
-              {selectedAssistant?.name ||
-                t('quickAsk.noAssistant', 'No Assistant')}
-            </span>
-            {isAssistantMenuOpen ? (
-              <ChevronUp size={12} />
-            ) : (
-              <ChevronDown size={12} />
-            )}
-          </button>
+      {/* Chat area - only shown when there are messages */}
+      {hasMessages && (
+        <SharedConversationSurface
+          items={quickAskTimelineItems}
+          conversationId={conversationId}
+          scrollContainerRef={chatAreaRef}
+          onScrollContainerChange={setChatAreaElement}
+          containerClassName={quickAskChatShellClassName}
+          renderItem={renderQuickAskTimelineItem}
+          forceRenderItemIds={['bottom-anchor']}
+          followOutput={followOutput}
+          onAtBottomStateChange={onAtBottomStateChange}
+          virtualizationThreshold={
+            focusedUserMessageId ? quickAskTimelineItems.length : undefined
+          }
+          onVirtualizationChange={setTimelineIsVirtualized}
+          scrollContainerClassName={quickAskChatAreaClassName}
+        />
+      )}
 
-          {/* Assistant dropdown */}
-          {isAssistantMenuOpen && (
-            <div
-              className="smtcmp-quick-ask-assistant-dropdown"
-              ref={assistantDropdownRef}
+      {/* Bottom toolbar (Cursor style): assistant selector left, actions right */}
+      <div className="yolo-quick-ask-toolbar">
+        {/* Left: Assistant selector */}
+        <div className="yolo-quick-ask-toolbar-left">
+          <DropdownMenu.Root
+            open={isAssistantMenuOpen}
+            onOpenChange={setIsAssistantMenuOpen}
+          >
+            <DropdownMenu.Trigger asChild>
+              <button
+                type="button"
+                ref={assistantTriggerRef}
+                className="yolo-quick-ask-assistant-trigger"
+                onKeyDown={(event) => {
+                  if (!isAssistantMenuOpen) {
+                    if (event.key === 'ArrowUp') {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      contentEditableRef.current?.focus()
+                      return
+                    }
+                    if (
+                      event.key === 'ArrowRight' ||
+                      event.key === 'ArrowLeft'
+                    ) {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      modelTriggerRef.current?.focus()
+                      return
+                    }
+                  }
+                }}
+              >
+                {selectedAssistant && (
+                  <span className="yolo-quick-ask-assistant-icon">
+                    {renderAssistantIcon(selectedAssistant.icon, 14)}
+                  </span>
+                )}
+                <span className="yolo-quick-ask-assistant-name">
+                  {selectedAssistant?.name ||
+                    t('quickAsk.noAssistant', 'No Assistant')}
+                </span>
+                {isAssistantMenuOpen ? (
+                  <ChevronUp size={12} />
+                ) : (
+                  <ChevronDown size={12} />
+                )}
+              </button>
+            </DropdownMenu.Trigger>
+            <YoloDropdownContent
+              anchorRef={assistantTriggerRef}
+              variant="smart-space"
+              minWidth={200}
+              maxWidth={300}
+              side="top"
+              align="start"
+              sideOffset={8}
+              collisionPadding={8}
+              avoidCollisions={false}
+              onCloseAutoFocus={(e) => e.preventDefault()}
             >
               <AssistantSelectMenu
                 assistants={assistants}
@@ -1769,10 +2393,10 @@ export function QuickAskPanel({
                 onClose={() => setIsAssistantMenuOpen(false)}
                 compact
               />
-            </div>
-          )}
+            </YoloDropdownContent>
+          </DropdownMenu.Root>
 
-          <div className="smtcmp-quick-ask-model-select smtcmp-smart-space-model-select">
+          <div className="yolo-quick-ask-model-select yolo-smart-space-model-select">
             <ModelSelect
               ref={modelTriggerRef}
               modelId={
@@ -1794,12 +2418,15 @@ export function QuickAskPanel({
                   },
                 })
               }}
-              container={containerRef?.current ?? undefined}
               side="bottom"
               align="start"
               sideOffset={12}
               alignOffset={-4}
-              contentClassName="smtcmp-smart-space-popover smtcmp-quick-ask-model-popover"
+              popover={{
+                variant: 'smart-space',
+                maxHeight: 400,
+                className: 'yolo-quick-ask-model-popover',
+              }}
               onKeyDown={(event, isMenuOpen) => {
                 if (isMenuOpen) {
                   if (event.key === 'Escape') {
@@ -1832,18 +2459,18 @@ export function QuickAskPanel({
             />
           </div>
 
-          <div className="smtcmp-quick-ask-mode-select">
+          <div className="yolo-quick-ask-mode-select">
             <ModeSelect
               ref={modeTriggerRef}
               mode={mode}
               onChange={handleModeChange}
+              triggerLabel={modeTriggerLabel}
+              triggerIcon={modeTriggerIcon}
               onMenuOpenChange={(open) => setIsModeMenuOpen(open)}
-              container={containerRef?.current ?? undefined}
               side="bottom"
               align="start"
               sideOffset={12}
               alignOffset={-4}
-              contentClassName="smtcmp-smart-space-popover smtcmp-quick-ask-mode-popover"
               onKeyDown={(event, isMenuOpen) => {
                 if (isMenuOpen) {
                   if (event.key === 'Escape') {
@@ -1873,11 +2500,12 @@ export function QuickAskPanel({
         </div>
 
         {/* Right: Action buttons */}
-        <div className="smtcmp-quick-ask-toolbar-right">
+        <div className="yolo-quick-ask-toolbar-right">
           {/* Clear conversation button - only shown when there are messages */}
           {hasMessages && (
             <button
-              className="smtcmp-quick-ask-toolbar-button"
+              type="button"
+              className="yolo-quick-ask-toolbar-button"
               onClick={clearConversation}
               aria-label={t('quickAsk.clear', 'Clear conversation')}
               title={t('quickAsk.clear', 'Clear conversation')}
@@ -1889,7 +2517,8 @@ export function QuickAskPanel({
           {/* Send/Stop button */}
           {isStreaming ? (
             <button
-              className="smtcmp-quick-ask-send-button stop"
+              type="button"
+              className="yolo-quick-ask-send-button stop"
               onClick={abortStream}
               aria-label={t('quickAsk.stop', 'Stop')}
             >
@@ -1897,15 +2526,18 @@ export function QuickAskPanel({
             </button>
           ) : (
             <button
-              className="smtcmp-quick-ask-send-button"
+              type="button"
+              className="yolo-quick-ask-send-button"
               onClick={() => {
                 const lexicalEditor = lexicalEditorRef.current
                 if (lexicalEditor) {
                   const editorState = lexicalEditor.getEditorState().toJSON()
                   const textContent = editorStateToPlainText(editorState)
 
-                  if (mode === 'edit') {
+                  if (executionMode === 'edit') {
                     void submitEditMode(textContent)
+                  } else if (executionMode === 'edit-direct') {
+                    void submitEditDirect(textContent)
                   } else {
                     void submitMessage(editorState)
                   }
@@ -1922,22 +2554,22 @@ export function QuickAskPanel({
 
       {/* Resize handles */}
       <div
-        className="smtcmp-quick-ask-resize-handle smtcmp-quick-ask-resize-handle-right"
+        className="yolo-quick-ask-resize-handle yolo-quick-ask-resize-handle-right"
         onMouseDown={handleResizeStart('right')}
         ref={(el) => (resizeHandlesRef.current.right = el)}
       />
       <div
-        className="smtcmp-quick-ask-resize-handle smtcmp-quick-ask-resize-handle-bottom"
+        className="yolo-quick-ask-resize-handle yolo-quick-ask-resize-handle-bottom"
         onMouseDown={handleResizeStart('bottom')}
         ref={(el) => (resizeHandlesRef.current.bottom = el)}
       />
       <div
-        className="smtcmp-quick-ask-resize-handle smtcmp-quick-ask-resize-handle-bottom-left"
+        className="yolo-quick-ask-resize-handle yolo-quick-ask-resize-handle-bottom-left"
         onMouseDown={handleResizeStart('bottom-left')}
         ref={(el) => (resizeHandlesRef.current.bottomLeft = el)}
       />
       <div
-        className="smtcmp-quick-ask-resize-handle smtcmp-quick-ask-resize-handle-bottom-right"
+        className="yolo-quick-ask-resize-handle yolo-quick-ask-resize-handle-bottom-right"
         onMouseDown={handleResizeStart('bottom-right')}
         ref={(el) => (resizeHandlesRef.current.bottomRight = el)}
       />

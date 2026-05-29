@@ -2,6 +2,13 @@ import { DEFAULT_YOLO_BASE_DIR, YOLO_SKILLS_SUBDIR } from '../paths/yoloPaths'
 
 export const YOLO_SKILLS_DIR = `${DEFAULT_YOLO_BASE_DIR}/${YOLO_SKILLS_SUBDIR}`
 
+export const getSkillsPathAwareTemplate = (
+  template: string,
+  skillsDir: string = YOLO_SKILLS_DIR,
+): string => {
+  return template.split(YOLO_SKILLS_DIR).join(skillsDir)
+}
+
 export const YOLO_SKILLS_INDEX_TEMPLATE = `# YOLO Skills
 
 Store your skill files here.
@@ -15,75 +22,47 @@ Store your skill files here.
 export const YOLO_OBSIDIAN_OUTPUT_FORMAT_TEMPLATE = `---
 id: obsidian-output-format
 name: Obsidian Output Format
-description: Enforce Obsidian markdown output contract with <smtcmp_block> tags. Use whenever returning markdown content, proposing markdown edits, or referencing markdown snippets.
+description: Use <yolo_block> only for markdown file edit plans. Output the compact edit DSL only.
 mode: always
 ---
 
 # Obsidian Output Format
 
-Follow this format whenever you output markdown content for the user.
+Use \`<yolo_block>\` only when proposing edits to an existing markdown file.
 
-## Core Rules
+## Rules
 
-1. Wrap user-facing markdown blocks with \`<smtcmp_block>...</smtcmp_block>\`.
-2. Never include line numbers in the markdown text you output.
-3. Keep commentary outside \`<smtcmp_block>\`.
+1. Output exactly one \`<yolo_block>\` when proposing file edits.
+2. Inside \`<yolo_block>\`, output one edit block only.
+3. The \`<yolo_block>\` block does not require any code block wrapping.
 
-## New Markdown Content
+## Format(REPLACE)
 
-When generating new markdown content, use:
-
-~~~xml
-<smtcmp_block language="markdown">
-{{ content }}
-</smtcmp_block>
-~~~
-
-## Editing Existing Files
-
-When proposing edits to an existing markdown file, choose one of these two formats.
-
-### Preferred (for one-click Apply)
-
-Use structured edit blocks so the app can apply changes locally without extra model round-trips.
-
-Wrap them in \`<smtcmp_block>\` and output ONLY edit blocks inside:
-
-~~~xml
-<smtcmp_block language="text" filename="path/to/file.md">
-<<<<<<< SEARCH
+Normal output text before the \`<yolo_block>\` block.
+<yolo_block filename="path/to/file.md">
+<<<<<<< REPLACE
+[old]
 exact old text
 =======
+[new]
 new text
->>>>>>> REPLACE
-</smtcmp_block>
-~~~
+>>>>>>> END
+</yolo_block>
+Normal output text after the \`<yolo_block>\` block.
 
-Allowed edit block types:
+Allowed operation types:
 
-1. \`SEARCH/REPLACE\` for replacement
-2. \`INSERT AFTER/INSERT\` for insertion
-3. \`CONTINUE/CONTINUE\` for appending
+1. \`REPLACE\` for replacement
+2. \`INSERT_AFTER\` for insertion after an anchor
+3. \`APPEND\` for appending to the end
 
-Rules:
+## Operation Rules
 
-- Keep SEARCH text minimal but uniquely matchable.
-- Preserve exact whitespace and punctuation in SEARCH.
-- For deletion, keep REPLACE section empty.
-- Multiple edit blocks are allowed when needed.
-
-
-The user already has full file access, so do not dump the full file unless explicitly requested.
-
-## Referencing Provided Markdown Snippets
-
-If the user context includes numbered markdown snippets and you need to reference one of them, output an empty placeholder block with location attributes:
-
-~~~xml
-<smtcmp_block filename="path/to/file.md" language="markdown" startLine="2" endLine="30"></smtcmp_block>
-~~~
-
-Do not place snippet content inside this placeholder block.
+- Keep \`[old]\` or \`[anchor]\` minimal but uniquely matchable.
+- Preserve exact markdown source in \`[old]\`, including whitespace and punctuation.
+- The \`APPEND\` operation only requires outputting the New text; there is no need to output \`[old]\` and exact old text
+- Each \`<yolo_block>\` must contain exactly one operation.
+- Do not dump the full file unless explicitly requested.
 `
 
 export const YOLO_SKILL_CREATOR_TEMPLATE = `---
@@ -129,7 +108,7 @@ Think of the agent as exploring a path: a narrow bridge with cliffs needs specif
 
 ### Reversibility by Default
 
-Obsidian vaults contain the user's real data. Prefer minimal edits, explicit verification steps, and safe patterns. Use \`fs_write\` with \`dryRun: true\` before committing changes. Do not perform destructive operations unless explicitly requested.
+Obsidian vaults contain the user's real data. Prefer minimal edits, explicit verification steps, and safe patterns. Use \`fs_edit\` for a single targeted content change in an existing file, and \`fs_create_file\` / \`fs_delete_file\` / \`fs_create_dir\` / \`fs_delete_dir\` / \`fs_move\` for path operations. Do not perform destructive operations unless explicitly requested.
 
 ## Anatomy of a Skill
 
@@ -219,9 +198,13 @@ YOLO skills operate within Obsidian's environment. The following built-in tools 
 |------|---------|
 | \`fs_list\` | Inspect folder contents and vault structure |
 | \`fs_search\` | Find files by keyword or pattern |
-| \`fs_read\` | Read file contents |
-| \`fs_write\` | Create or overwrite files (supports \`dryRun\`) |
-| \`fs_edit\` | Apply targeted edits to existing files (minimal diff) |
+| \`fs_read\` | Read full files or targeted line ranges |
+| \`fs_edit\` | Apply exactly one targeted text edit to an existing file (\`replace\`, \`replace_lines\`, \`insert_after\`, \`append\`) |
+| \`fs_create_file\` | Create a file with provided content (supports \`dryRun\`) |
+| \`fs_delete_file\` | Delete a file path (supports \`dryRun\`) |
+| \`fs_create_dir\` | Create a directory path (supports \`dryRun\`) |
+| \`fs_delete_dir\` | Delete a directory path (supports \`recursive\` and \`dryRun\`) |
+| \`fs_move\` | Move or rename a file/folder path (supports \`dryRun\`) |
 
 Skills should be designed around these capabilities. There is no script execution environment, no shell access, and no external API calls. All skill workflows must be achievable through file operations and the agent's reasoning.
 
@@ -262,7 +245,7 @@ Before creating something new, check what already exists:
 ~~~
 fs_list YOLO/skills/          -> see current inventory
 fs_search <topic keywords>    -> find related skills
-fs_read <similar-skill.md>    -> study patterns that work
+fs_read <similar-skill.md>    -> study patterns that work (prefer line ranges when a section is known)
 ~~~
 
 This avoids duplication and helps maintain consistency across the vault's skill collection.
@@ -295,8 +278,8 @@ Body guidelines:
 Always preview before committing:
 
 ~~~
-fs_write YOLO/skills/<skill-id>.md  (dryRun: true)   -> preview
-fs_write YOLO/skills/<skill-id>.md                     -> commit
+fs_create_file { path: "YOLO/skills/<skill-id>.md", content: "...", dryRun: true } -> preview
+fs_create_file { path: "YOLO/skills/<skill-id>.md", content: "..." } -> commit
 ~~~
 
 For updates to existing skills, prefer \`fs_edit\` to make minimal, targeted changes rather than rewriting the entire file.
@@ -305,7 +288,7 @@ For updates to existing skills, prefer \`fs_edit\` to make minimal, targeted cha
 
 After writing:
 
-1. \`fs_read\` the file to confirm it saved correctly
+1. \`fs_read\` the file to confirm it saved correctly, using line ranges unless the full file is needed
 2. Verify the description clearly communicates trigger conditions
 3. Walk through each workflow step mentally: is it executable with available tools?
 4. Test the skill on a real task when possible
@@ -324,7 +307,7 @@ Before finalizing any skill, verify:
 - [ ] Frontmatter includes \`id\`, \`name\`, and \`description\`
 - [ ] Description states clear trigger conditions (not buried in body)
 - [ ] \`id\` is kebab-case and matches the filename
-- [ ] Workflow is executable with available tools (\`fs_list\`, \`fs_search\`, \`fs_read\`, \`fs_write\`, \`fs_edit\`)
+- [ ] Workflow is executable with available tools (\`fs_list\`, \`fs_search\`, \`fs_read\`, \`fs_edit\`, \`fs_create_file\`, \`fs_delete_file\`, \`fs_create_dir\`, \`fs_delete_dir\`, \`fs_move\`)
 - [ ] Instructions are concise and avoid redundant background
 - [ ] Output pattern is defined where consistency matters
 - [ ] Body is under 300 lines

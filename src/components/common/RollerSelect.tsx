@@ -3,11 +3,24 @@ import { Check, ChevronDown } from 'lucide-react'
 import type { CSSProperties } from 'react'
 import React, { ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 
+import { getNodeWindow } from '../../utils/dom/window-context'
+
+import { YoloDropdownContent, YoloPopoverVariant } from './popover'
+
 export type RollerOption = {
   value: string
   label: string
   description?: string
   icon?: ReactNode
+}
+
+export type RollerSelectPopoverProps = {
+  variant?: YoloPopoverVariant
+  minWidth?: number | string
+  maxWidth?: number | string
+  maxHeight?: number | string
+  /** Extra class for consumer-specific concerns. */
+  className?: string
 }
 
 type RollerSelectProps = {
@@ -19,7 +32,9 @@ type RollerSelectProps = {
   onOpenChange?: (open: boolean) => void
   disabled?: boolean
   triggerClassName?: string
-  contentClassName?: string
+  /** Popover surface variant + sizing. */
+  popover?: RollerSelectPopoverProps
+  /** Inline style override for the popover content (e.g. runtime-computed width). */
   contentStyle?: CSSProperties
   ariaLabel?: string
   sideOffset?: number
@@ -40,7 +55,7 @@ const RollerSelect: React.FC<RollerSelectProps> = ({
   onOpenChange,
   disabled = false,
   triggerClassName,
-  contentClassName,
+  popover,
   contentStyle,
   ariaLabel,
   sideOffset = 8,
@@ -60,11 +75,35 @@ const RollerSelect: React.FC<RollerSelectProps> = ({
   )
   const [incomingValue, setIncomingValue] = useState<string | null>(null)
   const timeoutRef = useRef<number | null>(null)
+  const triggerRef = useRef<HTMLButtonElement | null>(null)
+  const [contextBg, setContextBg] = useState<string | null>(null)
+
+  /** popover 通过 Radix Portal 挂到 body 上，CSS 级联无法从 trigger 所在容器
+   * 透传 background；这里在打开瞬间从 trigger 上溯找到第一个有实底色的祖先，
+   * 把它的 background-color 作为 inline style 注入到 popover，让弹窗自动跟随
+   * 所在容器（侧栏面板 / 独立窗口编辑区 / etc.）的底色。 */
+  useEffect(() => {
+    if (!isOpen) return
+    const node = triggerRef.current
+    if (!node) return
+    const win = getNodeWindow(node)
+    let el: Element | null = node.parentElement
+    while (el) {
+      const bg = win.getComputedStyle(el).backgroundColor
+      if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
+        setContextBg(bg)
+        return
+      }
+      el = el.parentElement
+    }
+    setContextBg(null)
+  }, [isOpen])
 
   useEffect(() => {
+    const ownerWindow = getNodeWindow(triggerRef.current)
     return () => {
       if (timeoutRef.current !== null) {
-        window.clearTimeout(timeoutRef.current)
+        ownerWindow.clearTimeout(timeoutRef.current)
         timeoutRef.current = null
       }
     }
@@ -78,11 +117,12 @@ const RollerSelect: React.FC<RollerSelectProps> = ({
     }
 
     setIncomingValue(currentOption.value)
+    const ownerWindow = getNodeWindow(triggerRef.current)
     if (timeoutRef.current !== null) {
-      window.clearTimeout(timeoutRef.current)
+      ownerWindow.clearTimeout(timeoutRef.current)
       timeoutRef.current = null
     }
-    timeoutRef.current = window.setTimeout(() => {
+    timeoutRef.current = ownerWindow.setTimeout(() => {
       setVisibleValue(currentOption.value)
       setIncomingValue(null)
       timeoutRef.current = null
@@ -112,10 +152,11 @@ const RollerSelect: React.FC<RollerSelectProps> = ({
       onOpenChange={handleOpenChange}
     >
       <DropdownMenu.Trigger
+        ref={triggerRef}
         className={
           triggerClassName
-            ? `smtcmp-roller-select-trigger ${triggerClassName}${isOpen ? ' is-open' : ''}`
-            : `smtcmp-roller-select-trigger${isOpen ? ' is-open' : ''}`
+            ? `yolo-roller-select-trigger ${triggerClassName}${isOpen ? ' is-open' : ''}`
+            : `yolo-roller-select-trigger${isOpen ? ' is-open' : ''}`
         }
         aria-label={ariaLabel}
         onClick={() => {
@@ -125,96 +166,98 @@ const RollerSelect: React.FC<RollerSelectProps> = ({
         onMouseLeave={onTriggerMouseLeave}
         disabled={disabled}
       >
-        <div className="smtcmp-roller-select-window" aria-hidden="true">
+        <div className="yolo-roller-select-window" aria-hidden="true">
           <div
-            className={`smtcmp-roller-select-track ${isRolling ? 'is-rolling' : ''}`}
+            className={`yolo-roller-select-track ${isRolling ? 'is-rolling' : ''}`}
           >
-            <div className="smtcmp-roller-select-item">
+            <div className="yolo-roller-select-item">
               {visibleOption?.icon ? (
-                <span className="smtcmp-view-toggle-button-icon">
+                <span className="yolo-view-toggle-button-icon">
                   {visibleOption.icon}
                 </span>
               ) : null}
-              <span className="smtcmp-view-toggle-button-label smtcmp-roller-select-item-label">
+              <span className="yolo-view-toggle-button-label yolo-roller-select-item-label">
                 {visibleOption?.label}
               </span>
             </div>
             {incomingOption ? (
-              <div className="smtcmp-roller-select-item">
+              <div className="yolo-roller-select-item">
                 {incomingOption.icon ? (
-                  <span className="smtcmp-view-toggle-button-icon">
+                  <span className="yolo-view-toggle-button-icon">
                     {incomingOption.icon}
                   </span>
                 ) : null}
-                <span className="smtcmp-view-toggle-button-label smtcmp-roller-select-item-label">
+                <span className="yolo-view-toggle-button-label yolo-roller-select-item-label">
                   {incomingOption.label}
                 </span>
               </div>
             ) : null}
           </div>
         </div>
-        <span className="smtcmp-roller-select-caret" aria-hidden="true">
+        <span className="yolo-roller-select-caret" aria-hidden="true">
           <ChevronDown size={14} strokeWidth={2.4} />
         </span>
       </DropdownMenu.Trigger>
 
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          className={
-            contentClassName
-              ? `smtcmp-popover ${contentClassName}`
-              : 'smtcmp-popover'
-          }
-          style={contentStyle}
-          side="bottom"
-          sideOffset={sideOffset}
-          align="start"
-          collisionPadding={8}
-          onMouseEnter={onContentMouseEnter}
-          onMouseLeave={onContentMouseLeave}
+      <YoloDropdownContent
+        anchorRef={triggerRef}
+        variant={popover?.variant ?? 'default'}
+        minWidth={popover?.minWidth}
+        maxWidth={popover?.maxWidth}
+        maxHeight={popover?.maxHeight}
+        className={popover?.className}
+        style={{
+          ...(contextBg ? { background: contextBg } : null),
+          ...contentStyle,
+        }}
+        side="bottom"
+        sideOffset={sideOffset}
+        align="start"
+        collisionPadding={8}
+        onMouseEnter={onContentMouseEnter}
+        onMouseLeave={onContentMouseLeave}
+      >
+        <DropdownMenu.RadioGroup
+          className="yolo-roller-select-list"
+          value={value}
+          onValueChange={(nextValue) => {
+            if (!options.some((option) => option.value === nextValue)) {
+              return
+            }
+            onChange(nextValue)
+          }}
         >
-          <DropdownMenu.RadioGroup
-            className="smtcmp-model-select-list smtcmp-roller-select-list"
-            value={value}
-            onValueChange={(nextValue) => {
-              if (!options.some((option) => option.value === nextValue)) {
-                return
-              }
-              onChange(nextValue)
-            }}
-          >
-            {options.map((option) => (
-              <DropdownMenu.RadioItem
-                key={option.value}
-                value={option.value}
-                className="smtcmp-popover-item smtcmp-roller-select-list-item"
-              >
-                {option.icon ? (
-                  <span className="smtcmp-roller-select-list-item-icon">
-                    {option.icon}
+          {options.map((option) => (
+            <DropdownMenu.RadioItem
+              key={option.value}
+              value={option.value}
+              className="yolo-roller-select-list-item"
+            >
+              {option.icon ? (
+                <span className="yolo-roller-select-list-item-icon">
+                  {option.icon}
+                </span>
+              ) : null}
+              <span className="yolo-roller-select-list-item-content">
+                <span className="yolo-roller-select-list-item-label">
+                  {option.label}
+                </span>
+                {option.description ? (
+                  <span className="yolo-roller-select-list-item-desc">
+                    {option.description}
                   </span>
                 ) : null}
-                <span className="smtcmp-roller-select-list-item-content">
-                  <span className="smtcmp-roller-select-list-item-label">
-                    {option.label}
-                  </span>
-                  {option.description ? (
-                    <span className="smtcmp-roller-select-list-item-desc">
-                      {option.description}
-                    </span>
-                  ) : null}
-                </span>
-                <span
-                  className="smtcmp-roller-select-list-item-check"
-                  aria-hidden="true"
-                >
-                  {value === option.value ? <Check size={12} /> : null}
-                </span>
-              </DropdownMenu.RadioItem>
-            ))}
-          </DropdownMenu.RadioGroup>
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
+              </span>
+              <span
+                className="yolo-roller-select-list-item-check"
+                aria-hidden="true"
+              >
+                {value === option.value ? <Check size={12} /> : null}
+              </span>
+            </DropdownMenu.RadioItem>
+          ))}
+        </DropdownMenu.RadioGroup>
+      </YoloDropdownContent>
     </DropdownMenu.Root>
   )
 }

@@ -1,22 +1,18 @@
 import { Settings, Trash2 } from 'lucide-react'
 import { App, Notice } from 'obsidian'
-import React from 'react'
 
 import { DEFAULT_PROVIDERS, PROVIDER_TYPES_INFO } from '../../../constants'
 import { useLanguage } from '../../../contexts/language-context'
 import { useSettings } from '../../../contexts/settings-context'
-import { getEmbeddingModelClient } from '../../../core/rag/embedding'
-import SmartComposerPlugin from '../../../main'
+import YoloPlugin from '../../../main'
 import { LLMProvider } from '../../../types/provider.types'
 import { ConfirmModal } from '../../modals/ConfirmModal'
-import {
-  AddProviderModal,
-  EditProviderModal,
-} from '../modals/ProviderFormModal'
+import { EditProviderModal } from '../modals/ProviderFormModal'
+import { ProviderPickerModal } from '../modals/ProviderPickerModal'
 
 type ProvidersSectionProps = {
   app: App
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
 }
 
 export function ProvidersSection({ app, plugin }: ProvidersSectionProps) {
@@ -49,26 +45,15 @@ export function ProvidersSection({ app, plugin }: ProvidersSectionProps) {
             const vectorManager = await plugin.tryGetVectorManager()
 
             if (vectorManager) {
-              const embeddingStats = await vectorManager.getEmbeddingStats()
-
-              // Clear embeddings for each associated embedding model
-              for (const embeddingModel of associatedEmbeddingModels) {
-                const embeddingStat = embeddingStats.find(
-                  (v) => v.model === embeddingModel.id,
-                )
-
-                if (embeddingStat?.rowCount && embeddingStat.rowCount > 0) {
-                  // only clear when there's data
-                  const embeddingModelClient = getEmbeddingModelClient({
-                    settings,
-                    embeddingModelId: embeddingModel.id,
-                  })
-                  await vectorManager.clearAllVectors(embeddingModelClient)
-                }
+              const embeddingModelIds = associatedEmbeddingModels.map(
+                (embeddingModel) => embeddingModel.id,
+              )
+              if (embeddingModelIds.length > 0) {
+                await vectorManager.clearVectorsByModelIds(embeddingModelIds)
               }
             } else {
               console.warn(
-                '[Smart Composer] Skip clearing embeddings because vector manager is unavailable.',
+                '[YOLO] Skip clearing embeddings because vector manager is unavailable.',
               )
             }
 
@@ -85,7 +70,7 @@ export function ProvidersSection({ app, plugin }: ProvidersSectionProps) {
               ),
             })
           } catch (error) {
-            console.error('[Smart Composer] Failed to delete provider:', error)
+            console.error('[YOLO] Failed to delete provider:', error)
             new Notice('Failed to delete provider.')
           }
         })()
@@ -94,16 +79,16 @@ export function ProvidersSection({ app, plugin }: ProvidersSectionProps) {
   }
 
   return (
-    <div className="smtcmp-settings-section">
-      <div className="smtcmp-settings-header">
+    <div className="yolo-settings-section">
+      <div className="yolo-settings-header">
         {t('settings.providers.title')}
       </div>
 
-      <div className="smtcmp-settings-desc">
+      <div className="yolo-settings-desc">
         <span>{t('settings.providers.desc')}</span>
         <br />
         <a
-          href="https://github.com/glowingjade/obsidian-smart-composer/wiki/1.2-Initial-Setup#getting-your-api-key"
+          href="https://github.com/Lapis0x0/obsidian-yolo"
           target="_blank"
           rel="noopener noreferrer"
         >
@@ -111,8 +96,8 @@ export function ProvidersSection({ app, plugin }: ProvidersSectionProps) {
         </a>
       </div>
 
-      <div className="smtcmp-settings-table-container">
-        <table className="smtcmp-settings-table">
+      <div className="yolo-settings-table-container">
+        <table className="yolo-settings-table">
           <colgroup>
             <col />
             <col />
@@ -131,18 +116,22 @@ export function ProvidersSection({ app, plugin }: ProvidersSectionProps) {
             {settings.providers.map((provider) => (
               <tr key={provider.id}>
                 <td>{provider.id}</td>
-                <td>{PROVIDER_TYPES_INFO[provider.type].label}</td>
-                <td
-                  className="smtcmp-settings-table-api-key"
-                  onClick={() => {
-                    new EditProviderModal(app, plugin, provider).open()
-                  }}
-                >
-                  {provider.apiKey ? '••••••••' : 'Set API key'}
+                <td>{PROVIDER_TYPES_INFO[provider.presetType].label}</td>
+                <td className="yolo-settings-table-api-key">
+                  <button
+                    type="button"
+                    className="clickable-icon"
+                    onClick={() => {
+                      new EditProviderModal(app, plugin, provider).open()
+                    }}
+                  >
+                    {provider.apiKey ? '••••••••' : 'Set API key'}
+                  </button>
                 </td>
                 <td>
-                  <div className="smtcmp-settings-actions">
+                  <div className="yolo-settings-actions">
                     <button
+                      type="button"
                       onClick={() => {
                         new EditProviderModal(app, plugin, provider).open()
                       }}
@@ -152,6 +141,7 @@ export function ProvidersSection({ app, plugin }: ProvidersSectionProps) {
                     </button>
                     {!DEFAULT_PROVIDERS.some((v) => v.id === provider.id) && (
                       <button
+                        type="button"
                         onClick={() => handleDeleteProvider(provider)}
                         className="clickable-icon"
                       >
@@ -167,8 +157,9 @@ export function ProvidersSection({ app, plugin }: ProvidersSectionProps) {
             <tr>
               <td colSpan={4}>
                 <button
+                  type="button"
                   onClick={() => {
-                    new AddProviderModal(app, plugin).open()
+                    new ProviderPickerModal(app, plugin).open()
                   }}
                 >
                   Add custom provider

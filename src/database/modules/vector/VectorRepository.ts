@@ -24,55 +24,21 @@ import { DatabaseNotInitializedException } from '../../exception'
 import { InsertEmbedding, SelectEmbedding, embeddingTable } from '../../schema'
 
 export class VectorRepository {
-  private app: App
   private db: PgliteDatabase | null
 
-  constructor(app: App, db: PgliteDatabase | null) {
-    this.app = app
+  constructor(_app: App, db: PgliteDatabase | null) {
     this.db = db
   }
 
-  async getIndexedFilePaths(
-    embeddingModel: EmbeddingModelClient,
-  ): Promise<string[]> {
-    if (!this.db) {
-      throw new DatabaseNotInitializedException()
-    }
-    const indexedFiles = await this.db
-      .select({
-        path: embeddingTable.path,
-      })
-      .from(embeddingTable)
-      .where(eq(embeddingTable.model, embeddingModel.id))
-    return indexedFiles.map((row) => row.path)
-  }
-
-  async getVectorsByFilePath(
-    filePath: string,
-    embeddingModel: EmbeddingModelClient,
-  ): Promise<SelectEmbedding[]> {
-    if (!this.db) {
-      throw new DatabaseNotInitializedException()
-    }
-    const fileVectors = await this.db
-      .select()
-      .from(embeddingTable)
-      .where(
-        and(
-          eq(embeddingTable.path, filePath),
-          eq(embeddingTable.model, embeddingModel.id),
-        ),
-      )
-    return fileVectors
-  }
-
   /**
-   * 批量获取文件的 mtime 信息
-   * 用于优化 N+1 查询问题，一次查询获取所有文件的索引状态
+   * Build a path → mtime map for the given model. Used by the reconciler to
+   * decide which files have changed without round-tripping per file.
+   *
+   * If a path has multiple chunk rows (the common case), we expose the max
+   * mtime across them — they should all match anyway, since updateVaultIndex
+   * sets mtime per file.
    */
-  async getFileMtimes(
-    embeddingModel: EmbeddingModelClient,
-  ): Promise<Map<string, number>> {
+  async getFileMtimes(modelId: string): Promise<Map<string, number>> {
     if (!this.db) {
       throw new DatabaseNotInitializedException()
     }
@@ -83,83 +49,118 @@ export class VectorRepository {
         mtime: embeddingTable.mtime,
       })
       .from(embeddingTable)
-      .where(eq(embeddingTable.model, embeddingModel.id))
+      .where(eq(embeddingTable.model, modelId))
       .groupBy(embeddingTable.path, embeddingTable.mtime)
 
     const mtimeMap = new Map<string, number>()
     for (const row of results) {
-      // 如果同一文件有多条记录，取最新的 mtime
+      // Defensive: PGlite/drizzle's `bigint mode:'number'` occasionally hands
+      // back a JS bigint instead of a number, which would make `!==` always
+      // true against the file system's number mtime and force every file
+      // through chunkify on every sync.
+      const mtime = Number(row.mtime)
       const existing = mtimeMap.get(row.path)
-      if (existing === undefined || row.mtime > existing) {
-        mtimeMap.set(row.path, row.mtime)
+      if (existing === undefined || mtime > existing) {
+        mtimeMap.set(row.path, mtime)
       }
     }
     return mtimeMap
   }
 
-  async deleteVectorsForSingleFile(
-    filePath: string,
-    embeddingModel: EmbeddingModelClient,
-  ): Promise<void> {
+  /**
+   * Read the actual chunk rows for a set of paths under a given model. Used
+   * by the reconciler to diff against desired chunks. The embedding column
+   * is excluded since the diff doesn't need it.
+   */
+  async listChunksForPaths(
+    modelId: string,
+    paths: string[],
+  ): Promise<
+    Array<{
+      id: number
+      path: string
+      mtime: number
+      content_hash: string | null
+      metadata: SelectEmbedding['metadata']
+    }>
+  > {
     if (!this.db) {
       throw new DatabaseNotInitializedException()
     }
-    await this.db
-      .delete(embeddingTable)
-      .where(
-        and(
-          eq(embeddingTable.path, filePath),
-          eq(embeddingTable.model, embeddingModel.id),
-        ),
-      )
-  }
-
-  async deleteVectorsForMultipleFiles(
-    filePaths: string[],
-    embeddingModel: EmbeddingModelClient,
-  ): Promise<void> {
-    if (!this.db) {
-      throw new DatabaseNotInitializedException()
-    }
-    await this.db
-      .delete(embeddingTable)
-      .where(
-        and(
-          inArray(embeddingTable.path, filePaths),
-          eq(embeddingTable.model, embeddingModel.id),
-        ),
-      )
-  }
-
-  async clearAllVectors(embeddingModel: EmbeddingModelClient): Promise<void> {
-    if (!this.db) {
-      throw new DatabaseNotInitializedException()
-    }
-    await this.db
-      .delete(embeddingTable)
-      .where(eq(embeddingTable.model, embeddingModel.id))
-  }
-
-  async hasVectorsForModel(
-    embeddingModel: EmbeddingModelClient,
-  ): Promise<boolean> {
-    if (!this.db) {
-      throw new DatabaseNotInitializedException()
-    }
-    const result = await this.db
-      .select({ value: count() })
+    if (paths.length === 0) return []
+    return this.db
+      .select({
+        id: embeddingTable.id,
+        path: embeddingTable.path,
+        mtime: embeddingTable.mtime,
+        content_hash: embeddingTable.content_hash,
+        metadata: embeddingTable.metadata,
+      })
       .from(embeddingTable)
-      .where(eq(embeddingTable.model, embeddingModel.id))
-      .limit(1)
-    const countValue = result[0]?.value ?? 0
-    return countValue > 0
+      .where(
+        and(
+          eq(embeddingTable.model, modelId),
+          inArray(embeddingTable.path, paths),
+        ),
+      )
+  }
+
+  async deleteVectorsByIds(ids: number[]): Promise<void> {
+    if (!this.db) {
+      throw new DatabaseNotInitializedException()
+    }
+    if (ids.length === 0) return
+    await this.db.delete(embeddingTable).where(inArray(embeddingTable.id, ids))
+  }
+
+  async bumpMtimeByIds(
+    updates: Array<{ id: number; mtime: number }>,
+  ): Promise<void> {
+    if (!this.db) {
+      throw new DatabaseNotInitializedException()
+    }
+    if (updates.length === 0) return
+    // Group by mtime to minimize statements when many rows share the new mtime.
+    const groups = new Map<number, number[]>()
+    for (const u of updates) {
+      const bucket = groups.get(u.mtime)
+      if (bucket) bucket.push(u.id)
+      else groups.set(u.mtime, [u.id])
+    }
+    for (const [mtime, ids] of groups) {
+      await this.db
+        .update(embeddingTable)
+        .set({ mtime })
+        .where(inArray(embeddingTable.id, ids))
+    }
   }
 
   async insertVectors(data: InsertEmbedding[]): Promise<void> {
     if (!this.db) {
       throw new DatabaseNotInitializedException()
     }
+    if (data.length === 0) return
     await this.db.insert(embeddingTable).values(data)
+  }
+
+  /** Wipe all rows for one model namespace. */
+  async truncateModel(modelId: string): Promise<void> {
+    if (!this.db) {
+      throw new DatabaseNotInitializedException()
+    }
+    await this.db
+      .delete(embeddingTable)
+      .where(eq(embeddingTable.model, modelId))
+  }
+
+  async clearVectorsByModelIds(modelIds: string[]): Promise<void> {
+    if (!this.db) {
+      throw new DatabaseNotInitializedException()
+    }
+    if (modelIds.length === 0) return
+    await this.db
+      .delete(embeddingTable)
+      .where(inArray(embeddingTable.model, modelIds))
   }
 
   async performSimilaritySearch(
@@ -181,6 +182,11 @@ export class VectorRepository {
     if (!this.db) {
       throw new DatabaseNotInitializedException()
     }
+    const dbWithClient = this.db as PgliteDatabase & {
+      $client?: { exec: (sql: string) => Promise<unknown> }
+    }
+    await dbWithClient.$client?.exec('SET hnsw.ef_search = 100')
+
     const similarity = sql<number>`1 - (${cosineDistance(embeddingTable.embedding, queryVector)})`
     const similarityCondition = gt(similarity, options.minSimilarity)
 

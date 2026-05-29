@@ -1,49 +1,84 @@
-import React, { useCallback, useMemo } from 'react'
 import { Loader2 } from 'lucide-react'
+import React, { useCallback, useMemo } from 'react'
 
 import { useLanguage } from '../../contexts/language-context'
-import { ChatAssistantMessage, ChatMessage } from '../../types/chat'
+import { CitationSource } from '../../core/agent/citationRegistry'
+import { ChatAssistantMessage } from '../../types/chat'
+import { injectAnnotationMarkers } from '../../utils/chat/inject-annotation-markers'
 import {
   ParsedTagContent,
   parseTagContents,
 } from '../../utils/chat/parse-tag-content'
 
 import AssistantMessageReasoning from './AssistantMessageReasoning'
+import AssistantSelectionQuoteButton from './AssistantSelectionQuoteButton'
 import MarkdownCodeComponent from './MarkdownCodeComponent'
 import MarkdownReferenceBlock from './MarkdownReferenceBlock'
 import { ObsidianMarkdown } from './ObsidianMarkdown'
+import StreamingMarkdown from './StreamingMarkdown'
+import { getToolDisplayInfo, getToolLabels } from './ToolMessage'
+
+function hasRenderableAssistantContent(blocks: ParsedTagContent[]): boolean {
+  return blocks.some((block) => {
+    if (block.type === 'think') {
+      return false
+    }
+
+    return block.content.trim().length > 0
+  })
+}
 
 export default function AssistantMessageContent({
   content,
-  contextMessages,
+  annotations,
+  sources,
   handleApply,
   isApplying,
   activeApplyRequestKey,
   generationState,
   toolCallRequests,
+  showToolCallPreview = false,
+  messageId,
+  conversationId,
+  onQuote,
+  enableSelectionQuote = true,
 }: {
   content: ChatAssistantMessage['content']
-  contextMessages: ChatMessage[]
+  annotations?: ChatAssistantMessage['annotations']
+  sources?: CitationSource[]
   handleApply: (
     blockToApply: string,
-    chatMessages: ChatMessage[],
-    mode: 'quick' | 'precise',
     applyRequestKey: string,
+    targetFilePath?: string,
   ) => void
   isApplying: boolean
   activeApplyRequestKey: string | null
-  generationState?: 'streaming' | 'completed' | 'aborted'
+  generationState?: 'streaming' | 'completed' | 'aborted' | 'error'
   toolCallRequests?: ChatAssistantMessage['toolCallRequests']
+  showToolCallPreview?: boolean
+  messageId: string
+  conversationId: string
+  onQuote: (payload: {
+    messageId: string
+    conversationId: string
+    content: string
+  }) => void
+  enableSelectionQuote?: boolean
 }) {
   const onApply = useCallback(
     (
       blockToApply: string,
-      mode: 'quick' | 'precise',
       applyRequestKey: string,
+      targetFilePath?: string,
     ) => {
-      handleApply(blockToApply, contextMessages, mode, applyRequestKey)
+      handleApply(blockToApply, applyRequestKey, targetFilePath)
     },
-    [handleApply, contextMessages],
+    [handleApply],
+  )
+
+  const annotatedContent = useMemo(
+    () => injectAnnotationMarkers(content, annotations),
+    [content, annotations],
   )
 
   return (
@@ -53,8 +88,14 @@ export default function AssistantMessageContent({
       activeApplyRequestKey={activeApplyRequestKey}
       generationState={generationState}
       toolCallRequests={toolCallRequests}
+      showToolCallPreview={showToolCallPreview}
+      messageId={messageId}
+      conversationId={conversationId}
+      onQuote={onQuote}
+      enableSelectionQuote={enableSelectionQuote}
+      sources={sources}
     >
-      {content}
+      {annotatedContent}
     </AssistantTextRenderer>
   )
 }
@@ -65,18 +106,34 @@ const AssistantTextRenderer = React.memo(function AssistantTextRenderer({
   activeApplyRequestKey,
   generationState,
   toolCallRequests,
+  showToolCallPreview,
+  messageId,
+  conversationId,
+  onQuote,
+  enableSelectionQuote,
+  sources,
   children,
 }: {
   onApply: (
     blockToApply: string,
-    mode: 'quick' | 'precise',
     applyRequestKey: string,
+    targetFilePath?: string,
   ) => void
   children: string
   isApplying: boolean
   activeApplyRequestKey: string | null
-  generationState?: 'streaming' | 'completed' | 'aborted'
+  generationState?: 'streaming' | 'completed' | 'aborted' | 'error'
   toolCallRequests?: ChatAssistantMessage['toolCallRequests']
+  showToolCallPreview: boolean
+  messageId: string
+  conversationId: string
+  onQuote: (payload: {
+    messageId: string
+    conversationId: string
+    content: string
+  }) => void
+  enableSelectionQuote: boolean
+  sources?: CitationSource[]
 }) {
   const { t } = useLanguage()
 
@@ -84,17 +141,18 @@ const AssistantTextRenderer = React.memo(function AssistantTextRenderer({
     () => parseTagContents(children),
     [children],
   )
+  const hasAnswerContent = useMemo(
+    () => hasRenderableAssistantContent(blocks),
+    [blocks],
+  )
 
-  const runningToolText = useMemo(() => {
-    if (generationState !== 'streaming' || !toolCallRequests?.length) {
+  const toolPreviewText = useMemo(() => {
+    if (!showToolCallPreview || !toolCallRequests?.length) {
       return null
     }
+    const labels = getToolLabels(t)
     const toolNames = toolCallRequests
-      .map((toolCall) => {
-        const rawName = toolCall.name
-        const delimiterIndex = rawName.indexOf('__')
-        return delimiterIndex >= 0 ? rawName.slice(delimiterIndex + 2) : rawName
-      })
+      .map((toolCall) => getToolDisplayInfo(toolCall, labels).displayName)
       .filter(
         (name, index, arr) => name.length > 0 && arr.indexOf(name) === index,
       )
@@ -102,25 +160,32 @@ const AssistantTextRenderer = React.memo(function AssistantTextRenderer({
       return t('chat.toolCall.status.running', 'Running')
     }
     return `${t('chat.toolCall.status.running', 'Running')}: ${toolNames.join(', ')}`
-  }, [generationState, t, toolCallRequests])
+  }, [showToolCallPreview, t, toolCallRequests])
 
-  return (
+  const renderedContent = (
     <>
       {blocks.map((block) => {
+        const MarkdownRenderer =
+          generationState === 'streaming' ? StreamingMarkdown : ObsidianMarkdown
         const blockKey =
           block.type === 'string' || block.type === 'think'
             ? `${block.type}-${block.content.slice(0, 64)}`
-            : `${block.type}-${block.filename ?? ''}-${block.startLine ?? ''}-${block.endLine ?? ''}-${block.language ?? ''}-${block.content.slice(0, 64)}`
+            : `${block.type}-${block.filename ?? ''}-${block.startLine ?? ''}-${block.endLine ?? ''}-${block.content.slice(0, 64)}`
 
         return block.type === 'string' ? (
           <div key={blockKey}>
-            <ObsidianMarkdown content={block.content} scale="sm" />
+            <MarkdownRenderer
+              content={block.content}
+              scale="sm"
+              animateIncrementalText={generationState === 'streaming'}
+              citationSources={sources}
+            />
           </div>
         ) : block.type === 'think' ? (
           <AssistantMessageReasoning
             key={blockKey}
             reasoning={block.content}
-            content={children}
+            hasAnswerContent={hasAnswerContent}
             generationState={generationState}
           />
         ) : block.startLine && block.endLine && block.filename ? (
@@ -129,6 +194,11 @@ const AssistantTextRenderer = React.memo(function AssistantTextRenderer({
             filename={block.filename}
             startLine={block.startLine}
             endLine={block.endLine}
+            previewContent={
+              block.filename.toLowerCase().endsWith('.pdf')
+                ? block.content
+                : undefined
+            }
           />
         ) : (
           <MarkdownCodeComponent
@@ -136,23 +206,23 @@ const AssistantTextRenderer = React.memo(function AssistantTextRenderer({
             onApply={onApply}
             isApplying={isApplying}
             activeApplyRequestKey={activeApplyRequestKey}
-            language={block.language}
             filename={block.filename}
+            generationState={generationState}
           >
             {block.content}
           </MarkdownCodeComponent>
         )
       })}
-      {runningToolText && (
-        <div className="smtcmp-toolcall-container smtcmp-assistant-tool-running-preview">
-          <div className="smtcmp-toolcall">
-            <div className="smtcmp-toolcall-header smtcmp-assistant-tool-running-preview-header">
-              <div className="smtcmp-toolcall-header-icon smtcmp-toolcall-header-icon--status-inline">
-                <Loader2 className="smtcmp-spinner" size={14} />
+      {toolPreviewText && (
+        <div className="yolo-toolcall-container yolo-assistant-tool-running-preview">
+          <div className="yolo-toolcall">
+            <div className="yolo-toolcall-header yolo-assistant-tool-running-preview-header">
+              <div className="yolo-toolcall-header-icon yolo-toolcall-header-icon--status-inline">
+                <Loader2 className="yolo-spinner" size={14} />
               </div>
-              <div className="smtcmp-toolcall-header-content">
-                <span className="smtcmp-toolcall-header-tool-name">
-                  {runningToolText}
+              <div className="yolo-toolcall-header-content">
+                <span className="yolo-toolcall-header-tool-name">
+                  {toolPreviewText}
                 </span>
               </div>
             </div>
@@ -160,5 +230,20 @@ const AssistantTextRenderer = React.memo(function AssistantTextRenderer({
         </div>
       )}
     </>
+  )
+
+  if (!enableSelectionQuote) {
+    return renderedContent
+  }
+
+  return (
+    <AssistantSelectionQuoteButton
+      messageId={messageId}
+      conversationId={conversationId}
+      disabled={generationState === 'streaming'}
+      onQuote={onQuote}
+    >
+      {renderedContent}
+    </AssistantSelectionQuoteButton>
   )
 })

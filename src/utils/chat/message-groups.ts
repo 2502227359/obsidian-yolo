@@ -6,7 +6,9 @@ import {
 
 export function groupAssistantAndToolMessages(
   messages: ChatMessage[],
+  assistantGroupBoundaryMessageIds: readonly string[] = [],
 ): (ChatUserMessage | AssistantToolMessageGroup)[] {
+  const breakBeforeMessageIdSet = new Set(assistantGroupBoundaryMessageIds)
   return messages.reduce(
     (
       acc: (ChatUserMessage | AssistantToolMessageGroup)[],
@@ -15,6 +17,9 @@ export function groupAssistantAndToolMessages(
       if (message.role === 'user') {
         // Always push user messages directly
         acc.push(message)
+      } else if (message.role === 'external_agent_result') {
+        // external_agent_result messages are rendered as standalone timeline items
+        acc.push([message])
       } else {
         // For assistant or tool messages, check if we can add to an existing group
         const lastItem = acc[acc.length - 1]
@@ -22,7 +27,8 @@ export function groupAssistantAndToolMessages(
         // If last item is an array (a group), and current message is an assistant or tool message, add to group
         if (
           Array.isArray(lastItem) &&
-          (message.role === 'assistant' || message.role === 'tool')
+          (message.role === 'assistant' || message.role === 'tool') &&
+          !breakBeforeMessageIdSet.has(message.id)
         ) {
           lastItem.push(message)
         } else {

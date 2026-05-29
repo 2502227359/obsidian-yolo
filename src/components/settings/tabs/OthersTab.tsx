@@ -1,35 +1,22 @@
-import { App } from 'obsidian'
-import React, { useEffect, useState } from 'react'
+import { App, Platform } from 'obsidian'
 
 import { useLanguage } from '../../../contexts/language-context'
 import { useSettings } from '../../../contexts/settings-context'
-import {
-  getYoloBaseDir,
-  getYoloSkillsDir,
-  normalizeVaultRelativeDir,
-} from '../../../core/paths/yoloPaths'
-import SmartComposerPlugin from '../../../main'
+import YoloPlugin from '../../../main'
 import { ObsidianButton } from '../../common/ObsidianButton'
 import { ObsidianDropdown } from '../../common/ObsidianDropdown'
 import { ObsidianSetting } from '../../common/ObsidianSetting'
-import { ObsidianTextInput } from '../../common/ObsidianTextInput'
+import { ChatPreferencesSection } from '../sections/ChatPreferencesSection'
 import { EtcSection } from '../sections/EtcSection'
 
 type OthersTabProps = {
   app: App
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
 }
 
 export function OthersTab({ app, plugin }: OthersTabProps) {
   const { t } = useLanguage()
   const { settings, setSettings } = useSettings()
-  const yoloBaseDir = getYoloBaseDir(settings)
-  const skillsDir = getYoloSkillsDir(settings)
-  const [yoloBaseDirInput, setYoloBaseDirInput] = useState(yoloBaseDir)
-
-  useEffect(() => {
-    setYoloBaseDirInput(yoloBaseDir)
-  }, [yoloBaseDir])
 
   const handleMentionDisplayModeChange = (value: string) => {
     if (value !== 'inline' && value !== 'badge') return
@@ -48,77 +35,200 @@ export function OthersTab({ app, plugin }: OthersTabProps) {
     })()
   }
 
-  const handleYoloBaseDirBlur = (value: string) => {
-    const normalized = normalizeVaultRelativeDir(value)
-    setYoloBaseDirInput(normalized)
-    if (normalized === yoloBaseDir) {
-      return
-    }
+  const handleMentionContextModeChange = (value: string) => {
+    if (value !== 'light' && value !== 'full') return
     void (async () => {
       try {
         await setSettings({
           ...settings,
-          yolo: {
-            ...(settings.yolo ?? { baseDir: 'YOLO' }),
-            baseDir: normalized,
+          chatOptions: {
+            ...settings.chatOptions,
+            mentionContextMode: value,
           },
         })
       } catch (error: unknown) {
-        console.error('Failed to update YOLO base dir', error)
+        console.error('Failed to update mention context mode', error)
+      }
+    })()
+  }
+
+  const handleChatApplyModeChange = (value: string) => {
+    if (value !== 'review-required' && value !== 'direct-apply') return
+    void (async () => {
+      try {
+        await setSettings({
+          ...settings,
+          chatOptions: {
+            ...settings.chatOptions,
+            chatApplyMode: value,
+          },
+        })
+      } catch (error: unknown) {
+        console.error('Failed to update chat apply mode', error)
+      }
+    })()
+  }
+
+  const handleRibbonClickActionChange = (value: string) => {
+    if (
+      value !== 'sidebar' &&
+      value !== 'tab' &&
+      value !== 'split' &&
+      value !== 'window' &&
+      value !== 'last'
+    ) {
+      return
+    }
+    if (value === 'window' && !Platform.isDesktop) return
+    void (async () => {
+      try {
+        await setSettings({
+          ...settings,
+          chatOptions: {
+            ...settings.chatOptions,
+            ribbonClickAction: value,
+          },
+        })
+      } catch (error: unknown) {
+        console.error('Failed to update ribbon click action', error)
       }
     })()
   }
 
   return (
     <>
-      <div className="smtcmp-settings-section">
+      <div className="yolo-settings-section">
         <ObsidianSetting
-          name={t('settings.supportSmartComposer.name')}
-          desc={t('settings.supportSmartComposer.desc')}
+          name={t('settings.supportYolo.name')}
+          desc={t('settings.supportYolo.desc')}
           heading
-          className="smtcmp-settings-support-smart-composer"
+          className="yolo-settings-support-yolo"
         >
           <ObsidianButton
-            text={t('settings.supportSmartComposer.buyMeACoffee')}
+            text={t('settings.supportYolo.buyMeACoffee')}
             onClick={() =>
               window.open('https://afdian.com/a/lapis0x0', '_blank')
             }
             cta
           />
         </ObsidianSetting>
-        <ObsidianSetting
-          name={t('settings.etc.yoloBaseDir', 'YOLO 根目录')}
-          desc={t(
-            'settings.etc.yoloBaseDirDesc',
-            '用于存放 YOLO 管理文件的库内相对目录（例如：Config/YOLO）。技能将从 {path} 加载。',
-          ).replace('{path}', skillsDir)}
-        >
-          <ObsidianTextInput
-            value={yoloBaseDirInput}
-            placeholder={t('settings.etc.yoloBaseDirPlaceholder', 'YOLO')}
-            onChange={setYoloBaseDirInput}
-            onBlur={handleYoloBaseDirBlur}
-          />
-        </ObsidianSetting>
-        <ObsidianSetting
-          name={t('settings.etc.mentionDisplayMode', '引用文件显示位置')}
-          desc={t(
-            'settings.etc.mentionDisplayModeDesc',
-            '选择 @ 添加文件后是在输入框内显示，还是在输入框顶部以徽章显示。',
-          )}
-        >
-          <ObsidianDropdown
-            value={settings.chatOptions.mentionDisplayMode ?? 'inline'}
-            options={{
-              inline: t('settings.etc.mentionDisplayModeInline', '输入框内'),
-              badge: t('settings.etc.mentionDisplayModeBadge', '顶部徽章'),
-            }}
-            onChange={handleMentionDisplayModeChange}
-          />
-        </ObsidianSetting>
       </div>
 
-      <EtcSection app={app} plugin={plugin} />
+      <div className="yolo-settings-section yolo-settings-section--tight">
+        <section className="yolo-settings-block">
+          <div className="yolo-settings-block-head">
+            <div className="yolo-settings-block-head-title-row">
+              <div className="yolo-settings-sub-header yolo-settings-block-title">
+                {t('settings.etc.interactionSectionTitle', 'Interaction')}
+              </div>
+            </div>
+          </div>
+
+          <div className="yolo-settings-block-content">
+            <ObsidianSetting
+              name={t('settings.etc.ribbonClickAction', '侧边栏图标点击位置')}
+              desc={t(
+                'settings.etc.ribbonClickActionDesc',
+                '选择点击左侧边栏 YOLO 图标时，Chat 视图在哪里打开。若选定位置已有 Chat 视图会直接激活复用，否则新建。',
+              )}
+              className="yolo-settings-card"
+            >
+              <ObsidianDropdown
+                value={settings.chatOptions.ribbonClickAction ?? 'sidebar'}
+                options={{
+                  sidebar: t(
+                    'settings.etc.ribbonClickActionSidebar',
+                    '右侧边栏',
+                  ),
+                  tab: t('settings.etc.ribbonClickActionTab', '新标签页'),
+                  split: t('settings.etc.ribbonClickActionSplit', '右侧分屏'),
+                  ...(Platform.isDesktop
+                    ? {
+                        window: t(
+                          'settings.etc.ribbonClickActionWindow',
+                          '独立窗口',
+                        ),
+                      }
+                    : {}),
+                  last: t('settings.etc.ribbonClickActionLast', '上次的位置'),
+                }}
+                onChange={handleRibbonClickActionChange}
+              />
+            </ObsidianSetting>
+            <ObsidianSetting
+              name={t('settings.etc.mentionDisplayMode', '引用内容显示位置')}
+              desc={t(
+                'settings.etc.mentionDisplayModeDesc',
+                '选择 @ 文件引用和 / 技能选择是在输入框内显示，还是在输入框顶部以徽章显示。',
+              )}
+              className="yolo-settings-card"
+            >
+              <ObsidianDropdown
+                value={settings.chatOptions.mentionDisplayMode ?? 'inline'}
+                options={{
+                  inline: t(
+                    'settings.etc.mentionDisplayModeInline',
+                    '输入框内',
+                  ),
+                  badge: t('settings.etc.mentionDisplayModeBadge', '顶部徽章'),
+                }}
+                onChange={handleMentionDisplayModeChange}
+              />
+            </ObsidianSetting>
+            <ObsidianSetting
+              name={t(
+                'settings.etc.mentionContextMode',
+                '@ 文件上下文注入模式',
+              )}
+              desc={t(
+                'settings.etc.mentionContextModeDesc',
+                '控制 @ 文件注入到模型的方式，在轻量模式下将会注入引用文件的路径、笔记属性和 Markdown 结构，鼓励 Agent 只读取必要的内容。',
+              )}
+              className="yolo-settings-card"
+            >
+              <ObsidianDropdown
+                value={settings.chatOptions.mentionContextMode ?? 'light'}
+                options={{
+                  light: t('settings.etc.mentionContextModeLight', '轻量模式'),
+                  full: t('settings.etc.mentionContextModeFull', '全量模式'),
+                }}
+                onChange={handleMentionContextModeChange}
+              />
+            </ObsidianSetting>
+            <ObsidianSetting
+              name={t('settings.etc.chatApplyMode', 'Chat 应用修改方式')}
+              desc={t(
+                'settings.etc.chatApplyModeDesc',
+                '仅影响 Chat 侧边栏中的“应用”。可选择先进入内联审阅，或直接写入文件。关闭审阅后，点击应用将不再需要二次审批。',
+              )}
+              className="yolo-settings-card"
+            >
+              <ObsidianDropdown
+                value={settings.chatOptions.chatApplyMode ?? 'review-required'}
+                options={{
+                  'review-required': t(
+                    'settings.etc.chatApplyModeReviewRequired',
+                    '先审阅后应用',
+                  ),
+                  'direct-apply': t(
+                    'settings.etc.chatApplyModeDirectApply',
+                    '直接写入文件',
+                  ),
+                }}
+                onChange={handleChatApplyModeChange}
+              />
+            </ObsidianSetting>
+
+            <ChatPreferencesSection embedded />
+          </div>
+        </section>
+      </div>
+
+      <EtcSection
+        app={app}
+        plugin={plugin}
+        className="yolo-settings-section--tight"
+      />
     </>
   )
 }

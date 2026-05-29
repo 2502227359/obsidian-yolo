@@ -1,20 +1,41 @@
 import {
   ChatCompletion,
   ChatCompletionChunk,
+  ChatCompletionMessageParam,
 } from 'openai/resources/chat/completions'
 
+import { RequestMessage } from '../../types/llm/request'
 import {
   LLMResponseNonStreaming,
   LLMResponseStreaming,
 } from '../../types/llm/response'
 
-import { OpenAIMessageAdapter } from './openaiMessageAdapter'
+import {
+  OpenAIMessageAdapter,
+  normalizeOpenAICompatUsage,
+} from './openaiMessageAdapter'
 
 /**
  * Adapter for DeepSeek's API that extends OpenAIMessageAdapter to handle the additional
  * 'reasoning_content' field in DeepSeek's response format while maintaining OpenAI compatibility.
  */
 export class DeepSeekMessageAdapter extends OpenAIMessageAdapter {
+  protected parseRequestMessage(
+    message: RequestMessage,
+  ): ChatCompletionMessageParam {
+    const parsed = super.parseRequestMessage(
+      message,
+    ) as ChatCompletionMessageParam & {
+      reasoning_content?: string
+    }
+
+    if (message.role === 'assistant' && message.reasoning) {
+      parsed.reasoning_content = message.reasoning
+    }
+
+    return parsed
+  }
+
   protected parseNonStreamingResponse(
     response: ChatCompletion,
   ): LLMResponseNonStreaming {
@@ -35,7 +56,7 @@ export class DeepSeekMessageAdapter extends OpenAIMessageAdapter {
       model: response.model,
       object: 'chat.completion',
       system_fingerprint: response.system_fingerprint,
-      usage: response.usage,
+      usage: normalizeOpenAICompatUsage(response.usage),
     }
   }
 
@@ -58,7 +79,7 @@ export class DeepSeekMessageAdapter extends OpenAIMessageAdapter {
       model: chunk.model,
       object: 'chat.completion.chunk',
       system_fingerprint: chunk.system_fingerprint,
-      usage: chunk.usage ?? undefined,
+      usage: normalizeOpenAICompatUsage(chunk.usage),
     }
   }
 }

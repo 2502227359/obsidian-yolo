@@ -1,16 +1,28 @@
-import { App, Notice } from 'obsidian'
+import { App, Notice, Platform } from 'obsidian'
 import { useState } from 'react'
 
-import { PROVIDER_TYPES_INFO } from '../../../constants'
+import {
+  PROMPT_CACHING_SETTING,
+  PROVIDER_API_INFO,
+  PROVIDER_PRESET_INFO,
+} from '../../../constants'
 import { useLanguage } from '../../../contexts/language-context'
-import SmartComposerPlugin from '../../../main'
-import { chatModelSchema } from '../../../types/chat-model.types'
-import { embeddingModelSchema } from '../../../types/embedding-model.types'
+import YoloPlugin from '../../../main'
 import {
   LLMProvider,
+  LLMProviderPresetType,
   ProviderHeader,
+  getDefaultApiTypeForPresetType,
+  getDefaultRequestTransportModeForPresetType,
+  getSupportedApiTypesForPresetType,
   llmProviderSchema,
 } from '../../../types/provider.types'
+import { getDefaultBaseUrlForPreset } from '../../../utils/llm/provider-base-url'
+import {
+  getRequestTransportModeValue,
+  providerSupportsTransportModeSelection,
+  reconcileEmbeddingModelsForProviderUpdate,
+} from '../../../utils/llm/provider-config'
 import { sanitizeProviderHeaders } from '../../../utils/llm/provider-headers'
 import { ObsidianButton } from '../../common/ObsidianButton'
 import { ObsidianDropdown } from '../../common/ObsidianDropdown'
@@ -20,16 +32,23 @@ import { ObsidianToggle } from '../../common/ObsidianToggle'
 import { ReactModal } from '../../common/ReactModal'
 
 type ProviderFormComponentProps = {
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
   provider: LLMProvider | null // null for new provider
+  initialPresetType?: LLMProviderPresetType
 }
 
+const CUSTOM_PROVIDER_TYPE_ENTRIES = Object.entries(PROVIDER_PRESET_INFO)
+
 export class AddProviderModal extends ReactModal<ProviderFormComponentProps> {
-  constructor(app: App, plugin: SmartComposerPlugin) {
+  constructor(
+    app: App,
+    plugin: YoloPlugin,
+    initialPresetType?: LLMProviderPresetType,
+  ) {
     super({
       app: app,
       Component: ProviderFormComponent,
-      props: { plugin, provider: null },
+      props: { plugin, provider: null, initialPresetType },
       options: {
         title: 'Add custom provider', // Will be translated in component
       },
@@ -39,7 +58,7 @@ export class AddProviderModal extends ReactModal<ProviderFormComponentProps> {
 }
 
 export class EditProviderModal extends ReactModal<ProviderFormComponentProps> {
-  constructor(app: App, plugin: SmartComposerPlugin, provider: LLMProvider) {
+  constructor(app: App, plugin: YoloPlugin, provider: LLMProvider) {
     super({
       app: app,
       Component: ProviderFormComponent,
@@ -55,9 +74,23 @@ export class EditProviderModal extends ReactModal<ProviderFormComponentProps> {
 function ProviderFormComponent({
   plugin,
   provider,
+  initialPresetType,
   onClose,
 }: ProviderFormComponentProps & { onClose: () => void }) {
   const { t } = useLanguage()
+  const getDefaultAdditionalSettings = (
+    presetType: LLMProvider['presetType'],
+  ): LLMProvider['additionalSettings'] => {
+    const requestTransportMode = getDefaultRequestTransportModeForPresetType(
+      presetType,
+      Platform.isDesktop,
+    )
+    if (!requestTransportMode) {
+      return undefined
+    }
+
+    return { requestTransportMode }
+  }
 
   const [formData, setFormData] = useState<LLMProvider>(
     provider
@@ -67,12 +100,17 @@ function ProviderFormComponent({
             ? { ...provider.additionalSettings }
             : undefined,
         } as LLMProvider)
-      : {
-          type: 'openai-compatible',
-          id: '',
-          apiKey: '',
-          baseUrl: '',
-        },
+      : ((): LLMProvider => {
+          const presetType = initialPresetType ?? 'openai-compatible'
+          return {
+            presetType,
+            apiType: getDefaultApiTypeForPresetType(presetType),
+            id: '',
+            apiKey: '',
+            baseUrl: getDefaultBaseUrlForPreset(presetType) ?? '',
+            additionalSettings: getDefaultAdditionalSettings(presetType),
+          } as LLMProvider
+        })(),
   )
   const handleSubmit = () => {
     const execute = async () => {
@@ -117,13 +155,17 @@ function ProviderFormComponent({
 
         const validatedProvider = validationResult.data
         const providerIdChanged = provider.id !== validatedProvider.id
-        const providerTypeChanged = provider.type !== validatedProvider.type
-
+        const providerPresetChanged =
+          provider.presetType !== validatedProvider.presetType
+        const providerApiChanged =
+          provider.apiType !== validatedProvider.apiType
         const updatedProviders = [...plugin.settings.providers]
         updatedProviders[providerIndex] = validatedProvider
 
+        const becameOpenRouter =
+          providerPresetChanged && validatedProvider.presetType === 'openrouter'
         const updatedChatModels =
-          providerIdChanged || providerTypeChanged
+          providerIdChanged || becameOpenRouter
             ? plugin.settings.chatModels.map((model) => {
                 if (model.providerId !== provider.id) {
                   return model
@@ -133,34 +175,22 @@ function ProviderFormComponent({
                   ...(providerIdChanged
                     ? { providerId: validatedProvider.id }
                     : {}),
-                  ...(providerTypeChanged
-                    ? { providerType: validatedProvider.type }
+                  ...(becameOpenRouter &&
+                  model.builtinToolProvider !== 'none' &&
+                  model.builtinToolProvider !== 'openrouter'
+                    ? { builtinToolProvider: 'none' as const }
                     : {}),
                 }
-                return providerTypeChanged
-                  ? chatModelSchema.parse(updatedModel)
-                  : updatedModel
+                return updatedModel
               })
             : plugin.settings.chatModels
 
-        const updatedEmbeddingModels =
-          providerIdChanged || providerTypeChanged
-            ? plugin.settings.embeddingModels.map((model) => {
-                if (model.providerId !== provider.id) {
-                  return model
-                }
-                const updatedModel = {
-                  ...model,
-                  ...(providerIdChanged
-                    ? { providerId: validatedProvider.id }
-                    : {}),
-                  ...(providerTypeChanged
-                    ? { providerType: validatedProvider.type }
-                    : {}),
-                }
-                return providerTypeChanged
-                  ? embeddingModelSchema.parse(updatedModel)
-                  : updatedModel
+        const updatedEmbeddingModels: typeof plugin.settings.embeddingModels =
+          providerIdChanged || providerPresetChanged || providerApiChanged
+            ? reconcileEmbeddingModelsForProviderUpdate({
+                embeddingModels: plugin.settings.embeddingModels,
+                previousProvider: provider,
+                nextProvider: validatedProvider,
               })
             : plugin.settings.embeddingModels
 
@@ -201,15 +231,71 @@ function ProviderFormComponent({
     }
 
     void execute().catch((error) => {
-      console.error('[Smart Composer] Failed to save provider:', error)
+      console.error('[YOLO] Failed to save provider:', error)
       new Notice('Failed to save provider settings.')
     })
   }
 
-  const providerTypeInfo = PROVIDER_TYPES_INFO[formData.type]
+  const providerTypeInfo = PROVIDER_PRESET_INFO[formData.presetType]
+  const providerApiOptions = Object.fromEntries(
+    getSupportedApiTypesForPresetType(formData.presetType).map((apiType) => [
+      apiType,
+      PROVIDER_API_INFO[apiType].label,
+    ]),
+  )
+  const shouldHideCredentialFields =
+    formData.presetType === 'chatgpt-oauth' ||
+    formData.presetType === 'gemini-oauth' ||
+    formData.presetType === 'qwen-oauth'
+  const shouldShowBaseUrlField =
+    !shouldHideCredentialFields &&
+    !(
+      formData.presetType === 'amazon-bedrock' &&
+      formData.apiType === 'amazon-bedrock'
+    )
+  const requestTransportOptions = {
+    auto: t('settings.providers.requestTransportModeAuto'),
+    browser: t('settings.providers.requestTransportModeBrowser'),
+    obsidian: t('settings.providers.requestTransportModeObsidian'),
+    ...(Platform.isDesktop
+      ? {
+          node: t('settings.providers.requestTransportModeNode'),
+        }
+      : {}),
+  }
+  type AdditionalSettingEntry =
+    | (typeof providerTypeInfo.additionalSettings)[number]
+    | typeof PROMPT_CACHING_SETTING
+  const baseAdditionalSettings: AdditionalSettingEntry[] =
+    formData.apiType === 'anthropic'
+      ? [PROMPT_CACHING_SETTING, ...providerTypeInfo.additionalSettings]
+      : [...providerTypeInfo.additionalSettings]
+  const visibleAdditionalSettings = baseAdditionalSettings.filter(
+    (setting) =>
+      setting.key !== 'requestTransportMode' ||
+      providerSupportsTransportModeSelection(formData),
+  )
+  const apiKeyDesc =
+    formData.presetType === 'amazon-bedrock'
+      ? 'Enter your Amazon Bedrock API key / bearer token.'
+      : t('settings.providers.apiKeyDesc')
+  const apiKeyPlaceholder =
+    formData.presetType === 'amazon-bedrock'
+      ? 'Enter your Amazon Bedrock API key'
+      : t('settings.providers.apiKeyPlaceholder')
+  const baseUrlDesc =
+    formData.presetType === 'amazon-bedrock' &&
+    formData.apiType === 'openai-compatible'
+      ? 'Optional override. Leave empty to use the region-derived Bedrock Mantle endpoint.'
+      : t('settings.providers.baseUrlDesc')
+  const baseUrlPlaceholder =
+    formData.presetType === 'amazon-bedrock' &&
+    formData.apiType === 'openai-compatible'
+      ? 'https://bedrock-mantle.us-east-1.api.aws'
+      : t('settings.providers.baseUrlPlaceholder')
 
   return (
-    <div className="smtcmp-provider-form">
+    <div className="yolo-provider-form">
       <ObsidianSetting
         name={t('settings.providers.providerId', 'ID')}
         desc={t(
@@ -230,69 +316,94 @@ function ProviderFormComponent({
         />
       </ObsidianSetting>
 
-      <ObsidianSetting name="Provider type" required>
+      <ObsidianSetting name="Provider preset" required>
         <ObsidianDropdown
-          value={formData.type}
+          value={formData.presetType}
           options={Object.fromEntries(
-            Object.entries(PROVIDER_TYPES_INFO).map(([key, info]) => [
+            CUSTOM_PROVIDER_TYPE_ENTRIES.map(([key, info]) => [
               key,
               info.label,
             ]),
           )}
           onChange={(value: string) =>
-            setFormData(
-              (prev) =>
-                ({
-                  ...prev,
-                  type: value,
-                  additionalSettings: {},
-                }) as LLMProvider,
-            )
+            setFormData((prev) => {
+              const nextPreset = value as LLMProvider['presetType']
+              return {
+                ...prev,
+                presetType: nextPreset,
+                apiType: getDefaultApiTypeForPresetType(nextPreset),
+                additionalSettings: getDefaultAdditionalSettings(nextPreset),
+                baseUrl: getDefaultBaseUrlForPreset(nextPreset) ?? '',
+              } as LLMProvider
+            })
           }
         />
       </ObsidianSetting>
 
-      <ObsidianSetting
-        name={t('settings.providers.apiKey')}
-        desc={t('settings.providers.apiKeyDesc')}
-        required={providerTypeInfo.requireApiKey}
-      >
-        <ObsidianTextInput
-          value={formData.apiKey ?? ''}
-          placeholder={t('settings.providers.apiKeyPlaceholder')}
+      <ObsidianSetting name="API type" required>
+        <ObsidianDropdown
+          value={formData.apiType}
+          options={providerApiOptions}
           onChange={(value: string) =>
-            setFormData((prev) => ({ ...prev, apiKey: value }))
+            setFormData((prev) => ({
+              ...prev,
+              apiType: value as LLMProvider['apiType'],
+            }))
           }
         />
       </ObsidianSetting>
 
-      <ObsidianSetting
-        name={t('settings.providers.baseUrl')}
-        desc={t('settings.providers.baseUrlDesc')}
-        required={providerTypeInfo.requireBaseUrl}
-      >
-        <ObsidianTextInput
-          value={formData.baseUrl ?? ''}
-          placeholder={t('settings.providers.baseUrlPlaceholder')}
-          onChange={(value: string) =>
-            setFormData((prev) => ({ ...prev, baseUrl: value }))
-          }
-        />
-      </ObsidianSetting>
+      {!shouldHideCredentialFields && (
+        <>
+          <ObsidianSetting
+            name={t('settings.providers.apiKey')}
+            desc={apiKeyDesc}
+            required={providerTypeInfo.requireApiKey}
+          >
+            <ObsidianTextInput
+              value={formData.apiKey ?? ''}
+              placeholder={apiKeyPlaceholder}
+              onChange={(value: string) =>
+                setFormData((prev) => ({ ...prev, apiKey: value }))
+              }
+            />
+          </ObsidianSetting>
 
-      {providerTypeInfo.additionalSettings.map((setting) => {
+          {shouldShowBaseUrlField && (
+            <ObsidianSetting
+              name={t('settings.providers.baseUrl')}
+              desc={baseUrlDesc}
+              required={providerTypeInfo.requireBaseUrl}
+            >
+              <ObsidianTextInput
+                value={formData.baseUrl ?? ''}
+                placeholder={baseUrlPlaceholder}
+                onChange={(value: string) =>
+                  setFormData((prev) => ({ ...prev, baseUrl: value }))
+                }
+              />
+            </ObsidianSetting>
+          )}
+        </>
+      )}
+
+      {visibleAdditionalSettings.map((setting) => {
         const label =
           setting.key === 'noStainless'
             ? t('settings.providers.noStainlessHeaders')
-            : setting.key === 'useObsidianRequestUrl'
-              ? t('settings.providers.useObsidianRequestUrl')
-              : setting.label
+            : setting.key === 'requestTransportMode'
+              ? t('settings.providers.requestTransportMode')
+              : setting.key === 'promptCaching'
+                ? t('settings.providers.promptCaching')
+                : setting.label
         const description =
           setting.key === 'noStainless'
             ? t('settings.providers.noStainlessHeadersDesc')
-            : setting.key === 'useObsidianRequestUrl'
-              ? t('settings.providers.useObsidianRequestUrlDesc')
-              : (setting as { description?: string }).description
+            : setting.key === 'requestTransportMode'
+              ? t('settings.providers.requestTransportModeDesc')
+              : setting.key === 'promptCaching'
+                ? t('settings.providers.promptCachingDesc')
+                : (setting as { description?: string }).description
 
         return (
           <ObsidianSetting
@@ -309,6 +420,25 @@ function ProviderFormComponent({
                   ] ?? false
                 }
                 onChange={(value: boolean) =>
+                  setFormData(
+                    (prev) =>
+                      ({
+                        ...prev,
+                        additionalSettings: {
+                          ...(prev.additionalSettings ?? {}),
+                          [setting.key]: value,
+                        },
+                      }) as LLMProvider,
+                  )
+                }
+              />
+            ) : setting.type === 'select' ? (
+              <ObsidianDropdown
+                value={getRequestTransportModeValue(
+                  formData.additionalSettings,
+                )}
+                options={requestTransportOptions}
+                onChange={(value: string) =>
                   setFormData(
                     (prev) =>
                       ({
@@ -368,7 +498,7 @@ function ProviderFormComponent({
       {(formData.customHeaders ?? []).map((header, index) => (
         <ObsidianSetting
           key={`${header.key}-${header.value}-${index}`}
-          className="smtcmp-settings-kv-entry smtcmp-settings-kv-entry--inline smtcmp-provider-headers-entry"
+          className="yolo-settings-kv-entry yolo-settings-kv-entry--inline yolo-provider-headers-entry"
         >
           <ObsidianTextInput
             value={header.key}

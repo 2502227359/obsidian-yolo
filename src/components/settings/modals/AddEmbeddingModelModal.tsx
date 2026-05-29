@@ -1,22 +1,24 @@
 import { GoogleGenAI } from '@google/genai'
 import { App, Notice, requestUrl } from 'obsidian'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { useLanguage } from '../../../contexts/language-context'
+import { listBedrockEmbeddingModelIds } from '../../../core/llm/bedrockCatalog'
 import { extractEmbeddingVector } from '../../../core/llm/embedding-utils'
 import { getProviderClient } from '../../../core/llm/manager'
 import { supportedDimensionsForIndex } from '../../../database/schema'
-import SmartComposerPlugin from '../../../main'
+import YoloPlugin from '../../../main'
 import {
   EmbeddingModel,
   embeddingModelSchema,
 } from '../../../types/embedding-model.types'
 import { LLMProvider } from '../../../types/provider.types'
+import { resolveProviderBaseUrl } from '../../../utils/llm/provider-base-url'
+import { toProviderHeadersRecord } from '../../../utils/llm/provider-headers'
 import {
   ensureUniqueModelId,
   generateModelId,
 } from '../../../utils/model-id-utils'
-import { toProviderHeadersRecord } from '../../../utils/llm/provider-headers'
 import { ObsidianButton } from '../../common/ObsidianButton'
 import { ObsidianSetting } from '../../common/ObsidianSetting'
 import { ObsidianTextInput } from '../../common/ObsidianTextInput'
@@ -25,7 +27,7 @@ import { SearchableDropdown } from '../../common/SearchableDropdown'
 import { ConfirmModal } from '../../modals/ConfirmModal'
 
 type AddEmbeddingModelModalComponentProps = {
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
   provider?: LLMProvider
 }
 
@@ -53,8 +55,25 @@ const collectModelIdentifiers = (values: unknown[]): string[] =>
     .map((entry) => extractModelIdentifier(entry))
     .filter((id): id is string => Boolean(id))
 
+const sortModelsForEmbedding = (models: string[]): string[] => {
+  const embeddingKeywords = ['embedding', 'embed', 'text-embedding']
+  const embeddingModels: string[] = []
+  const otherModels: string[] = []
+
+  models.forEach((model) => {
+    const modelLower = model.toLowerCase()
+    if (embeddingKeywords.some((keyword) => modelLower.includes(keyword))) {
+      embeddingModels.push(model)
+      return
+    }
+    otherModels.push(model)
+  })
+
+  return [...embeddingModels.sort(), ...otherModels.sort()]
+}
+
 export class AddEmbeddingModelModal extends ReactModal<AddEmbeddingModelModalComponentProps> {
-  constructor(app: App, plugin: SmartComposerPlugin, provider?: LLMProvider) {
+  constructor(app: App, plugin: YoloPlugin, provider?: LLMProvider) {
     super({
       app: app,
       Component: AddEmbeddingModelModalComponent,
@@ -76,10 +95,8 @@ function AddEmbeddingModelModalComponent({
   const selectedProvider: LLMProvider | undefined =
     provider ?? plugin.settings.providers[0]
   const initialProviderId = selectedProvider?.id ?? ''
-  const initialProviderType = selectedProvider?.type ?? 'openai-compatible'
   const [formData, setFormData] = useState<Omit<EmbeddingModel, 'dimension'>>({
     providerId: initialProviderId,
-    providerType: initialProviderType,
     id: '',
     model: '',
     name: undefined,
@@ -89,24 +106,8 @@ function AddEmbeddingModelModalComponent({
   const [availableModels, setAvailableModels] = useState<string[]>([])
   const [loadingModels, setLoadingModels] = useState<boolean>(false)
   const [loadError, setLoadError] = useState<string | null>(null)
-
-  // Sort models with embedding-related ones first
-  const sortModelsForEmbedding = (models: string[]): string[] => {
-    const embeddingKeywords = ['embedding', 'embed', 'text-embedding']
-    const embeddingModels: string[] = []
-    const otherModels: string[] = []
-
-    models.forEach((model) => {
-      const modelLower = model.toLowerCase()
-      if (embeddingKeywords.some((keyword) => modelLower.includes(keyword))) {
-        embeddingModels.push(model)
-      } else {
-        otherModels.push(model)
-      }
-    })
-
-    return [...embeddingModels.sort(), ...otherModels.sort()]
-  }
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const isSubmittingRef = useRef(false)
 
   useEffect(() => {
     const fetchModels = async () => {
@@ -117,7 +118,10 @@ function AddEmbeddingModelModalComponent({
       }
 
       // Check cache first
-      const cachedModels = plugin.getCachedModelList(selectedProvider.id)
+      const cachedModels = plugin.getCachedModelList(
+        selectedProvider.id,
+        'embedding',
+      )
       if (cachedModels) {
         const sorted = sortModelsForEmbedding(cachedModels)
         setAvailableModels(sorted)
@@ -132,35 +136,31 @@ function AddEmbeddingModelModalComponent({
           selectedProvider.customHeaders,
         )
         const isOpenAIStyle =
-          selectedProvider.type === 'openai' ||
-          selectedProvider.type === 'openai-compatible' ||
-          selectedProvider.type === 'openrouter' ||
-          selectedProvider.type === 'groq' ||
-          selectedProvider.type === 'mistral' ||
-          selectedProvider.type === 'perplexity' ||
-          selectedProvider.type === 'deepseek'
+          selectedProvider.apiType === 'openai-compatible' ||
+          selectedProvider.apiType === 'openai-responses'
+
+        if (selectedProvider.apiType === 'amazon-bedrock') {
+          const unique = await listBedrockEmbeddingModelIds(selectedProvider)
+          const sorted = sortModelsForEmbedding(unique)
+          setAvailableModels(sorted)
+          plugin.setCachedModelList(selectedProvider.id, unique, 'embedding')
+          return
+        }
 
         if (isOpenAIStyle) {
-          const base = ((): string => {
-            // default OpenAI base when not provided
-            const cleaned = selectedProvider.baseUrl?.replace(/\/+$/, '')
-            if (cleaned && cleaned.length > 0) return cleaned
-            if (selectedProvider.type === 'openai')
-              return 'https://api.openai.com/v1'
-            if (selectedProvider.type === 'openrouter')
-              return 'https://openrouter.ai/api/v1'
-            return '' // no base => skip
-          })()
+          const base = resolveProviderBaseUrl(selectedProvider) ?? ''
 
           if (base) {
             const baseNorm = base.replace(/\/+$/, '')
             const urlCandidates: string[] = []
             if (baseNorm.endsWith('/v1')) {
-              // Try with v1 first, then without v1
+              // Prefer embedding-specific list (OpenRouter exposes it here),
+              // then fall back to the generic models endpoint.
+              urlCandidates.push(`${baseNorm}/embeddings/models`)
               urlCandidates.push(`${baseNorm}/models`)
               urlCandidates.push(`${baseNorm.replace(/\/v1$/, '')}/models`)
             } else {
-              // Try without v1 first, then with v1
+              urlCandidates.push(`${baseNorm}/v1/embeddings/models`)
               urlCandidates.push(`${baseNorm}/models`)
               urlCandidates.push(`${baseNorm}/v1/models`)
             }
@@ -206,7 +206,11 @@ function AddEmbeddingModelModalComponent({
                 const sorted = sortModelsForEmbedding(unique)
                 setAvailableModels(sorted)
                 // Cache the result (unsorted for consistency)
-                plugin.setCachedModelList(selectedProvider.id, unique)
+                plugin.setCachedModelList(
+                  selectedProvider.id,
+                  unique,
+                  'embedding',
+                )
                 fetched = true
                 break
               } catch (error) {
@@ -222,7 +226,7 @@ function AddEmbeddingModelModalComponent({
           }
         }
 
-        if (selectedProvider.type === 'gemini') {
+        if (selectedProvider.apiType === 'gemini') {
           const ai = new GoogleGenAI({
             apiKey: selectedProvider.apiKey ?? '',
             httpOptions: providerHeaders
@@ -249,7 +253,7 @@ function AddEmbeddingModelModalComponent({
           const sorted = sortModelsForEmbedding(unique)
           setAvailableModels(sorted)
           // Cache the result (unsorted for consistency)
-          plugin.setCachedModelList(selectedProvider.id, unique)
+          plugin.setCachedModelList(selectedProvider.id, unique, 'embedding')
           return
         }
       } catch (err: unknown) {
@@ -267,11 +271,32 @@ function AddEmbeddingModelModalComponent({
 
   const handleSubmit = () => {
     const run = async () => {
+      if (isSubmittingRef.current) {
+        return
+      }
+
+      if (!formData.model || formData.model.trim().length === 0) {
+        throw new Error('Model ID is required')
+      }
+
+      isSubmittingRef.current = true
+      setIsSubmitting(true)
+
       // Generate internal id (provider/model) and ensure uniqueness by suffix if needed
       const baseInternalId = generateModelId(
         formData.providerId,
         formData.model,
       )
+      const duplicatedModel = plugin.settings.embeddingModels.find(
+        (model) =>
+          model.providerId === formData.providerId &&
+          model.model === formData.model,
+      )
+
+      if (duplicatedModel) {
+        throw new Error('This embedding model has already been added')
+      }
+
       const existingIds = plugin.settings.embeddingModels.map((m) => m.id)
       const modelIdWithPrefix = ensureUniqueModelId(existingIds, baseInternalId)
 
@@ -319,6 +344,7 @@ function AddEmbeddingModelModalComponent({
             ? formData.name
             : formData.model,
         dimension,
+        nativeDimension: dimension,
       }
 
       const validationResult = embeddingModelSchema.safeParse(embeddingModel)
@@ -337,15 +363,25 @@ function AddEmbeddingModelModalComponent({
       onClose()
     }
 
-    void run().catch((error) => {
-      new Notice(
-        error instanceof Error ? error.message : 'An unknown error occurred',
-      )
-    })
+    void run()
+      .catch((error) => {
+        new Notice(
+          error instanceof Error ? error.message : 'An unknown error occurred',
+        )
+      })
+      .finally(() => {
+        isSubmittingRef.current = false
+        setIsSubmitting(false)
+      })
   }
 
   return (
-    <>
+    <div
+      aria-busy={isSubmitting}
+      style={{
+        opacity: isSubmitting ? 0.7 : 1,
+      }}
+    >
       {/* Available models dropdown (moved above other fields) */}
       <ObsidianSetting
         name={
@@ -370,7 +406,9 @@ function AddEmbeddingModelModalComponent({
               name: value, // Always update display name with the selected model
             }))
           }}
-          disabled={loadingModels || availableModels.length === 0}
+          disabled={
+            isSubmitting || loadingModels || availableModels.length === 0
+          }
           loading={loadingModels}
           placeholder={t('settings.models.searchModels') || 'Search models...'}
         />
@@ -381,6 +419,7 @@ function AddEmbeddingModelModalComponent({
         <ObsidianTextInput
           value={formData.name ?? ''}
           placeholder={t('settings.models.modelNamePlaceholder')}
+          disabled={isSubmitting}
           onChange={(value: string) =>
             setFormData((prev) => ({ ...prev, name: value }))
           }
@@ -396,6 +435,7 @@ function AddEmbeddingModelModalComponent({
         <ObsidianTextInput
           value={formData.model}
           placeholder={t('settings.models.modelIdPlaceholder')}
+          disabled={isSubmitting}
           onChange={(value: string) =>
             setFormData((prev) => ({ ...prev, model: value }))
           }
@@ -403,9 +443,18 @@ function AddEmbeddingModelModalComponent({
       </ObsidianSetting>
 
       <ObsidianSetting>
-        <ObsidianButton text={t('common.add')} onClick={handleSubmit} cta />
-        <ObsidianButton text={t('common.cancel')} onClick={onClose} />
+        <ObsidianButton
+          text={isSubmitting ? t('common.probingDimension') : t('common.add')}
+          onClick={handleSubmit}
+          cta
+          disabled={isSubmitting}
+        />
+        <ObsidianButton
+          text={t('common.cancel')}
+          onClick={onClose}
+          disabled={isSubmitting}
+        />
       </ObsidianSetting>
-    </>
+    </div>
   )
 }

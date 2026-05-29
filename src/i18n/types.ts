@@ -4,6 +4,12 @@ export type TranslationKeys = {
   // Commands
   commands: {
     openChat: string
+    openChatSidebar: string
+    newChatCurrentView: string
+    openYoloNewChat: string
+    openNewChatTab: string
+    openNewChatSplit: string
+    openNewChatWindow: string
     addSelectionToChat: string
     addFileToChat: string
     addFolderToChat: string
@@ -17,6 +23,9 @@ export type TranslationKeys = {
     triggerQuickAsk: string
     triggerTabCompletion: string
     acceptInlineSuggestion: string
+    capturePdfRegion?: string
+    exportSettings?: string
+    importSettings?: string
   }
 
   // UI Common
@@ -26,6 +35,8 @@ export type TranslationKeys = {
     delete: string
     edit: string
     add: string
+    adding: string
+    probingDimension: string
     clear: string
     remove: string
     confirm: string
@@ -46,6 +57,7 @@ export type TranslationKeys = {
     on?: string
     off?: string
     noResults?: string
+    configure?: string
   }
 
   sidebar?: {
@@ -60,6 +72,12 @@ export type TranslationKeys = {
       retryTitle?: string
       archived?: string
       hideArchived?: string
+      exportConversation?: string
+      moreActions?: string
+    }
+    chat?: {
+      exportSuccess?: string
+      exportError?: string
     }
     composer: {
       title: string
@@ -116,7 +134,7 @@ export type TranslationKeys = {
       agent: string
       others: string
     }
-    supportSmartComposer: {
+    supportYolo: {
       name: string
       desc: string
       buyMeACoffee: string
@@ -125,27 +143,25 @@ export type TranslationKeys = {
       title: string
       defaultChatModel: string
       defaultChatModelDesc: string
-      toolModel: string
-      toolModelDesc: string
+      chatTitleModel: string
+      chatTitleModelDesc: string
+      streamFallbackRecovery?: string
+      streamFallbackRecoveryDesc?: string
+      primaryRequestTimeout?: string
+      primaryRequestTimeoutDesc?: string
       globalSystemPrompt: string
       globalSystemPromptDesc: string
       continuationSystemPrompt: string
       continuationSystemPromptDesc: string
       chatTitlePrompt: string
       chatTitlePromptDesc: string
-      baseModelSpecialPrompt?: string
-      baseModelSpecialPromptDesc?: string
       tabCompletionSystemPrompt?: string
       tabCompletionSystemPromptDesc?: string
     }
     chatPreferences: {
       title: string
-      includeCurrentFile: string
-      includeCurrentFileDesc: string
-      historyArchiveEnabled?: string
-      historyArchiveEnabledDesc?: string
-      historyArchiveThreshold?: string
-      historyArchiveThresholdDesc?: string
+      chatFontScale?: string
+      chatFontScaleDesc?: string
     }
     assistants: {
       title: string
@@ -178,10 +194,10 @@ export type TranslationKeys = {
       addAssistantAria?: string
       deleteAssistantAria?: string
       dragHandleAria?: string
-      maxContextMessagesDesc?: string
       duplicate?: string
       copySuffix?: string
       currentBadge?: string
+      manageAll?: string
     }
     agent?: {
       title?: string
@@ -203,6 +219,59 @@ export type TranslationKeys = {
       skillsEmptyHint?: string
       createSkillTemplates?: string
       skillsTemplateCreated?: string
+      importSkill?: string
+      importSkillDesc?: string
+      importSkillDropzoneText?: string
+      importSkillBrowseFiles?: string
+      importSkillBrowseFolder?: string
+      importSkillFileCount?: string
+      importSkillFilesInPackage?: string
+      importSkillRemoveFile?: string
+      importSkillConfirm?: string
+      importSkillSuccess?: string
+      importSkillInvalidFile?: string
+      importSkillReadError?: string
+      importSkillWriteError?: string
+      importSkillErrHeader?: string
+      importSkillErrNoSkillMd?: string
+      importSkillErrNoFrontmatter?: string
+      importSkillErrNoName?: string
+      importSkillErrNameTooLong?: string
+      importSkillErrNameUppercase?: string
+      importSkillErrNameHyphenEdge?: string
+      importSkillErrNameDoubleHyphen?: string
+      importSkillErrNameInvalidChars?: string
+      importSkillErrNameMismatch?: string
+      importSkillErrNoDescription?: string
+      importSkillErrDescTooLong?: string
+      importSkillErrCompatTooLong?: string
+      importSkillConflictTitle?: string
+      importSkillConflictMessage?: string
+      importSkillConflictMessageList?: string
+      importSkillConflictOverwrite?: string
+      importSkillConflictSkip?: string
+      importSkillUnsafePath?: string
+      importSkillDuplicateInBatch?: string
+      importSkillFromUrlPlaceholder?: string
+      importSkillFromUrlFetch?: string
+      importSkillFromUrlFetching?: string
+      importSkillImporting?: string
+      importSkillFromUrlInvalid?: string
+      importSkillFromUrlNotFound?: string
+      importSkillFromUrlRateLimit?: string
+      importSkillFromUrlTooLarge?: string
+      importSkillFromUrlFetchError?: string
+      deleteSkillTitle?: string
+      deleteSkillMessage?: string
+      deleteSkillConfirm?: string
+      deleteSkillSuccess?: string
+      deleteSkillError?: string
+      deleteSkillBatchMessage?: string
+      deleteSkillBatchSuccess?: string
+      deleteSkillBatchBtn?: string
+      deleteSkillSelectAll?: string
+      deleteSkillCancel?: string
+      selectSkills?: string
       agents?: string
       agentsDesc?: string
       configureAgents?: string
@@ -216,10 +285,21 @@ export type TranslationKeys = {
       deleteConfirmMessageSuffix?: string
       toolSourceBuiltin?: string
       toolSourceMcp?: string
+      toolsGroupBuiltinVault?: string
+      toolsGroupBuiltinContext?: string
+      toolsGroupBuiltinExternal?: string
       noMcpTools?: string
       toolsEnabledCount?: string
       manageTools?: string
       manageSkills?: string
+      enableToolDisclosure?: string
+      enableToolDisclosureDesc?: string
+      expandDescription?: string
+      collapseDescription?: string
+      viewAllTools?: string
+      viewAllSkills?: string
+      enableAllTools?: string
+      disableAllTools?: string
       descriptionColumn?: string
       builtinFsListLabel?: string
       builtinFsListDesc?: string
@@ -227,17 +307,60 @@ export type TranslationKeys = {
       builtinFsSearchDesc?: string
       builtinFsReadLabel?: string
       builtinFsReadDesc?: string
+      builtinContextCompactLabel?: string
+      builtinContextCompactDesc?: string
+      builtinToolSearchLabel?: string
+      builtinToolSearchDesc?: string
       builtinFsEditLabel?: string
       builtinFsEditDesc?: string
-      builtinFsWriteLabel?: string
-      builtinFsWriteDesc?: string
+      fsEditReviewToggle?: string
+      fsEditReviewToggleDesc?: string
+      safetyControls?: string
+      safetyControlsDesc?: string
+      builtinFsFileOpsLabel?: string
+      builtinFsFileOpsDesc?: string
+      builtinMemoryOpsLabel?: string
+      builtinMemoryOpsDesc?: string
+      builtinMemoryAddLabel?: string
+      builtinMemoryAddDesc?: string
+      builtinMemoryUpdateLabel?: string
+      builtinMemoryUpdateDesc?: string
+      builtinMemoryDeleteLabel?: string
+      builtinMemoryDeleteDesc?: string
       builtinOpenSkillLabel?: string
       builtinOpenSkillDesc?: string
+      builtinWebSearchLabel?: string
+      builtinWebSearchDesc?: string
+      builtinWebScrapeLabel?: string
+      builtinWebScrapeDesc?: string
+      builtinWebOpsLabel?: string
+      builtinWebOpsDesc?: string
+      builtinJsEvalLabel?: string
+      builtinJsEvalDesc?: string
+      builtinDelegateExternalAgentLabel?: string
+      builtinDelegateExternalAgentDesc?: string
+      builtinTodoWriteLabel?: string
+      builtinTodoWriteDesc?: string
+      builtinAskUserQuestionLabel?: string
+      builtinAskUserQuestionDesc?: string
       editorDefaultName?: string
       editorIntro?: string
       editorTabProfile?: string
       editorTabTools?: string
       editorTabSkills?: string
+      editorTabWorkspace?: string
+      workspace?: {
+        enableTitle?: string
+        enableDesc?: string
+        includeTitle?: string
+        includeDesc?: string
+        includeBadge?: string
+        includeEmpty?: string
+        excludeTitle?: string
+        excludeDesc?: string
+        excludeBadge?: string
+        excludeEmpty?: string
+      }
       editorTabModel?: string
       editorName?: string
       editorNameDesc?: string
@@ -248,10 +371,20 @@ export type TranslationKeys = {
       editorChooseIcon?: string
       editorSystemPrompt?: string
       editorSystemPromptDesc?: string
+      editorSystemPromptExpand?: string
+      editorSystemPromptCollapse?: string
+      editorEnableProjectInstructions?: string
+      editorEnableProjectInstructionsDesc?: string
       editorEnableTools?: string
       editorEnableToolsDesc?: string
       editorIncludeBuiltinTools?: string
       editorIncludeBuiltinToolsDesc?: string
+      toolApproval?: string
+      toolApprovalFullAccess?: string
+      toolApprovalRequire?: string
+      toolApprovalForced?: string
+      toolDisclosureAlways?: string
+      toolDisclosureOnDemand?: string
       editorEnabled?: string
       editorDisabled?: string
       editorModel?: string
@@ -275,26 +408,163 @@ export type TranslationKeys = {
       editorCustomParametersKeyPlaceholder?: string
       editorCustomParametersValuePlaceholder?: string
       editorToolsCount?: string
+      editorEstimatedContextTokens?: string
       editorSkillsCount?: string
       editorSkillsCountWithEnabled?: string
       skillLoadAlways?: string
       skillLoadLazy?: string
       skillDisabledGlobally?: string
+      agentCapabilitiesBlockTitle?: string
+      focusSyncTitle?: string
+      focusSyncDesc?: string
+      imageReadingBlockTitle?: string
+      imageReadingEnabled?: string
+      imageReadingEnabledDesc?: string
+      externalImageFetchEnabled?: string
+      externalImageFetchEnabledDesc?: string
+      imageCompressionEnabled?: string
+      imageCompressionEnabledDesc?: string
+      imageCompressionQuality?: string
+      imageCompressionQualityDesc?: string
+      autoContextCompactionBlockTitle?: string
+      autoContextCompaction?: string
+      autoContextCompactionDesc?: string
+      autoContextCompactionThresholdMode?: string
+      autoContextCompactionModeTokens?: string
+      autoContextCompactionModeRatio?: string
+      autoContextCompactionThresholdTokens?: string
+      autoContextCompactionThresholdTokensDesc?: string
+      autoContextCompactionThresholdRatioPercent?: string
+      autoContextCompactionThresholdRatioPercentDesc?: string
+      jsSandboxExtTitle?: string
+      jsSandboxAllowFetch?: string
+      jsSandboxAllowFetchDesc?: string
+      jsSandboxAllowFetchRisk?: string
+      jsSandboxAllowFetchConfirm?: string
+      jsSandboxFetchMode?: string
+      jsSandboxFetchModeDesc?: string
+      jsSandboxFetchModeBlacklist?: string
+      jsSandboxFetchModeWhitelist?: string
+      jsSandboxFetchDomains?: string
+      jsSandboxFetchDomainsDesc?: string
+      jsSandboxAllowVaultRead?: string
+      jsSandboxAllowVaultReadDesc?: string
+      jsSandboxAllowVaultReadConfirm?: string
+      jsSandboxAllowDbQuery?: string
+      jsSandboxAllowDbQueryDesc?: string
+      jsSandboxAllowDbQueryConfirm?: string
+      jsSandboxAllowExternalScripts?: string
+      jsSandboxAllowExternalScriptsDesc?: string
+      jsSandboxAllowExternalScriptsRisk?: string
+      jsSandboxAllowExternalScriptsConfirm?: string
+      jsSandboxConfirmEnableTitle?: string
+      jsExecApprovalForced?: string
+      jsSandboxTimeoutMs?: string
+      jsSandboxTimeoutMsDesc?: string
+      jsSandboxOutputMaxKb?: string
+      jsSandboxOutputMaxKbDesc?: string
+      jsSandboxFetchMaxConcurrent?: string
+      jsSandboxFetchMaxConcurrentDesc?: string
+      jsSandboxFetchMaxResponseKb?: string
+      jsSandboxFetchMaxResponseKbDesc?: string
+      jsSandboxVaultReadMaxKb?: string
+      jsSandboxVaultReadMaxKbDesc?: string
+      jsSandboxDbMaxLimit?: string
+      jsSandboxDbMaxLimitDesc?: string
+    }
+    jsSandbox?: {
+      openSettings?: string
+    }
+    webSearch?: {
+      modalTitle?: string
+      openSettings?: string
+      intro?: string
+      providersHeader?: string
+      addProvider?: string
+      editProvider?: string
+      empty?: string
+      colName?: string
+      colType?: string
+      colDefault?: string
+      colActions?: string
+      deleteConfirmTitle?: string
+      deleteConfirmMessage?: string
+      deleteFailed?: string
+      commonHeader?: string
+      resultSize?: string
+      resultSizeDesc?: string
+      searchTimeout?: string
+      scrapeTimeout?: string
+      searchTimeoutLabel?: string
+      searchTimeoutDesc?: string
+      scrapeTimeoutLabel?: string
+      scrapeTimeoutDesc?: string
+      unitResults?: string
+      tagDefault?: string
+      failoverNotice?: string
+      providerCount?: string
+      types?: {
+        tavily?: string
+        jina?: string
+        searxng?: string
+        bing?: string
+        'gemini-grounding'?: string
+        grok?: string
+        zhipu?: string
+      }
+      fieldName?: string
+      fieldApiKey?: string
+      fieldDepth?: string
+      fieldSearchUrl?: string
+      fieldScrapeUrl?: string
+      fieldBaseUrl?: string
+      fieldLanguage?: string
+      fieldEngines?: string
+      fieldUsername?: string
+      fieldPassword?: string
+      fieldModel?: string
+      fieldSystemPrompt?: string
+      fieldEnableX?: string
+      fieldZhipuEngine?: string
+      fieldZhipuContentSize?: string
+      fieldZhipuRecency?: string
+      fieldZhipuDomainFilter?: string
+      bingNote?: string
     }
     providers: {
       title: string
       desc: string
       howToGetApiKeys: string
       addProvider: string
+      pickerTitle?: string
+      pickerSearchPlaceholder?: string
+      pickerCustomLabel?: string
+      pickerCustomDesc?: string
+      pickerEmpty?: string
+      categoryAll?: string
+      categoryMain?: string
+      categoryCn?: string
+      categoryGateway?: string
+      categoryCloud?: string
+      categoryLocal?: string
+      badgeOpenAiCompatible?: string
+      badgeNative?: string
+      badgeOAuth?: string
+      badgeAdded?: string
+      kind?: Record<string, string>
+      providersCount: string
       editProvider: string
       editProviderTitle: string
       deleteProvider: string
       deleteConfirm: string
       deleteWarning: string
+      requestDelete?: string
+      deleteConfirmTitle?: string
+      deleteConfirmImpact?: string
+      confirmDeleteAction?: string
       chatModels: string
       embeddingModels: string
       embeddingsWillBeDeleted: string
-      addCustomProvider: string
       providerId: string
       providerIdDesc: string
       providerIdPlaceholder: string
@@ -308,11 +578,49 @@ export type TranslationKeys = {
       noStainlessHeadersDesc: string
       useObsidianRequestUrl: string
       useObsidianRequestUrlDesc: string
+      requestTransportMode: string
+      requestTransportModeDesc: string
+      requestTransportModeAuto: string
+      requestTransportModeBrowser: string
+      requestTransportModeObsidian: string
+      requestTransportModeNode: string
+      promptCaching: string
+      promptCachingDesc: string
       customHeaders: string
       customHeadersDesc: string
       customHeadersAdd: string
       customHeadersKeyPlaceholder: string
       customHeadersValuePlaceholder: string
+      chatgptOAuthTitle: string
+      chatgptOAuthConnect: string
+      chatgptOAuthDisconnect: string
+      chatgptOAuthConnecting: string
+      chatgptOAuthLoadingStatus: string
+      chatgptOAuthConnected: string
+      chatgptOAuthExpires: string
+      chatgptOAuthDisconnectedHelp: string
+      chatgptOAuthStreamingNotice: string
+      chatgptOAuthPendingCode?: string
+      oauthDesktopOnly?: string
+      geminiOAuthTitle?: string
+      geminiOAuthConnect?: string
+      geminiOAuthDisconnect?: string
+      geminiOAuthConnecting?: string
+      geminiOAuthLoadingStatus?: string
+      geminiOAuthConnected?: string
+      geminiOAuthExpires?: string
+      geminiOAuthDisconnectedHelp?: string
+      geminiOAuthProject?: string
+      geminiOAuthStreamingNotice?: string
+      qwenOAuthTitle?: string
+      qwenOAuthConnect?: string
+      qwenOAuthDisconnect?: string
+      qwenOAuthConnecting?: string
+      qwenOAuthLoadingStatus?: string
+      qwenOAuthConnected?: string
+      qwenOAuthExpires?: string
+      qwenOAuthDisconnectedHelp?: string
+      qwenOAuthStreamingNotice?: string
     }
     models: {
       title: string
@@ -338,24 +646,53 @@ export type TranslationKeys = {
       embeddingModelsFirst?: string
       // reasoning UI
       reasoningType?: string
+      reasoningTypeDesc?: string
       reasoningTypeNone?: string
       reasoningTypeOpenAI?: string
       reasoningTypeGemini?: string
       reasoningTypeAnthropic?: string
       reasoningTypeGeneric?: string
-      reasoningTypeBase?: string
-      baseModelWarning?: string
+      inputModality?: string
+      inputModalityDesc?: string
+      inputModalityText?: string
+      inputModalityVision?: string
+      inputModalityVisionTooltip?: string
+      inputModalityPdf?: string
+      inputModalityPdfTooltip?: string
       openaiReasoningEffort?: string
       openaiReasoningEffortDesc?: string
       geminiThinkingBudget?: string
       geminiThinkingBudgetDesc?: string
       geminiThinkingBudgetPlaceholder?: string
-      toolType?: string
-      toolTypeDesc?: string
-      toolTypeNone?: string
-      toolTypeGemini?: string
+      builtinToolProvider?: string
+      builtinToolProviderDesc?: string
+      builtinToolProviderNone?: string
+      builtinToolProviderGemini?: string
+      builtinToolProviderGpt?: string
+      builtinToolProviderOpenRouter?: string
+      builtinToolProviderGrok?: string
+      builtinToolsGpt?: string
+      builtinToolsOpenRouter?: string
+      builtinToolsGrok?: string
+      builtinToolsGemini?: string
+      builtinToolWebSearch?: string
+      builtinToolWebSearchDesc?: string
+      builtinToolUrlContext?: string
+      builtinToolUrlContextDesc?: string
+      openRouterWebSearchEngine?: string
+      openRouterWebSearchEngineDesc?: string
+      openRouterWebSearchEngineAuto?: string
+      openRouterWebSearchEngineNative?: string
+      openRouterWebSearchEngineExa?: string
+      openRouterWebSearchEngineFirecrawl?: string
+      openRouterWebSearchEngineParallel?: string
+      openRouterWebSearchMaxResults?: string
+      openRouterWebSearchMaxResultsDesc?: string
+      openRouterWebSearchMaxResultsPlaceholder?: string
       sampling?: string
       restoreDefaults?: string
+      maxContextTokens?: string
+      maxContextTokensDesc?: string
       maxOutputTokens?: string
       customParameters?: string
       customParametersDesc?: string
@@ -374,8 +711,11 @@ export type TranslationKeys = {
     }
     rag: {
       title: string
+      desc?: string
       enableRag: string
       enableRagDesc: string
+      indexPdf?: string
+      indexPdfDesc?: string
       embeddingModel: string
       embeddingModelDesc: string
       chunkSize: string
@@ -384,6 +724,8 @@ export type TranslationKeys = {
       minSimilarityDesc: string
       limit: string
       limitDesc: string
+      embeddingConcurrency: string
+      embeddingConcurrencyDesc: string
       includePatterns: string
       includePatternsDesc: string
       excludePatterns: string
@@ -392,6 +734,10 @@ export type TranslationKeys = {
       manageEmbeddingDatabase: string
       manage: string
       rebuildIndex: string
+      rebuildFromScratch?: string
+      rebuildFromScratchConfirm?: string
+      continueIndex?: string
+      continueIndexNow?: string
       // UI additions
       selectedFolders?: string
       excludedFolders?: string
@@ -411,10 +757,79 @@ export type TranslationKeys = {
       manualUpdateNow?: string
       manualUpdateNowDesc?: string
       advanced?: string
+      basicCardTitle?: string
+      basicCardDesc?: string
+      resourceCardTitle?: string
+      resourceCardDesc?: string
+      scopeCardTitle?: string
+      scopeCardDesc?: string
+      maintenanceCardTitle?: string
+      maintenanceCardDesc?: string
+      maintenanceUnavailableHint?: string
+      currentStatus?: string
+      currentStatusDesc?: string
+      lastIndexedAt?: string
+      lastIndexedAtDesc?: string
+      maintenanceActions?: string
+      deleteIndex?: string
+      deleteIndexConfirm?: string
+      deleteIndexSuccess?: string
+      deleteIndexFailed?: string
+      statusDisabled?: string
+      statusSyncing?: string
+      statusRuntimeRequired?: string
+      statusReady?: string
+      statusEmpty?: string
+      selectEmbeddingModelFirst?: string
+      openKnowledgeSettings?: string
+      openKnowledgeSettingsDesc?: string
+      composerEntryDesc?: string
+      pgliteStatusCurrent?: string
+      pgliteStatusSource?: string
+      pgliteStatusPath?: string
+      pgliteStatusCheckedAt?: string
+      pgliteStatusVersion?: string
+      pgliteStatusReadyAt?: string
+      pgliteStatusReason?: string
+      pgliteStateUnchecked?: string
+      pgliteStateChecking?: string
+      pgliteStateMissing?: string
+      pgliteStateDownloading?: string
+      pgliteStateUnavailable?: string
+      pgliteStateFailed?: string
+      pgliteStateReady?: string
+      pgliteSourceRemote?: string
+      pgliteSourceBundled?: string
+      pgliteSourceLocalCache?: string
+      pgliteDeliveryManual?: string
+      pgliteDownload?: string
+      pgliteRedownload?: string
+      pgliteRecheck?: string
+      pgliteDeleteLocal?: string
+      pgliteDownloadPlaceholder?: string
+      pgliteDeletePlaceholder?: string
+      pgliteDownloadingUnknownFile?: string
+      pgliteInlineErrorTitle?: string
+      pgliteSummaryReadyRemote?: string
+      pgliteSummaryReadyBundled?: string
+      pgliteSummaryUnavailable?: string
+      pgliteSummaryReady?: string
+      pgliteSummaryDownloading?: string
+      pgliteSummaryFailed?: string
+      pgliteSummaryMissing?: string
+      pgliteDownloadingFile?: string
       // Index progress header/status
       indexProgressTitle?: string
       indexing?: string
       notStarted?: string
+      waitingRateLimit?: string
+      preparingProgress?: string
+      notIndexedYet?: string
+      indexComplete?: string
+      indexIncomplete?: string
+      retryNow?: string
+      waitingRetry?: string
+      cancelIndex?: string
     }
     mcp: {
       title: string
@@ -480,6 +895,30 @@ export type TranslationKeys = {
       editTemplate: string
       name: string
       actions: string
+    }
+    editor: {
+      snippets: {
+        sectionTitle: string
+        sectionDesc: string
+        cardName: string
+        cardDescCount: string
+        cardDescMissing: string
+        manageBtn: string
+        initBtn: string
+        modalTitle: string
+        modalCallout: string
+        openFileBtn: string
+        createFileBtn: string
+        empty: string
+        jumpBtn: string
+        deleteBtn: string
+        deleteTitle: string
+        deleteMessage: string
+        deleteConfirm: string
+        deleteSuccess: string
+        deleteError: string
+        openError: string
+      }
     }
     continuation: {
       title: string
@@ -570,6 +1009,12 @@ export type TranslationKeys = {
     }
     etc: {
       title: string
+      exportConfig?: string
+      exportConfigDesc?: string
+      export?: string
+      importConfig?: string
+      importConfigDesc?: string
+      import?: string
       resetSettings: string
       resetSettingsDesc: string
       resetSettingsConfirm: string
@@ -592,13 +1037,53 @@ export type TranslationKeys = {
       resetAgentsDesc?: string
       resetAgentsConfirm?: string
       resetAgentsSuccess?: string
+      captureRawRequestDebug?: string
+      captureRawRequestDebugDesc?: string
+      captureRawRequestDebugExcludeLogsTitle?: string
+      captureRawRequestDebugExcludeLogsMessage?: string
+      captureRawRequestDebugExcludeLogsCta?: string
+      captureRawRequestDebugExcludeLogsSuccess?: string
       yoloBaseDir?: string
       yoloBaseDirDesc?: string
       yoloBaseDirPlaceholder?: string
+      ribbonClickAction?: string
+      ribbonClickActionDesc?: string
+      ribbonClickActionSidebar?: string
+      ribbonClickActionTab?: string
+      ribbonClickActionSplit?: string
+      ribbonClickActionWindow?: string
+      ribbonClickActionLast?: string
       mentionDisplayMode?: string
       mentionDisplayModeDesc?: string
       mentionDisplayModeInline?: string
       mentionDisplayModeBadge?: string
+      mentionContextMode?: string
+      mentionContextModeDesc?: string
+      mentionContextModeLight?: string
+      mentionContextModeFull?: string
+      chatApplyMode?: string
+      chatApplyModeDesc?: string
+      chatApplyModeReviewRequired?: string
+      chatApplyModeDirectApply?: string
+      notifications?: string
+      notificationsDesc?: string
+      notificationsEnabled?: string
+      notificationsEnabledDesc?: string
+      notificationChannel?: string
+      notificationChannelDesc?: string
+      notificationChannelSound?: string
+      notificationChannelSystem?: string
+      notificationChannelBoth?: string
+      notificationTiming?: string
+      notificationTimingDesc?: string
+      notificationTimingAlways?: string
+      notificationTimingWhenUnfocused?: string
+      notificationApprovalRequired?: string
+      notificationApprovalRequiredDesc?: string
+      notificationTaskCompleted?: string
+      notificationTaskCompletedDesc?: string
+      interactionSectionTitle?: string
+      maintenanceSectionTitle?: string
     }
     smartSpace?: {
       quickActionsTitle: string
@@ -662,6 +1147,7 @@ export type TranslationKeys = {
       actionModeDesc: string
       actionModeAsk: string
       actionModeChatInput: string
+      actionModeChatSend: string
       actionModeRewrite: string
       actionRewriteType: string
       actionRewriteTypeDesc: string
@@ -675,6 +1161,9 @@ export type TranslationKeys = {
       duplicate: string
       copySuffix?: string
       dragHandleAria?: string
+      fixedActionHint?: string
+      hideFixedAction?: string
+      showFixedAction?: string
     }
   }
 
@@ -682,7 +1171,9 @@ export type TranslationKeys = {
   selection?: {
     actions?: {
       addToChat?: string
+      addToSidebar?: string
       customRewrite?: string
+      customAsk?: string
       rewrite?: string
       explain?: string
       suggest?: string
@@ -694,25 +1185,119 @@ export type TranslationKeys = {
   chat: {
     placeholder: string
     placeholderCompact?: string
+    placeholderPrefix?: string
+    placeholderMention?: string
+    placeholderSkill?: string
+    contextUsage?: string
+    contextUsageUnknownMaxSuffix?: string
+    contextBreakdown?: {
+      title?: string
+      /** "{{percent}} Full" — interpolated client-side */
+      fullLabel?: string
+      tokensSuffix?: string
+      localEstimateCaption?: string
+      unknownMaxHint?: string
+      error?: string
+      bucket?: {
+        system?: string
+        tools?: string
+        rules?: string
+        skills?: string
+        memory?: string
+        conversation?: string
+        reasoning?: string
+      }
+    }
+    inlineInfo?: {
+      callsTitle?: string
+      nextTurnContext?: string
+      nextTurnContextCached?: string
+    }
+    llmDebug?: {
+      title?: string
+      open?: string
+      openFailed?: string
+      copy?: string
+      copied?: string
+      copyFailed?: string
+      save?: string
+      savedShort?: string
+      saved?: string
+      saveFailed?: string
+      expired?: string
+    }
     sendMessage: string
     newChat: string
+    untitledConversation?: string
     continueResponse?: string
     stopGeneration?: string
-    vaultSearch: string
+    queueMessage?: {
+      tooltip?: string
+      hint?: string
+      blockedApproval?: string
+      blockedAwaitingInput?: string
+      abortedRestoredOne?: string
+      abortedRestoredMany?: string
+    }
+    askUserQuestion?: {
+      title?: string
+      submit?: string
+      submitHint?: string
+      cancel?: string
+      cancelTooltip?: string
+      answeredBadge?: string
+      rejected?: string
+      aborted?: string
+      schemaError?: string
+      stale?: string
+      otherOption?: string
+      otherPlaceholder?: string
+      otherAnswerPrefix?: string
+      otherAnswerFallback?: string
+      freeTextOptional?: string
+    }
     selectModel: string
     uploadImage: string
+    uploadFile?: string
+    imageUnsupportedByModel?: string
     addContext: string
     applyChanges: string
     copyMessage: string
+    createBranchFromHere?: string
+    branchCreated?: string
+    branchCreateFailed?: string
+    insertAtCursor?: string
+    insertSuccess?: string
+    insertUnavailable?: string
+    noAssistantContent?: string
     regenerate: string
     reasoning: string
     annotations: string
+    vaultSources?: string
+    assistantQuote?: {
+      add?: string
+      badge?: string
+    }
     mentionMenu?: {
       back?: string
+      entryCurrentFile?: string
       entryMode?: string
+      entrySkill?: string
       entryAssistant?: string
+      entryModel?: string
       entryFile?: string
       entryFolder?: string
+    }
+    slashCommands?: {
+      compact?: {
+        label?: string
+        description?: string
+      }
+    }
+    slashMenu?: {
+      entrySkill?: string
+      entrySnippet?: string
+      createSnippetsFile?: string
     }
     emptyState?: {
       chatTitle?: string
@@ -720,15 +1305,37 @@ export type TranslationKeys = {
       agentTitle?: string
       agentDescription?: string
     }
+    compaction?: {
+      pendingTitle?: string
+      dividerTitle?: string
+      dividerDescription?: string
+      dividerDescriptionWithEstimate?: string
+      dividerDescriptionWithSavings?: string
+      pendingStatus?: string
+      success?: string
+      failed?: string
+      empty?: string
+      runActive?: string
+      waitingApproval?: string
+      autoFailed?: string
+    }
+    todoPanel?: {
+      summaryPlanning?: string
+      summaryInProgress?: string
+      summaryPartial?: string
+      summaryAllDone?: string
+      expand?: string
+      collapse?: string
+    }
     codeBlock?: {
       showRawText?: string
       showFormattedText?: string
       copyText?: string
       textCopied?: string
       apply?: string
-      applyQuick?: string
-      applyPrecise?: string
       applying?: string
+      locatingTarget?: string
+      emptyPlanPreview?: string
       stopApplying?: string
     }
     customContinuePromptLabel?: string
@@ -772,15 +1379,35 @@ export type TranslationKeys = {
         title: string
       }
     }
+    editSummary?: {
+      filesChanged?: string
+      operationCreate?: string
+      operationDelete?: string
+      undo?: string
+      undoFile?: string
+      undone?: string
+      undoSuccess?: string
+      undoPartial?: string
+      undoUnavailable?: string
+      undoFailed?: string
+      fileDeleted?: string
+      fileMissing?: string
+    }
+    errorCard?: {
+      title?: string
+    }
     showMore?: string
     showLess?: string
+    pdfReferenceNoPreview?: string
     toolCall?: {
       status?: {
         call?: string
         rejected?: string
         running?: string
         failed?: string
+        completed?: string
         aborted?: string
+        awaitingUserInput?: string
         unknown?: string
       }
       displayName?: {
@@ -788,16 +1415,23 @@ export type TranslationKeys = {
         fs_search?: string
         fs_read?: string
         fs_edit?: string
-        fs_write?: string
+        fs_file_ops?: string
+        memory_add?: string
+        memory_update?: string
+        memory_delete?: string
         open_skill?: string
       }
       writeAction?: {
         create_file?: string
-        write_file?: string
         delete_file?: string
         create_dir?: string
         delete_dir?: string
         move?: string
+      }
+      readMode?: {
+        full?: string
+        linesSuffix?: string
+        pagesSuffix?: string
       }
       detail?: {
         target?: string
@@ -816,6 +1450,36 @@ export type TranslationKeys = {
       alwaysAllowThisTool?: string
       allowForThisChat?: string
     }
+    toolSummary?: {
+      todoWrite?: {
+        cleared?: string
+        allCompleted?: string
+        created?: string
+        progress?: string
+      }
+    }
+    // delegate_external_agent tool card
+    externalAgent?: {
+      statusRunning?: string
+      statusDone?: string
+      statusAborted?: string
+      statusError?: string
+      progress?: string
+      output?: string
+      abortedBeforeOutput?: string
+      progressTruncated?: string
+      truncated?: string
+    }
+    // async external agent result card
+    externalAgentResult?: {
+      statusCompleted?: string
+      statusFailed?: string
+      statusCancelled?: string
+      statusTimedOut?: string
+      statusKilledByShutdown?: string
+      showOutput?: string
+      jumpToDelegate?: string
+    }
     // conversation settings popover
     conversationSettings?: {
       openAria?: string
@@ -825,11 +1489,16 @@ export type TranslationKeys = {
       temperature?: string
       topP?: string
       streaming?: string
-      vaultSearch?: string
-      useVaultSearch?: string
       geminiTools?: string
       webSearch?: string
       urlContext?: string
+    }
+    notification?: {
+      approvalTitle?: string
+      approvalBody?: string
+      completedTitle?: string
+      completedBody?: string
+      completedErrorBody?: string
     }
   }
 
@@ -838,6 +1507,9 @@ export type TranslationKeys = {
     rebuildingIndex: string
     rebuildComplete: string
     rebuildFailed: string
+    continueComplete?: string
+    continueFailed?: string
+    openYoloNewChatFailed: string
     pgliteUnavailable: string
     downloadingPglite: string
     updatingIndex: string
@@ -847,6 +1519,41 @@ export type TranslationKeys = {
     migrationFailed: string
     reloadingPlugin: string
     settingsInvalid: string
+    transportModeAutoPromoted: string
+    capturePdfNoLeaf?: string
+    capturePdfFailed?: string
+    capturePdfInjectFailed?: string
+  }
+
+  pdf?: {
+    regionSelectorHint?: string
+    toolbarButtonTooltip?: string
+  }
+
+  mentionable?: {
+    /** Badge suffix for a block selected from a PDF page. {{page}} is replaced with the page number. */
+    pdfPage?: string
+  }
+
+  statusBar?: {
+    agentRunningWithApproval?: string
+    agentRunning?: string
+    agentStatusAriaLabel?: string
+    agentStatusTitle?: string
+    agentStatusPanelTitle?: string
+    agentStatusPanelEmpty?: string
+    agentStatusRunning?: string
+    agentStatusWaitingApproval?: string
+    agentStatusFallbackConversationTitle?: string
+    backgroundStatusAriaLabel?: string
+    backgroundStatusPanelTitle?: string
+    backgroundStatusPanelEmpty?: string
+    backgroundTasksRunning?: string
+    backgroundTasksNeedAttention?: string
+    ragAutoUpdateRunning?: string
+    ragAutoUpdateRunningDetail?: string
+    ragAutoUpdateFailed?: string
+    ragAutoUpdateFailedDetail?: string
   }
 
   // Errors
@@ -862,18 +1569,25 @@ export type TranslationKeys = {
   // Apply View
   applyView?: {
     applying?: string
+    reviewTitle?: string
     changesResolved?: string
     acceptAllIncoming?: string
+    keepAllChanges?: string
     rejectAll?: string
+    revertAllChanges?: string
     prevChange?: string
     nextChange?: string
     reset?: string
     applyAndClose?: string
     acceptIncoming?: string
+    keepChange?: string
     acceptCurrent?: string
+    revertChange?: string
     acceptBoth?: string
     acceptedIncoming?: string
+    keptChange?: string
     keptCurrent?: string
+    revertedChange?: string
     mergedBoth?: string
     undo?: string
   }
@@ -895,6 +1609,7 @@ export type TranslationKeys = {
     clearConfirm?: string
     cleared?: string
     error?: string
+    noModelConfigured?: string
     copied?: string
     inserted?: string
     // Mode select
@@ -918,6 +1633,8 @@ export type TranslationKeys = {
   chatMode?: {
     chat?: string
     chatDesc?: string
+    rewrite?: string
+    rewriteDesc?: string
     agent?: string
     agentDesc?: string
     warning?: {
@@ -942,5 +1659,106 @@ export type TranslationKeys = {
     medium?: string
     high?: string
     extraHigh?: string
+    offDesc?: string
+    autoDesc?: string
+    lowDesc?: string
+    mediumDesc?: string
+    highDesc?: string
+    extraHighDesc?: string
+  }
+
+  // Config import / export
+  configTransfer?: {
+    export: {
+      title: string
+      description: string
+      selectAll: string
+      selectNone: string
+      sensitive: string
+      redactedOption: string
+      submit: string
+      cancel: string
+      noticeAtLeastOne: string
+      noticeReadFailed: string
+      noticeSuccess: string
+      noticeFailed: string
+    }
+    import: {
+      title: string
+      sourceFile: string
+      sourceFileDesc: string
+      sourceVault: string
+      sourceVaultDesc: string
+      description: string
+      selectAll: string
+      selectNone: string
+      sensitive: string
+      strategyOverwriteTitle: string
+      strategyOverwriteDesc: string
+      strategyMergeTitle: string
+      strategyMergeDesc: string
+      submit: string
+      back: string
+      cancel: string
+      noticeInvalidJson: string
+      noticeFileReadFailed: string
+      noticeRedactedHint: string
+      noticeRedactedReminder: string
+      noticePluginNotFound: string
+      noticeAtLeastOne: string
+      noticeSuccess: string
+      noticeFailed: string
+    }
+    errors: {
+      errorNotJson: string
+      errorNotExportFile: string
+      errorInvalidFormatVersion: string
+      errorInvalidSettingsVersion: string
+      errorFileFromNewerVersion: string
+      errorFileFromOlderVersion: string
+      errorEmptyKeys: string
+      errorMissingData: string
+      errorTampered: string
+      errorChecksumMismatch: string
+      errorVaultParseFailed: string
+      errorVaultMissingVersion: string
+      errorVaultFromNewerVersion: string
+      errorVaultFromOlderVersion: string
+      errorVaultEmpty: string
+      errorApplyVersionMismatch: string
+      errorApplySchema: string
+    }
+    keyLabels: {
+      providers: string
+      chatModels: string
+      embeddingModels: string
+      chatModelId: string
+      chatTitleModelId: string
+      embeddingModelId: string
+      systemPrompt: string
+      ragOptions: string
+      mcp: string
+      webSearch: string
+      skills: string
+      yolo: string
+      debug: string
+      chatOptions: string
+      notificationOptions: string
+      continuationOptions: string
+      assistants: string
+      currentAssistantId: string
+      quickAskAssistantId: string
+    }
+  }
+
+  // Plugin update banner (GitHub release check)
+  update: {
+    newVersionAvailable: string
+    currentVersion: string
+    viewDetails: string
+    dismiss: string
+    installationIncompleteTitle: string
+    installationIncompleteMeta: string
+    installationIncompleteNotes: string
   }
 }

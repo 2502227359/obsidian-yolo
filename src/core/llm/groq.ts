@@ -10,30 +10,83 @@ import {
   LLMResponseNonStreaming,
   LLMResponseStreaming,
 } from '../../types/llm/response'
-import { LLMProvider } from '../../types/provider.types'
+import { LLMProvider, RequestTransportMode } from '../../types/provider.types'
+import { resolveProviderBaseUrl } from '../../utils/llm/provider-base-url'
 import { toProviderHeadersRecord } from '../../utils/llm/provider-headers'
 
 import { BaseLLMProvider } from './base'
 import { OpenAIMessageAdapter } from './openaiMessageAdapter'
+import { ModelRequestPolicy, resolveSdkMaxRetries } from './requestPolicy'
+import {
+  AutoPromotedTransportMode,
+  createRequestTransportMemoryKey,
+  resolveRequestTransportMode,
+  runWithRequestTransport,
+  runWithRequestTransportForStream,
+} from './requestTransport'
+import { createTransportClients } from './transportClients'
 
-export class GroqProvider extends BaseLLMProvider<
-  Extract<LLMProvider, { type: 'groq' }>
-> {
+export class GroqProvider extends BaseLLMProvider<LLMProvider> {
   private adapter: OpenAIMessageAdapter
-  private client: OpenAI
+  private browserClient: OpenAI
+  private obsidianClient: OpenAI
+  private nodeClient: OpenAI
+  private requestTransportMode: RequestTransportMode
+  private requestTransportMemoryKey: string
+  private onAutoPromoteTransportMode?: (mode: AutoPromotedTransportMode) => void
 
-  constructor(provider: Extract<LLMProvider, { type: 'groq' }>) {
+  private promoteTransportMode = (mode: AutoPromotedTransportMode) => {
+    if (this.requestTransportMode === mode) return
+    this.provider.additionalSettings = {
+      ...(this.provider.additionalSettings ?? {}),
+      requestTransportMode: mode,
+    }
+    this.requestTransportMode = mode
+    this.onAutoPromoteTransportMode?.(mode)
+  }
+
+  constructor(
+    provider: LLMProvider,
+    options?: {
+      onAutoPromoteTransportMode?: (mode: AutoPromotedTransportMode) => void
+      requestPolicy?: ModelRequestPolicy
+    },
+  ) {
     super(provider)
     this.adapter = new OpenAIMessageAdapter()
+    this.onAutoPromoteTransportMode = options?.onAutoPromoteTransportMode
     const defaultHeaders = toProviderHeadersRecord(provider.customHeaders)
-    this.client = new OpenAI({
+    this.requestTransportMemoryKey = createRequestTransportMemoryKey({
+      providerType: provider.presetType,
+      providerId: provider.id,
+      baseUrl: provider.baseUrl,
+    })
+    this.requestTransportMode = resolveRequestTransportMode({
+      additionalSettings: provider.additionalSettings,
+      hasCustomBaseUrl: !!provider.baseUrl,
+      memoryKey: this.requestTransportMemoryKey,
+    })
+    const clientOptions = {
       apiKey: provider.apiKey ?? '',
-      baseURL: provider.baseUrl
-        ? provider.baseUrl?.replace(/\/+$/, '')
-        : 'https://api.groq.com/openai/v1',
+      baseURL: resolveProviderBaseUrl(provider),
       dangerouslyAllowBrowser: true,
       defaultHeaders,
-    })
+      maxRetries: resolveSdkMaxRetries({
+        requestPolicy: options?.requestPolicy,
+        requestTransportMode: this.requestTransportMode,
+      }),
+      timeout: options?.requestPolicy?.timeoutMs,
+    }
+    const clients = createTransportClients(
+      (transportFetch) =>
+        new OpenAI({
+          ...clientOptions,
+          fetch: transportFetch,
+        }),
+    )
+    this.browserClient = clients.browserClient
+    this.obsidianClient = clients.obsidianClient
+    this.nodeClient = clients.nodeClient
   }
 
   async generateResponse(
@@ -41,13 +94,27 @@ export class GroqProvider extends BaseLLMProvider<
     request: LLMRequestNonStreaming,
     options?: LLMOptions,
   ): Promise<LLMResponseNonStreaming> {
-    if (model.providerType !== 'groq') {
-      throw new Error('Model is not a Groq model')
-    }
-
     const mergedRequest = this.applyCustomModelParameters(model, request)
 
-    return this.adapter.generateResponse(this.client, mergedRequest, options)
+    return runWithRequestTransport({
+      mode: this.requestTransportMode,
+      memoryKey: this.requestTransportMemoryKey,
+      onAutoPromoteTransportMode: this.promoteTransportMode,
+      runBrowser: () =>
+        this.adapter.generateResponse(
+          this.browserClient,
+          mergedRequest,
+          options,
+        ),
+      runObsidian: () =>
+        this.adapter.generateResponse(
+          this.obsidianClient,
+          mergedRequest,
+          options,
+        ),
+      runNode: () =>
+        this.adapter.generateResponse(this.nodeClient, mergedRequest, options),
+    })
   }
 
   async streamResponse(
@@ -55,16 +122,36 @@ export class GroqProvider extends BaseLLMProvider<
     request: LLMRequestStreaming,
     options?: LLMOptions,
   ): Promise<AsyncIterable<LLMResponseStreaming>> {
-    if (model.providerType !== 'groq') {
-      throw new Error('Model is not a Groq model')
-    }
-
     const mergedRequest = this.applyCustomModelParameters(model, request)
 
-    return this.adapter.streamResponse(this.client, mergedRequest, options)
+    return runWithRequestTransportForStream({
+      mode: this.requestTransportMode,
+      memoryKey: this.requestTransportMemoryKey,
+      onAutoPromoteTransportMode: this.promoteTransportMode,
+      signal: options?.signal,
+      createBrowserStream: (signal) =>
+        this.adapter.streamResponse(this.browserClient, mergedRequest, {
+          ...options,
+          signal: signal ?? options?.signal,
+        }),
+      createObsidianStream: (signal) =>
+        this.adapter.streamResponse(this.obsidianClient, mergedRequest, {
+          ...options,
+          signal: signal ?? options?.signal,
+        }),
+      createNodeStream: (signal) =>
+        this.adapter.streamResponse(this.nodeClient, mergedRequest, {
+          ...options,
+          signal: signal ?? options?.signal,
+        }),
+    })
   }
 
-  getEmbedding(_model: string, _text: string): Promise<number[]> {
+  getEmbedding(
+    _model: string,
+    _text: string,
+    _options?: { dimensions?: number },
+  ): Promise<number[]> {
     return Promise.reject(
       new Error(
         `Provider ${this.provider.id} does not support embeddings. Please use a different provider.`,

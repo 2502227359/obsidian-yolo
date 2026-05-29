@@ -17,11 +17,85 @@ import {
   RequestMessage,
 } from '../../types/llm/request'
 import {
+  Annotation,
   LLMResponseNonStreaming,
   LLMResponseStreaming,
+  ResponseUsage,
   ToolCall,
   ToolCallDelta,
 } from '../../types/llm/response'
+import { getToolCallArgumentsText } from '../../types/tool-call.types'
+import { filterEmptyAssistantMessages } from '../../utils/chat/tool-boundary'
+
+/**
+ * Normalize OpenAI-compatible `annotations` (returned by OpenAI's hosted web
+ * search and OpenRouter's `openrouter:web_search` server tool) into our
+ * internal `Annotation` shape. We only retain `url_citation` entries — that's
+ * the only variant both upstreams emit today and the only one the UI knows
+ * how to render. Unknown variants are dropped silently.
+ */
+const normalizeAnnotations = (raw: unknown): Annotation[] | undefined => {
+  if (!Array.isArray(raw)) return undefined
+  const out: Annotation[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const record = item as Record<string, unknown>
+    if (record.type !== 'url_citation') continue
+    const citation = record.url_citation
+    if (!citation || typeof citation !== 'object') continue
+    const c = citation as Record<string, unknown>
+    if (typeof c.url !== 'string') continue
+    out.push({
+      type: 'url_citation',
+      url_citation: {
+        url: c.url,
+        ...(typeof c.title === 'string' ? { title: c.title } : {}),
+        ...(typeof c.start_index === 'number'
+          ? { start_index: c.start_index }
+          : {}),
+        ...(typeof c.end_index === 'number' ? { end_index: c.end_index } : {}),
+      },
+    })
+  }
+  return out.length > 0 ? out : undefined
+}
+
+/**
+ * Normalize raw `usage` from OpenAI-compatible endpoints into our generic
+ * `ResponseUsage`, lifting provider-specific cache fields to the shared
+ * `cache_read_input_tokens` slot so the UI can treat them uniformly.
+ *
+ * Known shapes:
+ *   - OpenAI / Moonshot / OpenRouter / Groq / ...: usage.prompt_tokens_details.cached_tokens
+ *   - DeepSeek (non-standard extension):            usage.prompt_cache_hit_tokens
+ */
+export function normalizeOpenAICompatUsage(
+  raw: unknown,
+): ResponseUsage | undefined {
+  if (!raw || typeof raw !== 'object') {
+    return undefined
+  }
+  const u = raw as {
+    prompt_tokens?: number
+    completion_tokens?: number
+    total_tokens?: number
+    prompt_tokens_details?: { cached_tokens?: number | null } | null
+    prompt_cache_hit_tokens?: number | null
+  }
+  const cachedTokens =
+    u.prompt_tokens_details?.cached_tokens ??
+    u.prompt_cache_hit_tokens ??
+    undefined
+  const base: ResponseUsage = {
+    prompt_tokens: u.prompt_tokens ?? 0,
+    completion_tokens: u.completion_tokens ?? 0,
+    total_tokens: u.total_tokens ?? 0,
+  }
+  if (cachedTokens !== undefined && cachedTokens !== null && cachedTokens > 0) {
+    base.cache_read_input_tokens = cachedTokens
+  }
+  return base
+}
 
 function hasObjectProperty<T extends object, K extends PropertyKey>(
   value: T,
@@ -121,21 +195,21 @@ function normalizeFunctionArguments(value: unknown): string | undefined {
 }
 
 function normalizeRequestToolCallArguments(value: unknown): string {
+  if (
+    value &&
+    typeof value === 'object' &&
+    'kind' in value &&
+    typeof (value as { kind?: unknown }).kind === 'string'
+  ) {
+    return (
+      getToolCallArgumentsText(
+        value as Parameters<typeof getToolCallArgumentsText>[0],
+      ) ?? '{}'
+    )
+  }
+
   const argumentsText = normalizeFunctionArguments(value)
-  if (!argumentsText || argumentsText.trim().length === 0) {
-    return '{}'
-  }
-
-  try {
-    const parsed = JSON.parse(argumentsText)
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return JSON.stringify(parsed)
-    }
-  } catch {
-    // fallback below
-  }
-
-  return '{}'
+  return argumentsText && argumentsText.trim().length > 0 ? argumentsText : '{}'
 }
 
 function normalizeToolCalls(source: unknown): ToolCall[] | undefined {
@@ -357,7 +431,15 @@ export class OpenAIMessageAdapter {
   }):
     | ChatCompletionCreateParamsStreaming
     | ChatCompletionCreateParamsNonStreaming {
+    const sanitizedMessages = filterEmptyAssistantMessages(request.messages)
+
     if (stream) {
+      const streamOptions = hasObjectProperty(request, 'stream_options')
+        ? ((request as Record<string, unknown>).stream_options as
+            | ChatCompletionCreateParamsStreaming['stream_options']
+            | undefined)
+        : { include_usage: true }
+
       const params: ChatCompletionCreateParamsStreaming &
         Record<string, unknown> = {
         model: request.model,
@@ -365,7 +447,7 @@ export class OpenAIMessageAdapter {
         tool_choice: request.tool_choice,
         reasoning_effort: request.reasoning_effort,
         web_search_options: request.web_search_options,
-        messages: request.messages.map((m) => this.parseRequestMessage(m)),
+        messages: sanitizedMessages.map((m) => this.parseRequestMessage(m)),
         max_tokens: request.max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
@@ -374,9 +456,7 @@ export class OpenAIMessageAdapter {
         logit_bias: request.logit_bias,
         prediction: request.prediction,
         stream: true,
-        stream_options: {
-          include_usage: true,
-        },
+        stream_options: streamOptions,
       }
       return this.attachVendorExtensions(params, request)
     }
@@ -388,7 +468,7 @@ export class OpenAIMessageAdapter {
       tool_choice: request.tool_choice,
       reasoning_effort: request.reasoning_effort,
       web_search_options: request.web_search_options,
-      messages: request.messages.map((m) => this.parseRequestMessage(m)),
+      messages: sanitizedMessages.map((m) => this.parseRequestMessage(m)),
       max_tokens: request.max_tokens,
       temperature: request.temperature,
       top_p: request.top_p,
@@ -440,11 +520,16 @@ export class OpenAIMessageAdapter {
       typeof request.extra_body === 'object'
     ) {
       const { tools, ...otherExtraBody } = request.extra_body as {
-        tools?: ChatCompletionTool[]
+        tools?: Array<ChatCompletionTool | Record<string, unknown>>
         [key: string]: unknown
       }
       if (Array.isArray(tools)) {
-        mutable.tools = tools
+        const existingTools = Array.isArray(mutable.tools)
+          ? (mutable.tools as Array<
+              ChatCompletionTool | Record<string, unknown>
+            >)
+          : []
+        mutable.tools = [...existingTools, ...tools]
         if (hasObjectProperty(mutable, 'tool_choice')) {
           delete (mutable as { tool_choice?: unknown }).tool_choice
         }
@@ -483,6 +568,21 @@ export class OpenAIMessageAdapter {
                   return { type: 'text', text: part.text }
                 case 'image_url':
                   return { type: 'image_url', image_url: part.image_url }
+                case 'document':
+                  // Pass-through as OpenAI Chat Completions `file` content
+                  // part — the de-facto standard adopted by OpenRouter and
+                  // most OpenAI-compatible proxies that forward to PDF-capable
+                  // upstreams (Gemini / Claude). Reaching here means the user
+                  // explicitly enabled the `pdf` modality on this model; if
+                  // their proxy doesn't speak this format the proxy will
+                  // surface its own error, which is more useful than ours.
+                  return {
+                    type: 'file',
+                    file: {
+                      filename: part.name,
+                      file_data: `data:${part.mediaType};base64,${part.data}`,
+                    },
+                  }
                 default:
                   throw new Error('Unsupported content part type.')
               }
@@ -541,10 +641,13 @@ export class OpenAIMessageAdapter {
 
           if (!toolCallsFromStandardField && toolCallsFromLegacyField) {
             console.warn(
-              '[Smart Composer] Parsed legacy function_call response format (non-stream).',
+              '[YOLO] Parsed legacy function_call response format (non-stream).',
             )
           }
 
+          const annotations = normalizeAnnotations(
+            (choice.message as unknown as Record<string, unknown>).annotations,
+          )
           return {
             finish_reason: choice.finish_reason,
             message: {
@@ -552,6 +655,7 @@ export class OpenAIMessageAdapter {
               reasoning: extractReasoningContent(choice.message),
               role: choice.message.role,
               tool_calls: normalizedToolCalls,
+              ...(annotations ? { annotations } : {}),
             },
           }
         })(),
@@ -560,7 +664,7 @@ export class OpenAIMessageAdapter {
       model: response.model,
       object: 'chat.completion',
       system_fingerprint: response.system_fingerprint,
-      usage: response.usage,
+      usage: normalizeOpenAICompatUsage(response.usage),
     }
   }
 
@@ -582,10 +686,13 @@ export class OpenAIMessageAdapter {
 
           if (!toolCallsFromStandardField && toolCallsFromLegacyField) {
             console.warn(
-              '[Smart Composer] Parsed legacy function_call response format (stream).',
+              '[YOLO] Parsed legacy function_call response format (stream).',
             )
           }
 
+          const annotations = normalizeAnnotations(
+            (choice.delta as unknown as Record<string, unknown>).annotations,
+          )
           return {
             finish_reason: choice.finish_reason ?? null,
             delta: {
@@ -593,6 +700,7 @@ export class OpenAIMessageAdapter {
               reasoning: extractReasoningContent(choice.delta),
               role: choice.delta.role,
               tool_calls: normalizedToolCallDeltas,
+              ...(annotations ? { annotations } : {}),
             },
           }
         })(),
@@ -601,7 +709,7 @@ export class OpenAIMessageAdapter {
       model: chunk.model,
       object: 'chat.completion.chunk',
       system_fingerprint: chunk.system_fingerprint,
-      usage: chunk.usage ?? undefined,
+      usage: normalizeOpenAICompatUsage(chunk.usage),
     }
   }
 }

@@ -1,6 +1,4 @@
 <h1 align="center">YOLO</h1>
-<p align="center"><b>You Orchestrate, LLM Operates.</b></p>
-
 <p align="center">
   Agent-native AI assistant for Obsidian — chat, write, knowledge base, and orchestration, all in one place.
 </p>
@@ -23,6 +21,16 @@
   <b>English</b> | <a href="./README_zh-CN.md">简体中文</a> | <a href="./README_it.md">Italiano</a>
 </p>
 
+## What's New
+
+- `1.5.7`: YOLO can now sense what you're reading—focus sync keeps the AI aware of your current file and position, with deep PDF support for vision reading, selection sync, and region screenshots.
+- `1.5.6`: Built-in web search is here—Agents can now browse the internet directly, with multiple search providers and unified web scraping.
+- `1.5.5`: Refreshed knowledge-base foundations with fully upgraded hybrid search and indexing—and smarter, more relevant results.
+- `1.5.4`: Built for long chats and complex tasks: smarter context pruning and compression, multi-model branches, a virtualized chat timeline, and automatic compression to keep agents running smoothly.
+- `1.5.3`: Native multi-window chat plus background Agents—automation that stays out of your way.
+- `1.5.2`: The new memory system is now live, allowing YOLO to more naturally remember your preferences, habits, and long-term context across conversations.
+- `1.5.1`: YOLO introduced an all-new Agent mode, turning AI from a chat assistant into something that can call tools, organize steps, and actively help get real work done.
+
 ## Highlights
 
 ### 🤖 Agent Mode
@@ -34,12 +42,17 @@ YOLO's Agent mode lets LLMs go beyond just "Q&A machines" — they can actually 
 | ![Agent Tools](./assets/agenttools.gif) | ![Agent Skills](./assets/agentskills.gif) |
 | Freely configure toolchains so Agents can read, write, edit, and organize your files directly | Encapsulate experience and SOPs into reusable skills, invoke with a single sentence — let the Agent work your way |
 
-### 🧠 Knowledge Base Q&A + ✍️ Smart Space & Quick Ask
+| Multi-Window Chat | Quick Ask |
+|:--:|:--:|
+| ![Chat Window](./assets/chatwindow.gif) | ![Quick Ask](./assets/Quickask.gif) |
+| Handle different tasks and contexts in parallel across multiple chat windows, making multitasking feel more natural | Trigger with a character (default `@`) to open an inline assistant for Q&A, editing, and continuation, making document editing seamless |
 
-| Knowledge Base Q&A | Smart Space | Quick Ask |
-|:--:|:--:|:--:|
-| ![RAG Vault](./assets/ragvault.gif) | ![Smart Space](./assets/Smartspace.gif) | ![Quick Ask](./assets/Quickask.gif) |
-| Turn your entire Vault into the AI's knowledge base, powered by RAG to answer with context from your notes instead of generic output | Summon anywhere to freely continue your creative flow with smooth content generation | Trigger with a character (default `@`) to open an inline assistant for Q&A, editing, and continuation, making document editing seamless |
+### 🧠 Knowledge Base Q&A + ✍️ Smart Space
+
+| Knowledge Base Q&A | Smart Space |
+|:--:|:--:|
+| ![RAG Vault](./assets/ragvault.gif) | ![Smart Space](./assets/Smartspace.gif) |
+| Turn your entire Vault into the AI's knowledge base, powered by RAG to answer with context from your notes instead of generic output | Summon anywhere to freely continue your creative flow with smooth content generation |
 
 ## Features
 
@@ -48,6 +61,7 @@ Beyond the core capabilities above, YOLO also provides:
 | Feature | Description |
 |---------|-------------|
 | 💬 Sidebar Chat | Seamless LLM conversation with context injection, preset prompts, Markdown smart parsing |
+| 🧠 Memory System | Lets YOLO remember preferences, habits, and long-term context for more consistent conversations |
 | 🪡 Cursor Chat | One-click context addition, conversation at your fingertips |
 | ⌨️ Tab Completion | Real-time AI-powered completion for smoother, more natural writing |
 | 🎛️ Multi-Model Support | OpenAI, Claude, Gemini, DeepSeek and other mainstream models, freely switch |
@@ -58,7 +72,7 @@ Beyond the core capabilities above, YOLO also provides:
 
 1. Open Obsidian Settings → Community Plugins → Browse → Search **"YOLO"**
 2. Install and enable
-3. Configure your API key in plugin settings:
+3. Configure your API key in plugin settings, or use your own ChatGPT OAuth / Gemini OAuth:
    - [OpenAI](https://platform.openai.com/api-keys) / [Anthropic](https://console.anthropic.com/settings/keys) / [Gemini](https://aistudio.google.com/apikey) / [Groq](https://console.groq.com/keys)
 4. Open the sidebar to start chatting — or try Quick Ask by typing `@` in the editor
 
@@ -77,9 +91,15 @@ See Quick Start above.
 > [!WARNING]
 > YOLO cannot coexist with [Smart Composer](https://github.com/glowingjade/obsidian-smart-composer). Please disable or uninstall Smart Composer before using YOLO.
 
+## Mobile Support Note
+
+Due to the capability gap between Obsidian mobile and desktop, YOLO cannot fully match the desktop feature set and overall experience on mobile in the short term. With limited personal maintenance bandwidth, I can currently only guarantee that YOLO remains usable on mobile, not that every feature will reach desktop-level parity.
+
+If you use YOLO on mobile, you may still encounter unavailable features, inconsistent behavior, or incomplete adaptations for some workflows. Please keep that expectation in mind.
+
 ## Roadmap
 
-- [ ] Better and stronger Vault AI search
+- [x] Better and stronger Vault AI search
 - [ ] Background Agent (long-running task automation)
 - [ ] Cron scheduled tasks
 - [ ] Multi-Agent orchestration

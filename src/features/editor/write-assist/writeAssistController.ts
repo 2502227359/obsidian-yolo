@@ -3,8 +3,8 @@ import { App, Editor, Notice, TFile, TFolder } from 'obsidian'
 
 import { executeSingleTurn } from '../../../core/ai/single-turn'
 import { getChatModelClient } from '../../../core/llm/manager'
-import type { RAGEngine } from '../../../core/rag/ragEngine'
-import type { SmartComposerSettings } from '../../../settings/schema/setting.types'
+import { promoteProviderTransportModeToObsidian } from '../../../core/llm/transportModePromotion'
+import type { YoloSettings } from '../../../settings/schema/setting.types'
 import type { ApplyViewState } from '../../../types/apply-view.types'
 import type { ConversationOverrideSettings } from '../../../types/conversation-settings.types'
 import type { LLMRequestBase, RequestMessage } from '../../../types/llm/request'
@@ -17,19 +17,19 @@ import {
   readMultipleTFiles,
   readTFileContent,
 } from '../../../utils/obsidian'
+import { resolvePromptVariables } from '../../../utils/prompt/promptVariables'
 
 type WriteAssistDeps = {
   app: App
-  getSettings: () => SmartComposerSettings
+  getSettings: () => YoloSettings
+  setSettings: (newSettings: YoloSettings) => Promise<void>
   t: (key: string, fallback?: string) => string
   getActiveConversationOverrides: () => ConversationOverrideSettings | undefined
   resolveContinuationParams: (overrides?: ConversationOverrideSettings) => {
     temperature?: number
     topP?: number
     stream: boolean
-    useVaultSearch: boolean
   }
-  getRagEngine: () => Promise<RAGEngine>
   getEditorView: (editor: Editor) => EditorView | null
   closeSmartSpace: () => void
   registerTimeout: (callback: () => void, timeout: number) => void
@@ -38,7 +38,6 @@ type WriteAssistDeps = {
   setContinuationInProgress: (value: boolean) => void
   cancelAllAiTasks: () => void
   clearInlineSuggestion: () => void
-  ensureInlineSuggestionExtension: (view: EditorView) => void
   setInlineSuggestionGhost: (
     view: EditorView,
     payload: { from: number; text: string } | null,
@@ -57,10 +56,8 @@ type WriteAssistDeps = {
     fromOffset: number
     startPos: ReturnType<Editor['getCursor']>
   }) => void
-  openApplyReview: (state: ApplyViewState) => Promise<void>
+  openApplyReview: (state: ApplyViewState) => Promise<boolean>
 }
-
-const FIRST_TOKEN_TIMEOUT_MS = 12000
 
 function getSelectionEndPosition(
   from: { line: number; ch: number },
@@ -121,32 +118,28 @@ export class WriteAssistController {
       const { providerClient, model } = getChatModelClient({
         settings,
         modelId: rewriteModelId,
+        onAutoPromoteTransportMode: (providerId, mode) => {
+          void promoteProviderTransportModeToObsidian({
+            getSettings: this.deps.getSettings,
+            setSettings: this.deps.setSettings,
+            providerId,
+            mode,
+          })
+        },
       })
 
       const systemPrompt =
         'You are an intelligent assistant that rewrites ONLY the provided markdown text according to the instruction. Preserve the original meaning, structure, and any markdown (links, emphasis, code) unless explicitly told otherwise. Output ONLY the rewritten text without code fences or extra explanations.'
 
       const instruction = (customPrompt ?? '').trim()
-      const isBaseModel = Boolean(model.isBaseModel)
-      const baseModelSpecialPrompt = (
-        settings.chatOptions.baseModelSpecialPrompt ?? ''
-      ).trim()
-      const basePromptSection =
-        isBaseModel && baseModelSpecialPrompt.length > 0
-          ? `${baseModelSpecialPrompt}\n\n`
-          : ''
       const requestMessages: RequestMessage[] = [
-        ...(isBaseModel
-          ? []
-          : [
-              {
-                role: 'system' as const,
-                content: systemPrompt,
-              },
-            ]),
+        {
+          role: 'system' as const,
+          content: systemPrompt,
+        },
         {
           role: 'user' as const,
-          content: `${basePromptSection}Instruction:\n${instruction}\n\nSelected text:\n${selected}\n\nRewrite the selected text accordingly. Output only the rewritten text.`,
+          content: `Instruction:\n${instruction}\n\nSelected text:\n${selected}\n\nRewrite the selected text accordingly. Output only the rewritten text.`,
         },
       ]
 
@@ -175,6 +168,10 @@ export class WriteAssistController {
         request: rewriteRequestBase,
         signal: controller.signal,
         stream: streamPreference,
+        primaryRequestTimeoutMs:
+          settings.continuationOptions.primaryRequestTimeoutMs,
+        streamFallbackRecoveryEnabled:
+          settings.continuationOptions.streamFallbackRecoveryEnabled,
       })
       const rewritten = stripFences(rewriteResult.content).trim()
       if (!rewritten) {
@@ -207,8 +204,6 @@ export class WriteAssistController {
           from,
           to,
         },
-        selectionOriginalText: selected,
-        selectionNewText: rewritten,
       } satisfies ApplyViewState)
 
       notice.setMessage('改写结果已生成。')
@@ -387,7 +382,6 @@ export class WriteAssistController {
         temperature,
         topP,
         stream: streamPreference,
-        useVaultSearch,
       } = this.deps.resolveContinuationParams(sidebarOverrides)
 
       const { providerClient, model } = getChatModelClient({
@@ -400,73 +394,14 @@ export class WriteAssistController {
         ? `Instruction:\n${userInstruction}\n\n`
         : ''
 
-      const systemPrompt = (settings.systemPrompt ?? '').trim()
+      const systemPrompt = resolvePromptVariables(
+        settings.systemPrompt ?? '',
+      ).trim()
 
       const activeFileForTitle = this.deps.app.workspace.getActiveFile()
       const fileTitle = activeFileForTitle?.basename?.trim() ?? ''
       const titleLine = fileTitle ? `File title: ${fileTitle}\n\n` : ''
       const hasContext = (baseContext ?? '').trim().length > 0
-
-      let ragContextSection = ''
-      const knowledgeBaseRaw =
-        settings.continuationOptions?.knowledgeBaseFolders ?? []
-      const knowledgeBaseFolders: string[] = []
-      const knowledgeBaseFiles: string[] = []
-      for (const raw of knowledgeBaseRaw) {
-        const trimmed = raw.trim()
-        if (!trimmed) continue
-        const abstract = this.deps.app.vault.getAbstractFileByPath(trimmed)
-        if (abstract instanceof TFolder) {
-          knowledgeBaseFolders.push(abstract.path)
-        } else if (abstract instanceof TFile) {
-          knowledgeBaseFiles.push(abstract.path)
-        }
-      }
-      const ragGloballyEnabled = Boolean(settings.ragOptions?.enabled)
-      if (useVaultSearch && ragGloballyEnabled) {
-        try {
-          const querySource = (
-            baseContext ||
-            userInstruction ||
-            fileTitle
-          ).trim()
-          if (querySource.length > 0) {
-            const ragEngine = await this.deps.getRagEngine()
-            const ragResults = await ragEngine.processQuery({
-              query: querySource.slice(-4000),
-              scope:
-                knowledgeBaseFolders.length > 0 || knowledgeBaseFiles.length > 0
-                  ? {
-                      folders: knowledgeBaseFolders,
-                      files: knowledgeBaseFiles,
-                    }
-                  : undefined,
-            })
-            const snippetLimit = Math.max(
-              1,
-              Math.min(settings.ragOptions?.limit ?? 10, 10),
-            )
-            const snippets = ragResults.slice(0, snippetLimit)
-            if (snippets.length > 0) {
-              const formatted = snippets
-                .map((snippet, index) => {
-                  const content = (snippet.content ?? '').trim()
-                  const truncated =
-                    content.length > 600
-                      ? `${content.slice(0, 600)}...`
-                      : content
-                  return `Snippet ${index + 1} (from ${snippet.path}):\n${truncated}`
-                })
-                .join('\n\n')
-              if (formatted.trim().length > 0) {
-                ragContextSection = `Vault snippets:\n\n${formatted}\n\n`
-              }
-            }
-          }
-        } catch (error) {
-          console.warn('Continuation RAG lookup failed:', error)
-        }
-      }
 
       if (controller.signal.aborted) {
         return
@@ -477,29 +412,10 @@ export class WriteAssistController {
         hasContext && limitedContextHasContent
           ? `Context (up to recent portion):\n\n${limitedContext}\n\n`
           : ''
-      const baseModelContextSection = `${
-        referenceRulesSection
-      }${mentionableContextSection}${
-        hasContext && limitedContextHasContent ? `${limitedContext}\n\n` : ''
-      }${ragContextSection}`
-      const combinedContextSection = `${referenceRulesSection}${mentionableContextSection}${contextSection}${ragContextSection}`
-
-      const isBaseModel = Boolean(model.isBaseModel)
-      const baseModelSpecialPrompt = (
-        settings.chatOptions.baseModelSpecialPrompt ?? ''
-      ).trim()
-      const basePromptSection =
-        isBaseModel && baseModelSpecialPrompt.length > 0
-          ? `${baseModelSpecialPrompt}\n\n`
-          : ''
-      const baseModelCoreContent = `${basePromptSection}${titleLine}${instructionSection}${baseModelContextSection}`
-
-      const userMessageContent = isBaseModel
-        ? `${baseModelCoreContent}`
-        : `${basePromptSection}${titleLine}${instructionSection}${combinedContextSection}`
+      const combinedContextSection = `${referenceRulesSection}${mentionableContextSection}${contextSection}`
 
       const requestMessages: RequestMessage[] = [
-        ...(!isBaseModel && systemPrompt.length > 0
+        ...(systemPrompt.length > 0
           ? [
               {
                 role: 'system' as const,
@@ -509,7 +425,7 @@ export class WriteAssistController {
           : []),
         {
           role: 'user' as const,
-          content: userMessageContent,
+          content: `${titleLine}${instructionSection}${combinedContextSection}`,
         },
       ]
 
@@ -521,8 +437,6 @@ export class WriteAssistController {
         this.deps.registerTimeout(() => notice.hide(), 1200)
         return
       }
-
-      this.deps.ensureInlineSuggestionExtension(view)
 
       // Ensure editor is focused so inline widgets render at the active cursor
       view.focus()
@@ -563,7 +477,6 @@ export class WriteAssistController {
         overrides: sidebarOverrides,
         request: baseRequest,
         streamPreference,
-        useVaultSearch,
       })
 
       const insertStart = hasSelection
@@ -630,7 +543,10 @@ export class WriteAssistController {
         request: baseRequest,
         signal: controller.signal,
         stream: streamPreference,
-        firstTokenTimeoutMs: FIRST_TOKEN_TIMEOUT_MS,
+        primaryRequestTimeoutMs:
+          settings.continuationOptions.primaryRequestTimeoutMs,
+        streamFallbackRecoveryEnabled:
+          settings.continuationOptions.streamFallbackRecoveryEnabled,
         geminiTools,
         onStreamDelta: ({ contentDelta, reasoningDelta }) => {
           if (reasoningDelta) {

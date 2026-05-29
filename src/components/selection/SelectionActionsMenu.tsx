@@ -1,11 +1,13 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Platform } from 'obsidian'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { useLanguage } from '../../contexts/language-context'
 import { useSettings } from '../../contexts/settings-context'
+import { resolveSelectionChatActions } from '../../features/editor/selection-chat/resolveSelectionChatActions'
 
 import type { SelectionInfo } from './SelectionManager'
 
-export type SelectionActionMode = 'ask' | 'rewrite' | 'chat-input'
+export type SelectionActionMode = 'ask' | 'rewrite' | 'chat-input' | 'chat-send'
 export type SelectionActionRewriteBehavior = 'custom' | 'preset'
 
 export type SelectionAction = {
@@ -14,6 +16,7 @@ export type SelectionAction = {
   instruction: string
   mode: SelectionActionMode
   rewriteBehavior?: SelectionActionRewriteBehavior
+  assistantId?: string
   handler: () => void | Promise<void>
 }
 
@@ -27,8 +30,11 @@ type SelectionActionsMenuProps = {
     instruction: string,
     mode: SelectionActionMode,
     rewriteBehavior?: SelectionActionRewriteBehavior,
+    assistantId?: string,
   ) => void | Promise<void>
   onHoverChange: (isHovering: boolean) => void
+  /** PDF selections cannot be rewritten — pass 'pdf' to hide rewrite actions. */
+  source?: 'markdown' | 'pdf'
 }
 
 export function SelectionActionsMenu({
@@ -38,7 +44,9 @@ export function SelectionActionsMenu({
   visible,
   onAction,
   onHoverChange,
+  source = 'markdown',
 }: SelectionActionsMenuProps) {
+  const isMobile = !Platform.isDesktop
   const { t } = useLanguage()
   const { settings } = useSettings()
   const menuRef = useRef<HTMLDivElement>(null)
@@ -46,108 +54,93 @@ export function SelectionActionsMenu({
   const [isVisible, setIsVisible] = useState(false)
   const showTimerRef = useRef<number | null>(null)
 
-  const defaultActions = useMemo(
-    () => [
-      {
-        id: 'custom-rewrite',
-        label: t('selection.actions.customRewrite', '自定义改写'),
-        instruction: '',
-        mode: 'rewrite' as const,
-        rewriteBehavior: 'custom' as const,
-      },
-      {
-        id: 'explain',
-        label: t('selection.actions.explain', '深入解释'),
-        instruction: t('selection.actions.explain', '深入解释'),
-        mode: 'ask' as const,
-      },
-      {
-        id: 'suggest',
-        label: t('selection.actions.suggest', '提供建议'),
-        instruction: t('selection.actions.suggest', '提供建议'),
-        mode: 'ask' as const,
-      },
-      {
-        id: 'translate-to-chinese',
-        label: t('selection.actions.translateToChinese', '翻译成中文'),
-        instruction: t('selection.actions.translateToChinese', '翻译成中文'),
-        mode: 'ask' as const,
-      },
-    ],
-    [t],
-  )
-
   const actions: SelectionAction[] = useMemo(() => {
-    const customActions = settings?.continuationOptions?.selectionChatActions
-    const resolvedActions =
-      customActions && customActions.length > 0
-        ? customActions.filter((action) => action.enabled)
-        : defaultActions
+    if (!settings) return []
+    const resolved = resolveSelectionChatActions(settings, t)
+    // PDF selections have no writable target: filter out all rewrite-mode actions.
+    const displayActions =
+      source === 'pdf'
+        ? resolved.filter((action) => action.mode !== 'rewrite')
+        : resolved
 
-    const hasCustomRewrite = resolvedActions.some(
-      (action) => action.id === 'custom-rewrite',
-    )
-    const displayActions = hasCustomRewrite
-      ? resolvedActions
-      : [defaultActions[0], ...resolvedActions]
+    return displayActions.map((action) => ({
+      id: action.id,
+      label: action.label,
+      instruction: action.instruction,
+      mode: action.mode,
+      rewriteBehavior: action.rewriteBehavior,
+      assistantId: action.assistantId,
+      handler: () =>
+        onAction(
+          action.id,
+          action.instruction,
+          action.mode,
+          action.rewriteBehavior,
+          action.assistantId,
+        ),
+    }))
+  }, [settings, t, source, onAction])
 
-    return displayActions.map((action) => {
-      const label = action.label?.trim() || ''
-      const mode: SelectionActionMode =
-        action.mode ??
-        (action.id === 'rewrite' || action.id === 'custom-rewrite'
-          ? 'rewrite'
-          : 'ask')
-      const rewriteBehavior: SelectionActionRewriteBehavior | undefined =
-        mode === 'rewrite'
-          ? (action.rewriteBehavior ??
-            (action.id === 'custom-rewrite' ? 'custom' : 'preset'))
-          : undefined
-      const rawInstruction = action.instruction?.trim() || ''
-      const resolvedInstruction =
-        mode === 'rewrite'
-          ? rawInstruction
-          : rawInstruction || label || action.id
-      return {
-        id: action.id,
-        label: label || action.id,
-        instruction: resolvedInstruction,
-        mode,
-        rewriteBehavior,
-        handler: () =>
-          onAction(action.id, resolvedInstruction, mode, rewriteBehavior),
-      }
-    })
-  }, [
-    defaultActions,
-    onAction,
-    settings?.continuationOptions?.selectionChatActions,
-  ])
+  const getMenuSize = useCallback(() => {
+    const measuredWidth = menuRef.current?.offsetWidth ?? 0
+    const measuredHeight = menuRef.current?.offsetHeight ?? 0
+
+    return {
+      width: measuredWidth > 0 ? measuredWidth : 180,
+      height: measuredHeight > 0 ? measuredHeight : 44 * actions.length + 16,
+    }
+  }, [actions.length])
 
   const updatePosition = useCallback(() => {
     const containerRect = containerEl.getBoundingClientRect()
-    // Position menu relative to indicator
-    const menuWidth = 200 // Approximate menu width
-    const menuHeight = 44 * actions.length + 16 // Approximate height
     const offset = 8
-
-    let left = indicatorPosition.left + 28 + offset // 28px is indicator width
-    let top = indicatorPosition.top
-
-    // Ensure menu stays within container bounds
     const viewportWidth = containerRect.width
     const viewportHeight = containerRect.height
+    const indicatorWidth = 28
+    const indicatorHeight = 28
+    let left = indicatorPosition.left + indicatorWidth + offset
+    let top = indicatorPosition.top
 
-    if (left + menuWidth > viewportWidth - 8) {
-      // Position to the left of indicator
-      left = indicatorPosition.left - menuWidth - offset
+    if (!isMobile) {
+      const menuWidth = 200
+      const menuHeight = 44 * actions.length + 16
+
+      if (left + menuWidth > viewportWidth - 8) {
+        left = indicatorPosition.left - menuWidth - offset
+      }
+      if (left < 8) {
+        left = 8
+      }
+
+      if (top + menuHeight > viewportHeight - 8) {
+        top = viewportHeight - menuHeight - 8
+      }
+      if (top < 8) {
+        top = 8
+      }
+
+      setPosition({ left, top })
+      return
     }
-    if (left < 8) {
-      left = 8
+
+    const { width: menuWidth, height: menuHeight } = getMenuSize()
+    const minLeft = 8
+    const maxLeft = Math.max(minLeft, containerRect.width - menuWidth - 8)
+    const preferredRightLeft = indicatorPosition.left + indicatorWidth + offset
+    const preferredLeftLeft = indicatorPosition.left - menuWidth - offset
+    const fallbackAlignedLeft =
+      indicatorPosition.left + indicatorWidth - menuWidth
+
+    if (preferredRightLeft + menuWidth <= viewportWidth - 8) {
+      left = preferredRightLeft
+    } else if (preferredLeftLeft >= minLeft) {
+      left = preferredLeftLeft
+    } else {
+      left = Math.min(maxLeft, Math.max(minLeft, fallbackAlignedLeft))
     }
 
     if (top + menuHeight > viewportHeight - 8) {
-      top = viewportHeight - menuHeight - 8
+      top = Math.max(8, indicatorPosition.top + indicatorHeight - menuHeight)
     }
     if (top < 8) {
       top = 8
@@ -157,13 +150,15 @@ export function SelectionActionsMenu({
   }, [
     actions.length,
     containerEl,
+    getMenuSize,
     indicatorPosition.left,
     indicatorPosition.top,
+    isMobile,
   ])
 
   useEffect(() => {
     updatePosition()
-  }, [selection, updatePosition])
+  }, [selection, updatePosition, visible])
 
   useEffect(() => {
     if (showTimerRef.current !== null) {
@@ -206,12 +201,17 @@ export function SelectionActionsMenu({
     () => ({
       left: `${Math.round(position.left)}px`,
       top: `${Math.round(position.top)}px`,
+      ...(isMobile
+        ? {
+            minWidth: '160px',
+            maxWidth: 'min(280px, calc(100vw - 24px))',
+          }
+        : {}),
     }),
-    [position.left, position.top],
+    [isMobile, position.left, position.top],
   )
 
-  const menuClasses =
-    `smtcmp-selection-menu ${isVisible ? 'visible' : ''}`.trim()
+  const menuClasses = `yolo-selection-menu ${isVisible ? 'visible' : ''}`.trim()
 
   return (
     <div
@@ -221,15 +221,15 @@ export function SelectionActionsMenu({
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
     >
-      <div className="smtcmp-selection-menu-content">
+      <div className="yolo-selection-menu-content">
         {actions.map((action) => (
           <button
             key={action.id}
             type="button"
-            className="smtcmp-selection-menu-item"
+            className="yolo-selection-menu-item"
             onClick={() => void handleActionClick(action)}
           >
-            <span className="smtcmp-selection-menu-item-label">
+            <span className="yolo-selection-menu-item-label">
               {action.label}
             </span>
           </button>

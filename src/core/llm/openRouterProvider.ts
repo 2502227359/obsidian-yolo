@@ -5,37 +5,99 @@ import {
   LLMOptions,
   LLMRequestNonStreaming,
   LLMRequestStreaming,
+  RequestTool,
 } from '../../types/llm/request'
 import {
   LLMResponseNonStreaming,
   LLMResponseStreaming,
 } from '../../types/llm/response'
-import { LLMProvider } from '../../types/provider.types'
-import { detectReasoningTypeFromModelId } from '../../utils/model-id-utils'
+import { LLMProvider, RequestTransportMode } from '../../types/provider.types'
+import {
+  REASONING_META,
+  resolveRequestReasoningLevel,
+} from '../../types/reasoning'
+import { getBuiltinProviderTools } from '../../utils/llm/model-tools'
+import { resolveProviderBaseUrl } from '../../utils/llm/provider-base-url'
 import { toProviderHeadersRecord } from '../../utils/llm/provider-headers'
+import { detectReasoningTypeFromModelId } from '../../utils/model-id-utils'
 
 import { BaseLLMProvider } from './base'
 import { extractEmbeddingVector } from './embedding-utils'
 import { OpenAIMessageAdapter } from './openaiMessageAdapter'
+import { ModelRequestPolicy, resolveSdkMaxRetries } from './requestPolicy'
+import {
+  AutoPromotedTransportMode,
+  createRequestTransportMemoryKey,
+  resolveRequestTransportMode,
+  runWithRequestTransport,
+  runWithRequestTransportForStream,
+} from './requestTransport'
+import { createTransportClients } from './transportClients'
 
-export class OpenRouterProvider extends BaseLLMProvider<
-  Extract<LLMProvider, { type: 'openrouter' }>
-> {
+export class OpenRouterProvider extends BaseLLMProvider<LLMProvider> {
   private adapter: OpenAIMessageAdapter
-  private client: OpenAI
+  private browserClient: OpenAI
+  private obsidianClient: OpenAI
+  private nodeClient: OpenAI
+  private requestTransportMode: RequestTransportMode
+  private requestTransportMemoryKey: string
+  private onAutoPromoteTransportMode?: (mode: AutoPromotedTransportMode) => void
 
-  constructor(provider: Extract<LLMProvider, { type: 'openrouter' }>) {
+  private promoteTransportMode = (mode: AutoPromotedTransportMode) => {
+    if (this.requestTransportMode === mode) {
+      return
+    }
+
+    this.provider.additionalSettings = {
+      ...(this.provider.additionalSettings ?? {}),
+      requestTransportMode: mode,
+    }
+    this.requestTransportMode = mode
+    this.onAutoPromoteTransportMode?.(mode)
+  }
+
+  constructor(
+    provider: LLMProvider,
+    options?: {
+      onAutoPromoteTransportMode?: (mode: AutoPromotedTransportMode) => void
+      requestPolicy?: ModelRequestPolicy
+    },
+  ) {
     super(provider)
     this.adapter = new OpenAIMessageAdapter()
+    this.onAutoPromoteTransportMode = options?.onAutoPromoteTransportMode
     const defaultHeaders = toProviderHeadersRecord(provider.customHeaders)
-    this.client = new OpenAI({
+    this.requestTransportMemoryKey = createRequestTransportMemoryKey({
+      providerType: provider.presetType,
+      providerId: provider.id,
+      baseUrl: provider.baseUrl,
+    })
+    this.requestTransportMode = resolveRequestTransportMode({
+      additionalSettings: provider.additionalSettings,
+      hasCustomBaseUrl: !!provider.baseUrl,
+      memoryKey: this.requestTransportMemoryKey,
+    })
+    const clientOptions = {
       apiKey: provider.apiKey ?? '',
-      baseURL: provider.baseUrl
-        ? provider.baseUrl?.replace(/\/+$/, '')
-        : 'https://openrouter.ai/api/v1',
+      baseURL: resolveProviderBaseUrl(provider),
       dangerouslyAllowBrowser: true,
       defaultHeaders,
-    })
+      maxRetries: resolveSdkMaxRetries({
+        requestPolicy: options?.requestPolicy,
+        requestTransportMode: this.requestTransportMode,
+      }),
+      timeout: options?.requestPolicy?.timeoutMs,
+    }
+    const clients = createTransportClients(
+      (transportFetch) =>
+        new OpenAI({
+          ...clientOptions,
+          fetch: transportFetch,
+        }),
+    )
+    this.browserClient = clients.browserClient
+    this.obsidianClient = clients.obsidianClient
+    this.nodeClient = clients.nodeClient
   }
 
   async generateResponse(
@@ -43,16 +105,33 @@ export class OpenRouterProvider extends BaseLLMProvider<
     request: LLMRequestNonStreaming,
     options?: LLMOptions,
   ): Promise<LLMResponseNonStreaming> {
-    if (model.providerType !== 'openrouter') {
-      throw new Error('Model is not an OpenRouter model')
-    }
-
     const mergedRequest = this.applyCustomModelParameters(
       model,
-      this.applyReasoningConfig(model, request),
+      this.applyBuiltinProviderTools(
+        model,
+        this.applyReasoningConfig(model, request),
+      ),
     )
 
-    return this.adapter.generateResponse(this.client, mergedRequest, options)
+    return runWithRequestTransport({
+      mode: this.requestTransportMode,
+      memoryKey: this.requestTransportMemoryKey,
+      onAutoPromoteTransportMode: this.promoteTransportMode,
+      runBrowser: () =>
+        this.adapter.generateResponse(
+          this.browserClient,
+          mergedRequest,
+          options,
+        ),
+      runObsidian: () =>
+        this.adapter.generateResponse(
+          this.obsidianClient,
+          mergedRequest,
+          options,
+        ),
+      runNode: () =>
+        this.adapter.generateResponse(this.nodeClient, mergedRequest, options),
+    })
   }
 
   async streamResponse(
@@ -60,23 +139,68 @@ export class OpenRouterProvider extends BaseLLMProvider<
     request: LLMRequestStreaming,
     options?: LLMOptions,
   ): Promise<AsyncIterable<LLMResponseStreaming>> {
-    if (model.providerType !== 'openrouter') {
-      throw new Error('Model is not an OpenRouter model')
-    }
-
     const mergedRequest = this.applyCustomModelParameters(
       model,
-      this.applyReasoningConfig(model, request),
+      this.applyBuiltinProviderTools(
+        model,
+        this.applyReasoningConfig(model, request),
+      ),
     )
 
-    return this.adapter.streamResponse(this.client, mergedRequest, options)
+    return runWithRequestTransportForStream({
+      mode: this.requestTransportMode,
+      memoryKey: this.requestTransportMemoryKey,
+      onAutoPromoteTransportMode: this.promoteTransportMode,
+      signal: options?.signal,
+      createBrowserStream: (signal) =>
+        this.adapter.streamResponse(this.browserClient, mergedRequest, {
+          ...options,
+          signal: signal ?? options?.signal,
+        }),
+      createObsidianStream: (signal) =>
+        this.adapter.streamResponse(this.obsidianClient, mergedRequest, {
+          ...options,
+          signal: signal ?? options?.signal,
+        }),
+      createNodeStream: (signal) =>
+        this.adapter.streamResponse(this.nodeClient, mergedRequest, {
+          ...options,
+          signal: signal ?? options?.signal,
+        }),
+    })
   }
 
-  async getEmbedding(model: string, text: string): Promise<number[]> {
+  async getEmbedding(
+    model: string,
+    text: string,
+    options?: { dimensions?: number },
+  ): Promise<number[]> {
+    const dimensionsParam = options?.dimensions
+      ? { dimensions: options.dimensions }
+      : {}
     try {
-      const embedding = await this.client.embeddings.create({
-        model: model,
-        input: text,
+      const embedding = await runWithRequestTransport({
+        mode: this.requestTransportMode,
+        memoryKey: this.requestTransportMemoryKey,
+        onAutoPromoteTransportMode: this.promoteTransportMode,
+        runBrowser: () =>
+          this.browserClient.embeddings.create({
+            model: model,
+            input: text,
+            ...dimensionsParam,
+          }),
+        runObsidian: () =>
+          this.obsidianClient.embeddings.create({
+            model: model,
+            input: text,
+            ...dimensionsParam,
+          }),
+        runNode: () =>
+          this.nodeClient.embeddings.create({
+            model: model,
+            input: text,
+            ...dimensionsParam,
+          }),
       })
       return extractEmbeddingVector(embedding)
     } catch (error) {
@@ -86,11 +210,65 @@ export class OpenRouterProvider extends BaseLLMProvider<
     }
   }
 
+  /**
+   * Serialize OpenRouter's hosted web search to the official server-tool entry
+   * (https://openrouter.ai/docs/guides/features/server-tools/web-search):
+   *
+   *   tools: [{ type: 'openrouter:web_search', parameters: { engine?, max_results? } }]
+   *
+   * OpenRouter intercepts the entry at the router layer, runs the search, and
+   * stitches results into the prompt before forwarding to the upstream model,
+   * so it works uniformly across Claude / Gemini / DeepSeek / etc. — the older
+   * `plugins:[{id:'web'}]` form is deprecated.
+   *
+   * `engine` is omitted when set to `auto` (OpenRouter's default).
+   *
+   * Other built-in tool families are dropped: forwarding `{type:'web_search'}`
+   * or `grok:live_search` to OpenRouter would be rejected (or change the
+   * user's intent), so a stale cross-provider config silently no-ops on this
+   * transport instead.
+   */
+  private applyBuiltinProviderTools<
+    RequestType extends LLMRequestNonStreaming | LLMRequestStreaming,
+  >(model: ChatModel, request: RequestType): RequestType {
+    const orTool = getBuiltinProviderTools(model).find(
+      (t) => t.type === 'openrouter:web_search',
+    )
+    if (!orTool || orTool.type !== 'openrouter:web_search') {
+      return request
+    }
+    const parameters: Record<string, unknown> = {}
+    if (orTool.engine) {
+      parameters.engine = orTool.engine
+    }
+    if (typeof orTool.maxResults === 'number') {
+      parameters.max_results = orTool.maxResults
+    }
+    const entry: Record<string, unknown> = { type: 'openrouter:web_search' }
+    if (Object.keys(parameters).length > 0) {
+      entry.parameters = parameters
+    }
+    // Cast: `entry` is OpenRouter's namespaced server-tool variant
+    // (`type:'openrouter:web_search'`), which sits outside the local
+    // `RequestTool` union (function-only). It's passed through verbatim to the
+    // OpenRouter HTTP body — no other provider sees it because this method is
+    // OpenRouter-specific.
+    const next = { ...request } as RequestType & Record<string, unknown>
+    const existingTools = Array.isArray(next.tools) ? next.tools : []
+    next.tools = [...existingTools, entry as unknown as RequestTool]
+    return next
+  }
+
   private applyReasoningConfig<
     RequestType extends LLMRequestNonStreaming | LLMRequestStreaming,
   >(model: ChatModel, request: RequestType): RequestType {
     const formattedRequest = { ...request } as RequestType &
       Record<string, unknown>
+
+    const level = resolveRequestReasoningLevel(model, request.reasoningLevel)
+    if (level === undefined) {
+      return formattedRequest as RequestType
+    }
 
     const resolveReasoningType = () => {
       if (model.reasoningType && model.reasoningType !== 'none') {
@@ -101,62 +279,34 @@ export class OpenRouterProvider extends BaseLLMProvider<
     }
 
     const reasoningType = resolveReasoningType()
-    const thinkingModel = model as ChatModel & {
-      thinking?: {
-        enabled?: boolean
-        thinking_budget?: number
-        budget_tokens?: number
+    if (!reasoningType) {
+      return formattedRequest as RequestType
+    }
+
+    if (reasoningType === 'openai') {
+      if (level === 'auto') {
+        return formattedRequest as RequestType
       }
-    }
-    const reasoningModel = model as ChatModel & {
-      reasoning?: { enabled?: boolean; reasoning_effort?: string }
-    }
-
-    const budget =
-      thinkingModel.thinking?.thinking_budget ??
-      thinkingModel.thinking?.budget_tokens
-
-    if (reasoningType === 'openai' && reasoningModel.reasoning) {
-      if (reasoningModel.reasoning.enabled === false) {
+      if (level === 'off') {
         formattedRequest.reasoning = { effort: 'none', exclude: true }
       } else {
-        const effort = reasoningModel.reasoning.reasoning_effort as
-          | 'low'
-          | 'medium'
-          | 'high'
-          | undefined
-        if (effort) {
-          formattedRequest.reasoning = { effort }
-        } else if (reasoningModel.reasoning.enabled) {
-          formattedRequest.reasoning = { enabled: true }
-        }
+        formattedRequest.reasoning = { effort: REASONING_META[level].effort }
       }
+      return formattedRequest as RequestType
     }
 
-    if (reasoningType !== 'openai' && thinkingModel.thinking) {
-      if (thinkingModel.thinking.enabled === false) {
-        formattedRequest.reasoning = { max_tokens: 0, exclude: true }
-      } else if (budget === -1) {
-        formattedRequest.reasoning = { enabled: true }
-      } else if (typeof budget === 'number') {
-        if (budget <= 0) {
-          formattedRequest.reasoning = { max_tokens: 0, exclude: true }
-        } else {
-          formattedRequest.reasoning = { max_tokens: budget }
-        }
-      }
+    if (level === 'off') {
+      formattedRequest.reasoning = { max_tokens: 0, exclude: true }
+      return formattedRequest as RequestType
+    }
+    if (level === 'auto') {
+      formattedRequest.reasoning = { enabled: true }
+      return formattedRequest as RequestType
     }
 
-    if (!reasoningType && reasoningModel.reasoning) {
-      if (reasoningModel.reasoning.enabled === false) {
-        formattedRequest.reasoning = { effort: 'none', exclude: true }
-      } else if (reasoningModel.reasoning.reasoning_effort) {
-        formattedRequest.reasoning = {
-          effort: reasoningModel.reasoning.reasoning_effort,
-        }
-      }
+    formattedRequest.reasoning = {
+      max_tokens: REASONING_META[level].budget,
     }
-
     return formattedRequest as RequestType
   }
 }

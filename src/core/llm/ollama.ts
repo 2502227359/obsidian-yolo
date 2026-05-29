@@ -13,29 +13,87 @@ import {
   LLMResponseNonStreaming,
   LLMResponseStreaming,
 } from '../../types/llm/response'
-import { LLMProvider } from '../../types/provider.types'
+import { LLMProvider, RequestTransportMode } from '../../types/provider.types'
+import { resolveProviderBaseUrl } from '../../utils/llm/provider-base-url'
 import { toProviderHeadersRecord } from '../../utils/llm/provider-headers'
 
 import { BaseLLMProvider } from './base'
 import { NoStainlessOpenAI } from './NoStainlessOpenAI'
 import { OpenAIMessageAdapter } from './openaiMessageAdapter'
+import { ModelRequestPolicy, resolveSdkMaxRetries } from './requestPolicy'
+import {
+  AutoPromotedTransportMode,
+  createRequestTransportMemoryKey,
+  resolveRequestTransportMode,
+  runWithRequestTransport,
+  runWithRequestTransportForStream,
+} from './requestTransport'
+import { createTransportClients } from './transportClients'
 
-export class OllamaProvider extends BaseLLMProvider<
-  Extract<LLMProvider, { type: 'ollama' }>
-> {
+export class OllamaProvider extends BaseLLMProvider<LLMProvider> {
   private adapter: OpenAIMessageAdapter
-  private client: NoStainlessOpenAI
+  private browserClient: NoStainlessOpenAI
+  private obsidianClient: NoStainlessOpenAI
+  private nodeClient: NoStainlessOpenAI
+  private requestTransportMode: RequestTransportMode
+  private requestTransportMemoryKey: string
+  private onAutoPromoteTransportMode?: (mode: AutoPromotedTransportMode) => void
 
-  constructor(provider: Extract<LLMProvider, { type: 'ollama' }>) {
+  private promoteTransportMode = (mode: AutoPromotedTransportMode) => {
+    if (this.requestTransportMode === mode) {
+      return
+    }
+
+    this.provider.additionalSettings = {
+      ...(this.provider.additionalSettings ?? {}),
+      requestTransportMode: mode,
+    }
+    this.requestTransportMode = mode
+    this.onAutoPromoteTransportMode?.(mode)
+  }
+
+  constructor(
+    provider: LLMProvider,
+    options?: {
+      onAutoPromoteTransportMode?: (mode: AutoPromotedTransportMode) => void
+      requestPolicy?: ModelRequestPolicy
+    },
+  ) {
     super(provider)
     this.adapter = new OpenAIMessageAdapter()
+    this.onAutoPromoteTransportMode = options?.onAutoPromoteTransportMode
     const defaultHeaders = toProviderHeadersRecord(provider.customHeaders)
-    this.client = new NoStainlessOpenAI({
-      baseURL: `${provider.baseUrl ? provider.baseUrl.replace(/\/+$/, '') : 'http://127.0.0.1:11434'}/v1`,
+    this.requestTransportMemoryKey = createRequestTransportMemoryKey({
+      providerType: provider.presetType,
+      providerId: provider.id,
+      baseUrl: provider.baseUrl,
+    })
+    this.requestTransportMode = resolveRequestTransportMode({
+      additionalSettings: provider.additionalSettings,
+      hasCustomBaseUrl: !!provider.baseUrl,
+      memoryKey: this.requestTransportMemoryKey,
+    })
+    const clientOptions = {
+      baseURL: `${resolveProviderBaseUrl(provider)}/v1`,
       apiKey: provider.apiKey ?? '',
       dangerouslyAllowBrowser: true,
       defaultHeaders,
-    })
+      maxRetries: resolveSdkMaxRetries({
+        requestPolicy: options?.requestPolicy,
+        requestTransportMode: this.requestTransportMode,
+      }),
+      timeout: options?.requestPolicy?.timeoutMs,
+    }
+    const clients = createTransportClients(
+      (transportFetch) =>
+        new NoStainlessOpenAI({
+          ...clientOptions,
+          fetch: transportFetch,
+        }),
+    )
+    this.browserClient = clients.browserClient
+    this.obsidianClient = clients.obsidianClient
+    this.nodeClient = clients.nodeClient
   }
 
   async generateResponse(
@@ -43,13 +101,27 @@ export class OllamaProvider extends BaseLLMProvider<
     request: LLMRequestNonStreaming,
     options?: LLMOptions,
   ): Promise<LLMResponseNonStreaming> {
-    if (model.providerType !== 'ollama') {
-      throw new Error('Model is not an Ollama model')
-    }
-
     const mergedRequest = this.applyCustomModelParameters(model, request)
 
-    return this.adapter.generateResponse(this.client, mergedRequest, options)
+    return runWithRequestTransport({
+      mode: this.requestTransportMode,
+      memoryKey: this.requestTransportMemoryKey,
+      onAutoPromoteTransportMode: this.promoteTransportMode,
+      runBrowser: () =>
+        this.adapter.generateResponse(
+          this.browserClient,
+          mergedRequest,
+          options,
+        ),
+      runObsidian: () =>
+        this.adapter.generateResponse(
+          this.obsidianClient,
+          mergedRequest,
+          options,
+        ),
+      runNode: () =>
+        this.adapter.generateResponse(this.nodeClient, mergedRequest, options),
+    })
   }
 
   async streamResponse(
@@ -57,20 +129,58 @@ export class OllamaProvider extends BaseLLMProvider<
     request: LLMRequestStreaming,
     options?: LLMOptions,
   ): Promise<AsyncIterable<LLMResponseStreaming>> {
-    if (model.providerType !== 'ollama') {
-      throw new Error('Model is not an Ollama model')
-    }
-
     const mergedRequest = this.applyCustomModelParameters(model, request)
 
-    return this.adapter.streamResponse(this.client, mergedRequest, options)
+    return runWithRequestTransportForStream({
+      mode: this.requestTransportMode,
+      memoryKey: this.requestTransportMemoryKey,
+      onAutoPromoteTransportMode: this.promoteTransportMode,
+      signal: options?.signal,
+      createBrowserStream: (signal) =>
+        this.adapter.streamResponse(this.browserClient, mergedRequest, {
+          ...options,
+          signal: signal ?? options?.signal,
+        }),
+      createObsidianStream: (signal) =>
+        this.adapter.streamResponse(this.obsidianClient, mergedRequest, {
+          ...options,
+          signal: signal ?? options?.signal,
+        }),
+      createNodeStream: (signal) =>
+        this.adapter.streamResponse(this.nodeClient, mergedRequest, {
+          ...options,
+          signal: signal ?? options?.signal,
+        }),
+    })
   }
 
-  async getEmbedding(model: string, text: string): Promise<number[]> {
-    const embedding = await this.client.embeddings.create({
-      model: model,
-      input: text,
-      encoding_format: 'float',
+  async getEmbedding(
+    model: string,
+    text: string,
+    _options?: { dimensions?: number },
+  ): Promise<number[]> {
+    const embedding = await runWithRequestTransport({
+      mode: this.requestTransportMode,
+      memoryKey: this.requestTransportMemoryKey,
+      onAutoPromoteTransportMode: this.promoteTransportMode,
+      runBrowser: () =>
+        this.browserClient.embeddings.create({
+          model: model,
+          input: text,
+          encoding_format: 'float',
+        }),
+      runObsidian: () =>
+        this.obsidianClient.embeddings.create({
+          model: model,
+          input: text,
+          encoding_format: 'float',
+        }),
+      runNode: () =>
+        this.nodeClient.embeddings.create({
+          model: model,
+          input: text,
+          encoding_format: 'float',
+        }),
     })
     return embedding.data[0].embedding
   }

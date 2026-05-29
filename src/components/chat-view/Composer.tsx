@@ -1,7 +1,5 @@
-import { Notice } from 'obsidian'
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import { RECOMMENDED_MODELS_FOR_EMBEDDING } from '../../constants'
 import { useApp } from '../../contexts/app-context'
 import { useLanguage } from '../../contexts/language-context'
 import { usePlugin } from '../../contexts/plugin-context'
@@ -12,26 +10,15 @@ import {
   DEFAULT_TAB_COMPLETION_TRIGGERS,
   type TabCompletionTrigger,
 } from '../../settings/schema/setting.types'
-import type { SmartComposerSettings } from '../../settings/schema/setting.types'
-import { findFilesMatchingPatterns } from '../../utils/glob-utils'
+import type { YoloSettings } from '../../settings/schema/setting.types'
 import { getModelDisplayName } from '../../utils/model-id-utils'
-import {
-  folderPathsToIncludePatterns,
-  includePatternsToFolderPaths,
-} from '../../utils/rag-utils'
 import { ObsidianButton } from '../common/ObsidianButton'
-import {
-  ObsidianDropdown,
-  type ObsidianDropdownOptionGroup,
-} from '../common/ObsidianDropdown'
+import { ObsidianDropdown } from '../common/ObsidianDropdown'
 import { ObsidianTextArea } from '../common/ObsidianTextArea'
 import { ObsidianTextInput } from '../common/ObsidianTextInput'
 import { ObsidianToggle } from '../common/ObsidianToggle'
+import { ReasoningPanel } from '../common/ReasoningPanel'
 import { SimpleSelect } from '../common/SimpleSelect'
-import { FolderSelectionList } from '../settings/inputs/FolderSelectionList'
-import { EmbeddingDbManageModal } from '../settings/modals/EmbeddingDbManageModal'
-import { ExcludedFilesModal } from '../settings/modals/ExcludedFilesModal'
-import { IncludedFilesModal } from '../settings/modals/IncludedFilesModal'
 import { SelectionChatActionsSettings } from '../settings/SelectionChatActionsSettings'
 import { SmartSpaceQuickActionsSettings } from '../settings/SmartSpaceQuickActionsSettings'
 
@@ -53,11 +40,7 @@ const Composer: React.FC<ComposerProps> = (_props) => {
   const composerRef = useRef<HTMLDivElement>(null)
 
   const [activeTab, setActiveTab] = useState<SparkleTab>('smart-space')
-  const [showRagAdvanced, setShowRagAdvanced] = useState(false)
   const [showTabAdvanced, setShowTabAdvanced] = useState(false)
-  const [isIndexing, setIsIndexing] = useState(false)
-  const [indexAbortController, setIndexAbortController] =
-    useState<AbortController | null>(null)
 
   const orderedEnabledModels = useMemo(() => {
     const enabledModels = settings.chatModels.filter(
@@ -113,7 +96,7 @@ const Composer: React.FC<ComposerProps> = (_props) => {
   }, [orderedEnabledModels, settings.providers])
 
   const updateContinuationOptions = useCallback(
-    (updates: Partial<SmartComposerSettings['continuationOptions']>) => {
+    (updates: Partial<YoloSettings['continuationOptions']>) => {
       void setSettings({
         ...settings,
         continuationOptions: {
@@ -123,30 +106,6 @@ const Composer: React.FC<ComposerProps> = (_props) => {
       })
     },
     [setSettings, settings],
-  )
-
-  const applySettingsUpdate = useCallback(
-    (nextSettings: SmartComposerSettings, errorMessage: string) => {
-      void (async () => {
-        try {
-          await setSettings(nextSettings)
-        } catch (error: unknown) {
-          console.error('[Sparkle] ' + errorMessage, error)
-          new Notice(errorMessage)
-        }
-      })()
-    },
-    [setSettings],
-  )
-
-  const isRagEnabled = settings.ragOptions.enabled ?? true
-  const includeFolders = useMemo(
-    () => includePatternsToFolderPaths(settings.ragOptions.includePatterns),
-    [settings.ragOptions.includePatterns],
-  )
-  const excludeFolders = useMemo(
-    () => includePatternsToFolderPaths(settings.ragOptions.excludePatterns),
-    [settings.ragOptions.excludePatterns],
   )
 
   const parseIntegerInput = (value: string) => {
@@ -171,70 +130,6 @@ const Composer: React.FC<ComposerProps> = (_props) => {
     const parsed = Number(trimmed)
     return Number.isFinite(parsed) ? parsed : null
   }
-
-  const [ragNumberInputs, setRagNumberInputs] = useState<NumberInputState>({
-    chunkSize: String(settings.ragOptions.chunkSize),
-    minSimilarity: String(settings.ragOptions.minSimilarity),
-    limit: String(settings.ragOptions.limit),
-    autoUpdateIntervalHours: String(
-      settings.ragOptions.autoUpdateIntervalHours ?? 24,
-    ),
-  })
-
-  useEffect(() => {
-    setRagNumberInputs((prev) => ({
-      ...prev,
-      chunkSize: String(settings.ragOptions.chunkSize),
-      minSimilarity: String(settings.ragOptions.minSimilarity),
-      limit: String(settings.ragOptions.limit),
-      autoUpdateIntervalHours: String(
-        settings.ragOptions.autoUpdateIntervalHours ?? 24,
-      ),
-    }))
-  }, [
-    settings.ragOptions.chunkSize,
-    settings.ragOptions.minSimilarity,
-    settings.ragOptions.limit,
-    settings.ragOptions.autoUpdateIntervalHours,
-  ])
-
-  const embeddingModelOptionGroups = useMemo<
-    ObsidianDropdownOptionGroup[]
-  >(() => {
-    const providerOrder = settings.providers.map((p) => p.id)
-    const providerIdsInModels = Array.from(
-      new Set(settings.embeddingModels.map((model) => model.providerId)),
-    )
-    const orderedProviderIds = [
-      ...providerOrder.filter((id) => providerIdsInModels.includes(id)),
-      ...providerIdsInModels.filter((id) => !providerOrder.includes(id)),
-    ]
-    const recommendedBadge =
-      t('settings.defaults.recommendedBadge', '(Recommended)') ??
-      '(Recommended)'
-
-    return orderedProviderIds
-      .map<ObsidianDropdownOptionGroup | null>((providerId) => {
-        const groupModels = settings.embeddingModels.filter(
-          (model) => model.providerId === providerId,
-        )
-        if (groupModels.length === 0) return null
-        return {
-          label: providerId,
-          options: groupModels.map((model) => {
-            const baseLabel = model.name || model.model || model.id
-            const badge = RECOMMENDED_MODELS_FOR_EMBEDDING.includes(model.id)
-              ? ` ${recommendedBadge}`
-              : ''
-            return {
-              value: model.id,
-              label: `${baseLabel}${badge}`.trim(),
-            }
-          }),
-        }
-      })
-      .filter((group): group is ObsidianDropdownOptionGroup => group !== null)
-  }, [settings.embeddingModels, settings.providers, t])
 
   const enableSmartSpace = settings.continuationOptions.enableSmartSpace ?? true
   const smartSpaceTriggerMode =
@@ -364,85 +259,21 @@ const Composer: React.FC<ComposerProps> = (_props) => {
     settings.continuationOptions.continuationModelId ??
     orderedEnabledModels[0]?.id ??
     ''
-
-  const handleRagUpdate = (reindexAll: boolean) => {
-    void (async () => {
-      const abortController = new AbortController()
-      setIndexAbortController(abortController)
-      setIsIndexing(true)
-
-      try {
-        if (reindexAll) {
-          try {
-            const dbManager = await plugin.getDbManager()
-            const resourceCheck = dbManager.checkPGliteResources()
-            if (!resourceCheck.available) {
-              new Notice(
-                t(
-                  'notices.pgliteUnavailable',
-                  'PGlite resources unavailable. Please reinstall the plugin.',
-                ),
-                5000,
-              )
-              return
-            }
-          } catch (error) {
-            console.warn('Failed to check PGlite resources:', error)
-          }
-        }
-
-        const ragEngine = await plugin.getRAGEngine()
-        await ragEngine.updateVaultIndex(
-          { reindexAll, signal: abortController.signal },
-          () => {
-            return
-          },
-        )
-
-        await plugin.setSettings({
-          ...plugin.settings,
-          ragOptions: {
-            ...plugin.settings.ragOptions,
-            lastAutoUpdateAt: Date.now(),
-          },
-        })
-
-        new Notice(
-          reindexAll ? t('notices.rebuildComplete') : t('notices.indexUpdated'),
-        )
-      } catch (error) {
-        if (error instanceof DOMException && error.name === 'AbortError') {
-          new Notice(t('notices.indexCancelled', '索引已取消'))
-        } else {
-          console.error('Failed to update index:', error)
-          new Notice(
-            reindexAll
-              ? t('notices.rebuildFailed')
-              : t('notices.indexUpdateFailed'),
-          )
-        }
-      } finally {
-        setIsIndexing(false)
-        setIndexAbortController(null)
-      }
-    })()
-  }
-
-  const handleCancelIndex = () => {
-    if (!indexAbortController) return
-    indexAbortController.abort()
-    new Notice(t('notices.indexCancelling', '正在取消索引...'))
-  }
+  const tabCompletionChatModel = useMemo(
+    () =>
+      orderedEnabledModels.find((m) => m.id === tabCompletionModelId) ?? null,
+    [orderedEnabledModels, tabCompletionModelId],
+  )
 
   return (
-    <div className="smtcmp-composer-container" ref={composerRef}>
+    <div className="yolo-composer-container" ref={composerRef}>
       <div
-        className="smtcmp-composer-tabs smtcmp-composer-tabs--glider"
+        className="yolo-composer-tabs yolo-composer-tabs--glider"
         role="tablist"
         style={
           {
-            '--smtcmp-tab-count': 3,
-            '--smtcmp-tab-index': [
+            '--yolo-tab-count': 3,
+            '--yolo-tab-index': [
               'smart-space',
               'quick-ask',
               'tab-completion',
@@ -450,57 +281,57 @@ const Composer: React.FC<ComposerProps> = (_props) => {
           } as React.CSSProperties
         }
       >
-        <div className="smtcmp-composer-tabs-glider" aria-hidden="true" />
+        <div className="yolo-composer-tabs-glider" aria-hidden="true" />
         <button
-          className={`smtcmp-composer-tab${
+          className={`yolo-composer-tab${
             activeTab === 'smart-space' ? ' is-active' : ''
           }`}
           onClick={() => setActiveTab('smart-space')}
           role="tab"
           aria-selected={activeTab === 'smart-space'}
         >
-          <span className="smtcmp-composer-tab-label">
+          <span className="yolo-composer-tab-label">
             {t('settings.continuation.customSubsectionTitle', 'Smart Space')}
           </span>
         </button>
         <button
-          className={`smtcmp-composer-tab${
+          className={`yolo-composer-tab${
             activeTab === 'quick-ask' ? ' is-active' : ''
           }`}
           onClick={() => setActiveTab('quick-ask')}
           role="tab"
           aria-selected={activeTab === 'quick-ask'}
         >
-          <span className="smtcmp-composer-tab-label">
+          <span className="yolo-composer-tab-label">
             {t('settings.continuation.quickAskSubsectionTitle', 'Quick Ask')}
           </span>
         </button>
         <button
-          className={`smtcmp-composer-tab${
+          className={`yolo-composer-tab${
             activeTab === 'tab-completion' ? ' is-active' : ''
           }`}
           onClick={() => setActiveTab('tab-completion')}
           role="tab"
           aria-selected={activeTab === 'tab-completion'}
         >
-          <span className="smtcmp-composer-tab-label">
+          <span className="yolo-composer-tab-label">
             {t('settings.continuation.tabSubsectionTitle', 'Tab completion')}
           </span>
         </button>
       </div>
 
-      <div className="smtcmp-composer-scroll">
+      <div className="yolo-composer-scroll">
         {activeTab === 'smart-space' && (
           <>
-            <section className="smtcmp-composer-section">
-              <header className="smtcmp-composer-heading">
-                <div className="smtcmp-composer-heading-title">
+            <section className="yolo-composer-section">
+              <header className="yolo-composer-heading">
+                <div className="yolo-composer-heading-title">
                   {t(
                     'settings.continuation.smartSpaceToggle',
                     '启用 Smart Space',
                   )}
                 </div>
-                <div className="smtcmp-composer-heading-desc">
+                <div className="yolo-composer-heading-desc">
                   {t(
                     'settings.continuation.smartSpaceDescription',
                     'Smart Space 在空行触发，为续写与快速操作提供入口。',
@@ -508,22 +339,22 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                 </div>
               </header>
 
-              <div className="smtcmp-composer-option">
-                <div className="smtcmp-composer-option-info">
-                  <div className="smtcmp-composer-option-title">
+              <div className="yolo-composer-option">
+                <div className="yolo-composer-option-info">
+                  <div className="yolo-composer-option-title">
                     {t(
                       'settings.continuation.smartSpaceToggle',
                       '启用 Smart Space',
                     )}
                   </div>
-                  <div className="smtcmp-composer-option-desc">
+                  <div className="yolo-composer-option-desc">
                     {t(
                       'settings.continuation.smartSpaceToggleDesc',
                       '关闭后将不会触发 Smart Space 浮动面板。',
                     )}
                   </div>
                 </div>
-                <div className="smtcmp-composer-option-control">
+                <div className="yolo-composer-option-control">
                   <ObsidianToggle
                     value={enableSmartSpace}
                     onChange={(value) =>
@@ -535,23 +366,23 @@ const Composer: React.FC<ComposerProps> = (_props) => {
 
               {enableSmartSpace && (
                 <>
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
+                  <div className="yolo-composer-option">
+                    <div className="yolo-composer-option-info">
+                      <div className="yolo-composer-option-title">
                         {t(
                           'settings.continuation.smartSpaceTriggerMode',
                           '触发模式',
                         )}
                       </div>
-                      <div className="smtcmp-composer-option-desc">
+                      <div className="yolo-composer-option-desc">
                         {t(
                           'settings.continuation.smartSpaceTriggerModeDesc',
                           '定义在空行按下空格时的触发方式。',
                         )}
                       </div>
                     </div>
-                    <div className="smtcmp-composer-option-control smtcmp-composer-option-control--fluid">
-                      <div className="smtcmp-simple-select-wrapper">
+                    <div className="yolo-composer-option-control yolo-composer-option-control--fluid">
+                      <div className="yolo-simple-select-wrapper">
                         <SimpleSelect
                           value={smartSpaceTriggerMode}
                           options={[
@@ -598,91 +429,12 @@ const Composer: React.FC<ComposerProps> = (_props) => {
             </section>
 
             {enableSmartSpace && (
-              <section className="smtcmp-composer-section">
-                <header className="smtcmp-composer-heading">
-                  <div className="smtcmp-composer-heading-title">
-                    {t(
-                      'settings.continuation.selectionChatSubsectionTitle',
-                      'Cursor Chat',
-                    )}
-                  </div>
-                  <div className="smtcmp-composer-heading-desc">
-                    {t(
-                      'settings.continuation.selectionChatDescription',
-                      '选中文本后显示快捷操作面板，并保持同步到侧边 Chat。',
-                    )}
-                  </div>
-                </header>
-                <div className="smtcmp-composer-option">
-                  <div className="smtcmp-composer-option-info">
-                    <div className="smtcmp-composer-option-title">
-                      {t(
-                        'settings.continuation.selectionChatToggle',
-                        'Selection Chat',
-                      )}
-                    </div>
-                    <div className="smtcmp-composer-option-desc">
-                      {t(
-                        'settings.continuation.selectionChatToggleDesc',
-                        '选中文本后显示快捷操作面板。',
-                      )}
-                    </div>
-                  </div>
-                  <div className="smtcmp-composer-option-control">
-                    <ObsidianToggle
-                      value={enableSelectionChat}
-                      onChange={(value) =>
-                        updateContinuationOptions({
-                          enableSelectionChat: value,
-                        })
-                      }
-                    />
-                  </div>
-                </div>
-                {enableSelectionChat && (
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
-                        {t(
-                          'settings.continuation.selectionChatAutoDock',
-                          '自动停靠到右上角',
-                        )}
-                      </div>
-                      <div className="smtcmp-composer-option-desc">
-                        {t(
-                          'settings.continuation.selectionChatAutoDockDesc',
-                          '发送问题后自动移动到编辑器右上角（拖动后不再自动跟随）。',
-                        )}
-                      </div>
-                    </div>
-                    <div className="smtcmp-composer-option-control">
-                      <ObsidianToggle
-                        value={
-                          settings.continuationOptions
-                            .quickAskAutoDockToTopRight ?? true
-                        }
-                        onChange={(value) =>
-                          updateContinuationOptions({
-                            quickAskAutoDockToTopRight: value,
-                          })
-                        }
-                      />
-                    </div>
-                  </div>
-                )}
-                {enableSelectionChat && (
-                  <SelectionChatActionsSettings variant="composer" />
-                )}
-              </section>
-            )}
-
-            {enableSmartSpace && (
-              <section className="smtcmp-composer-section">
-                <header className="smtcmp-composer-heading">
-                  <div className="smtcmp-composer-heading-title">
+              <section className="yolo-composer-section">
+                <header className="yolo-composer-heading">
+                  <div className="yolo-composer-heading-title">
                     {t('settings.smartSpace.quickActionsTitle', '快捷动作')}
                   </div>
-                  <div className="smtcmp-composer-heading-desc">
+                  <div className="yolo-composer-heading-desc">
                     {t(
                       'settings.smartSpace.quickActionsDesc',
                       '自定义 Smart Space 中显示的快捷选项和提示词。',
@@ -693,577 +445,61 @@ const Composer: React.FC<ComposerProps> = (_props) => {
               </section>
             )}
 
-            <section className="smtcmp-composer-section">
-              <header className="smtcmp-composer-heading">
-                <div className="smtcmp-composer-heading-title">
-                  {t('settings.rag.title', 'RAG 索引')}
+            <section className="yolo-composer-section">
+              <header className="yolo-composer-heading">
+                <div className="yolo-composer-heading-title">
+                  {t('settings.rag.title', '知识库')}
                 </div>
-                <div className="smtcmp-composer-heading-desc">
+                <div className="yolo-composer-heading-desc">
                   {t(
-                    'settings.rag.enableRagDesc',
-                    '为 Sparkle 提供知识库检索与上下文增强。',
+                    'settings.rag.composerEntryDesc',
+                    '知识库索引已经迁移到设置页统一管理，这里提供快捷入口。',
                   )}
                 </div>
               </header>
 
-              <div className="smtcmp-composer-option">
-                <div className="smtcmp-composer-option-info">
-                  <div className="smtcmp-composer-option-title">
-                    {t('settings.rag.enableRag', '启用 RAG')}
+              <div className="yolo-composer-option">
+                <div className="yolo-composer-option-info">
+                  <div className="yolo-composer-option-title">
+                    {t('settings.rag.openKnowledgeSettings', '打开知识库设置')}
                   </div>
-                  <div className="smtcmp-composer-option-desc">
+                  <div className="yolo-composer-option-desc">
                     {t(
-                      'settings.rag.enableRagDesc',
-                      '开启后将使用向量检索增强回答。',
+                      'settings.rag.openKnowledgeSettingsDesc',
+                      '前往设置页配置知识库索引、范围、状态与高级参数。',
                     )}
                   </div>
                 </div>
-                <div className="smtcmp-composer-option-control">
-                  <ObsidianToggle
-                    value={isRagEnabled}
-                    onChange={(value) => {
-                      applySettingsUpdate(
-                        {
-                          ...settings,
-                          ragOptions: {
-                            ...settings.ragOptions,
-                            enabled: value,
-                          },
-                        },
-                        t(
-                          'notices.indexUpdateFailed',
-                          'Failed to update RAG settings.',
-                        ),
-                      )
+                <div className="yolo-composer-option-control">
+                  <ObsidianButton
+                    text={t(
+                      'settings.rag.openKnowledgeSettings',
+                      '打开知识库设置',
+                    )}
+                    onClick={() => {
+                      // @ts-expect-error: setting property exists in Obsidian's App but is not typed
+                      app.setting.open()
+                      // @ts-expect-error: setting property exists in Obsidian's App but is not typed
+                      app.setting.openTabById(plugin.manifest.id)
                     }}
                   />
                 </div>
               </div>
-
-              {isRagEnabled && (
-                <>
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
-                        {t('settings.rag.embeddingModel', 'Embedding 模型')}
-                      </div>
-                      <div className="smtcmp-composer-option-desc">
-                        {t(
-                          'settings.rag.embeddingModelDesc',
-                          '用于生成向量索引的模型。',
-                        )}
-                      </div>
-                    </div>
-                    <div className="smtcmp-composer-option-control smtcmp-composer-option-control--fluid">
-                      <div className="smtcmp-simple-select-wrapper">
-                        <SimpleSelect
-                          value={settings.embeddingModelId}
-                          groupedOptions={embeddingModelOptionGroups.map(
-                            (group) => ({
-                              label: group.label,
-                              options: group.options.map((option) => ({
-                                value: option.value,
-                                label: option.label,
-                              })),
-                            }),
-                          )}
-                          onChange={(value) => {
-                            applySettingsUpdate(
-                              {
-                                ...settings,
-                                embeddingModelId: value,
-                              },
-                              t(
-                                'notices.indexUpdateFailed',
-                                'Failed to update embedding model.',
-                              ),
-                            )
-                          }}
-                          align="end"
-                          side="bottom"
-                          sideOffset={6}
-                          collisionBoundary={composerRef.current}
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
-                        {t('settings.rag.includePatterns', '包含的文件夹')}
-                      </div>
-                      <div className="smtcmp-composer-option-desc">
-                        {t(
-                          'settings.rag.includePatternsDesc',
-                          '只索引这些目录；留空表示全库。',
-                        )}
-                      </div>
-                    </div>
-                    <div className="smtcmp-composer-option-control">
-                      <ObsidianButton
-                        text={t('settings.rag.testPatterns', '测试规则')}
-                        onClick={() => {
-                          void (async () => {
-                            const patterns = settings.ragOptions.includePatterns
-                            const includedFiles =
-                              await findFilesMatchingPatterns(
-                                patterns,
-                                plugin.app.vault,
-                              )
-                            new IncludedFilesModal(
-                              app,
-                              includedFiles,
-                              patterns,
-                            ).open()
-                          })().catch((error) => {
-                            console.error(
-                              'Failed to test include patterns',
-                              error,
-                            )
-                          })
-                        }}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="smtcmp-composer-context-picker">
-                    <FolderSelectionList
-                      app={app}
-                      vault={plugin.app.vault}
-                      title={t(
-                        'settings.rag.selectedFolders',
-                        '已选择的文件夹',
-                      )}
-                      value={includeFolders}
-                      onChange={(folders: string[]) => {
-                        const patterns = folderPathsToIncludePatterns(folders)
-                        applySettingsUpdate(
-                          {
-                            ...settings,
-                            ragOptions: {
-                              ...settings.ragOptions,
-                              includePatterns: patterns,
-                            },
-                          },
-                          t(
-                            'notices.indexUpdateFailed',
-                            'Failed to update include patterns.',
-                          ),
-                        )
-                      }}
-                    />
-                  </div>
-
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
-                        {t('settings.rag.excludePatterns', '排除的文件夹')}
-                      </div>
-                      <div className="smtcmp-composer-option-desc">
-                        {t(
-                          'settings.rag.excludePatternsDesc',
-                          '这些目录不会参与索引。',
-                        )}
-                      </div>
-                    </div>
-                    <div className="smtcmp-composer-option-control">
-                      <ObsidianButton
-                        text={t('settings.rag.testPatterns', '测试规则')}
-                        onClick={() => {
-                          void (async () => {
-                            const patterns = settings.ragOptions.excludePatterns
-                            const excludedFiles =
-                              await findFilesMatchingPatterns(
-                                patterns,
-                                plugin.app.vault,
-                              )
-                            new ExcludedFilesModal(app, excludedFiles).open()
-                          })().catch((error) => {
-                            console.error(
-                              'Failed to test exclude patterns',
-                              error,
-                            )
-                          })
-                        }}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="smtcmp-composer-context-picker">
-                    <FolderSelectionList
-                      app={app}
-                      vault={plugin.app.vault}
-                      title={t(
-                        'settings.rag.excludedFolders',
-                        '已排除的文件夹',
-                      )}
-                      placeholder={t(
-                        'settings.rag.selectExcludeFoldersPlaceholder',
-                        '点击此处选择要排除的文件夹（留空则不排除）',
-                      )}
-                      value={excludeFolders}
-                      onChange={(folders: string[]) => {
-                        const patterns = folderPathsToIncludePatterns(folders)
-                        applySettingsUpdate(
-                          {
-                            ...settings,
-                            ragOptions: {
-                              ...settings.ragOptions,
-                              excludePatterns: patterns,
-                            },
-                          },
-                          t(
-                            'notices.indexUpdateFailed',
-                            'Failed to update exclude patterns.',
-                          ),
-                        )
-                      }}
-                    />
-                  </div>
-
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
-                        {t('settings.rag.autoUpdate', '自动更新索引')}
-                      </div>
-                      <div className="smtcmp-composer-option-desc">
-                        {t(
-                          'settings.rag.autoUpdateDesc',
-                          '文件变更后按最小间隔增量更新索引。',
-                        )}
-                      </div>
-                    </div>
-                    <div className="smtcmp-composer-option-control">
-                      <ObsidianToggle
-                        value={!!settings.ragOptions.autoUpdateEnabled}
-                        onChange={(value) => {
-                          applySettingsUpdate(
-                            {
-                              ...settings,
-                              ragOptions: {
-                                ...settings.ragOptions,
-                                autoUpdateEnabled: value,
-                              },
-                            },
-                            t(
-                              'notices.indexUpdateFailed',
-                              'Failed to update auto update settings.',
-                            ),
-                          )
-                        }}
-                      />
-                    </div>
-                  </div>
-
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
-                        {t('settings.rag.manualUpdateNow', '立即更新索引')}
-                      </div>
-                      <div className="smtcmp-composer-option-desc">
-                        {t(
-                          'settings.rag.manualUpdateNowDesc',
-                          '手动执行一次增量更新。',
-                        )}
-                      </div>
-                    </div>
-                    <div className="smtcmp-composer-option-control smtcmp-composer-option-control--stack">
-                      <ObsidianButton
-                        text={t('settings.rag.manualUpdateNow', '立即更新')}
-                        disabled={isIndexing}
-                        onClick={() => handleRagUpdate(false)}
-                      />
-                      <ObsidianButton
-                        text={t('settings.rag.rebuildIndex', '重建索引')}
-                        disabled={isIndexing}
-                        onClick={() => handleRagUpdate(true)}
-                      />
-                      {isIndexing && indexAbortController && (
-                        <ObsidianButton
-                          text={t('settings.rag.cancelIndex', '取消')}
-                          onClick={() => handleCancelIndex()}
-                        />
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
-                        {t(
-                          'settings.rag.manageEmbeddingDatabase',
-                          '管理索引数据',
-                        )}
-                      </div>
-                      <div className="smtcmp-composer-option-desc">
-                        {t(
-                          'settings.rag.manageEmbeddingDatabaseDesc',
-                          '查看向量库占用并管理索引。',
-                        )}
-                      </div>
-                    </div>
-                    <div className="smtcmp-composer-option-control">
-                      <ObsidianButton
-                        text={t('settings.rag.manage', '管理')}
-                        onClick={() => {
-                          const modal = new EmbeddingDbManageModal(app, plugin)
-                          modal.open()
-                        }}
-                      />
-                    </div>
-                  </div>
-
-                  <div
-                    className={`smtcmp-settings-advanced-toggle smtcmp-clickable${
-                      showRagAdvanced ? ' is-expanded' : ''
-                    }`}
-                    onClick={() => setShowRagAdvanced((prev) => !prev)}
-                    role="button"
-                    tabIndex={0}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault()
-                        setShowRagAdvanced((prev) => !prev)
-                      }
-                    }}
-                  >
-                    <span className="smtcmp-settings-advanced-toggle-icon">
-                      ▶
-                    </span>
-                    {t('settings.rag.advanced', '高级设置')}
-                  </div>
-
-                  {showRagAdvanced && (
-                    <>
-                      <div className="smtcmp-composer-option">
-                        <div className="smtcmp-composer-option-info">
-                          <div className="smtcmp-composer-option-title">
-                            {t('settings.rag.chunkSize', 'Chunk 大小')}
-                          </div>
-                          <div className="smtcmp-composer-option-desc">
-                            {t(
-                              'settings.rag.chunkSizeDesc',
-                              '单次切分的字符数。',
-                            )}
-                          </div>
-                        </div>
-                        <div className="smtcmp-composer-option-control">
-                          <ObsidianTextInput
-                            type="number"
-                            value={ragNumberInputs.chunkSize}
-                            onChange={(value) => {
-                              setRagNumberInputs((prev) => ({
-                                ...prev,
-                                chunkSize: value,
-                              }))
-                              const chunkSize = parseIntegerInput(value)
-                              if (chunkSize === null) return
-                              applySettingsUpdate(
-                                {
-                                  ...settings,
-                                  ragOptions: {
-                                    ...settings.ragOptions,
-                                    chunkSize,
-                                  },
-                                },
-                                t(
-                                  'notices.indexUpdateFailed',
-                                  'Failed to update chunk size.',
-                                ),
-                              )
-                            }}
-                            onBlur={(value) => {
-                              const chunkSize = parseIntegerInput(value)
-                              if (chunkSize === null) {
-                                setRagNumberInputs((prev) => ({
-                                  ...prev,
-                                  chunkSize: String(
-                                    settings.ragOptions.chunkSize,
-                                  ),
-                                }))
-                              }
-                            }}
-                          />
-                        </div>
-                      </div>
-
-                      <div className="smtcmp-composer-option">
-                        <div className="smtcmp-composer-option-info">
-                          <div className="smtcmp-composer-option-title">
-                            {t('settings.rag.minSimilarity', '最小相似度')}
-                          </div>
-                          <div className="smtcmp-composer-option-desc">
-                            {t(
-                              'settings.rag.minSimilarityDesc',
-                              '低于该相似度的结果将被过滤。',
-                            )}
-                          </div>
-                        </div>
-                        <div className="smtcmp-composer-option-control">
-                          <ObsidianTextInput
-                            type="number"
-                            value={ragNumberInputs.minSimilarity}
-                            onChange={(value) => {
-                              setRagNumberInputs((prev) => ({
-                                ...prev,
-                                minSimilarity: value,
-                              }))
-                              const minSimilarity = parseFloatInput(value)
-                              if (minSimilarity === null) return
-                              applySettingsUpdate(
-                                {
-                                  ...settings,
-                                  ragOptions: {
-                                    ...settings.ragOptions,
-                                    minSimilarity,
-                                  },
-                                },
-                                t(
-                                  'notices.indexUpdateFailed',
-                                  'Failed to update min similarity.',
-                                ),
-                              )
-                            }}
-                            onBlur={(value) => {
-                              const minSimilarity = parseFloatInput(value)
-                              if (minSimilarity === null) {
-                                setRagNumberInputs((prev) => ({
-                                  ...prev,
-                                  minSimilarity: String(
-                                    settings.ragOptions.minSimilarity,
-                                  ),
-                                }))
-                              }
-                            }}
-                          />
-                        </div>
-                      </div>
-
-                      <div className="smtcmp-composer-option">
-                        <div className="smtcmp-composer-option-info">
-                          <div className="smtcmp-composer-option-title">
-                            {t('settings.rag.limit', '返回条数')}
-                          </div>
-                          <div className="smtcmp-composer-option-desc">
-                            {t(
-                              'settings.rag.limitDesc',
-                              '每次检索返回的候选数量。',
-                            )}
-                          </div>
-                        </div>
-                        <div className="smtcmp-composer-option-control">
-                          <ObsidianTextInput
-                            type="number"
-                            value={ragNumberInputs.limit}
-                            onChange={(value) => {
-                              setRagNumberInputs((prev) => ({
-                                ...prev,
-                                limit: value,
-                              }))
-                              const limit = parseIntegerInput(value)
-                              if (limit === null) return
-                              applySettingsUpdate(
-                                {
-                                  ...settings,
-                                  ragOptions: {
-                                    ...settings.ragOptions,
-                                    limit,
-                                  },
-                                },
-                                t(
-                                  'notices.indexUpdateFailed',
-                                  'Failed to update limit.',
-                                ),
-                              )
-                            }}
-                            onBlur={(value) => {
-                              const limit = parseIntegerInput(value)
-                              if (limit === null) {
-                                setRagNumberInputs((prev) => ({
-                                  ...prev,
-                                  limit: String(settings.ragOptions.limit),
-                                }))
-                              }
-                            }}
-                          />
-                        </div>
-                      </div>
-
-                      <div className="smtcmp-composer-option">
-                        <div className="smtcmp-composer-option-info">
-                          <div className="smtcmp-composer-option-title">
-                            {t(
-                              'settings.rag.autoUpdateInterval',
-                              '最小更新间隔(小时)',
-                            )}
-                          </div>
-                          <div className="smtcmp-composer-option-desc">
-                            {t(
-                              'settings.rag.autoUpdateIntervalDesc',
-                              '控制自动更新的最低频率。',
-                            )}
-                          </div>
-                        </div>
-                        <div className="smtcmp-composer-option-control">
-                          <ObsidianTextInput
-                            type="number"
-                            value={ragNumberInputs.autoUpdateIntervalHours}
-                            onChange={(value) => {
-                              setRagNumberInputs((prev) => ({
-                                ...prev,
-                                autoUpdateIntervalHours: value,
-                              }))
-                              const n = parseIntegerInput(value)
-                              if (n === null || n <= 0) return
-                              applySettingsUpdate(
-                                {
-                                  ...settings,
-                                  ragOptions: {
-                                    ...settings.ragOptions,
-                                    autoUpdateIntervalHours: n,
-                                  },
-                                },
-                                t(
-                                  'notices.indexUpdateFailed',
-                                  'Failed to update interval.',
-                                ),
-                              )
-                            }}
-                            onBlur={(value) => {
-                              const n = parseIntegerInput(value)
-                              if (n === null || n <= 0) {
-                                setRagNumberInputs((prev) => ({
-                                  ...prev,
-                                  autoUpdateIntervalHours: String(
-                                    settings.ragOptions
-                                      .autoUpdateIntervalHours ?? 24,
-                                  ),
-                                }))
-                              }
-                            }}
-                          />
-                        </div>
-                      </div>
-                    </>
-                  )}
-                </>
-              )}
             </section>
           </>
         )}
 
         {activeTab === 'quick-ask' && (
           <>
-            <section className="smtcmp-composer-section">
-              <header className="smtcmp-composer-heading">
-                <div className="smtcmp-composer-heading-title">
+            <section className="yolo-composer-section">
+              <header className="yolo-composer-heading">
+                <div className="yolo-composer-heading-title">
                   {t(
                     'settings.continuation.quickAskSubsectionTitle',
                     'Quick Ask',
                   )}
                 </div>
-                <div className="smtcmp-composer-heading-desc">
+                <div className="yolo-composer-heading-desc">
                   {t(
                     'settings.continuation.quickAskDescription',
                     '在空行输入触发字符快速呼出浮动聊天面板。',
@@ -1271,22 +507,22 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                 </div>
               </header>
 
-              <div className="smtcmp-composer-option">
-                <div className="smtcmp-composer-option-info">
-                  <div className="smtcmp-composer-option-title">
+              <div className="yolo-composer-option">
+                <div className="yolo-composer-option-info">
+                  <div className="yolo-composer-option-title">
                     {t(
                       'settings.continuation.quickAskToggle',
                       '启用 Quick Ask',
                     )}
                   </div>
-                  <div className="smtcmp-composer-option-desc">
+                  <div className="yolo-composer-option-desc">
                     {t(
                       'settings.continuation.quickAskToggleDesc',
                       '关闭后不会再触发 Quick Ask 浮动面板。',
                     )}
                   </div>
                 </div>
-                <div className="smtcmp-composer-option-control">
+                <div className="yolo-composer-option-control">
                   <ObsidianToggle
                     value={enableQuickAsk}
                     onChange={(value) =>
@@ -1298,19 +534,19 @@ const Composer: React.FC<ComposerProps> = (_props) => {
 
               {enableQuickAsk && (
                 <>
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
+                  <div className="yolo-composer-option">
+                    <div className="yolo-composer-option-info">
+                      <div className="yolo-composer-option-title">
                         {t('settings.continuation.quickAskTrigger', '触发字符')}
                       </div>
-                      <div className="smtcmp-composer-option-desc">
+                      <div className="yolo-composer-option-desc">
                         {t(
                           'settings.continuation.quickAskTriggerDesc',
                           '支持 1-3 个字符。',
                         )}
                       </div>
                     </div>
-                    <div className="smtcmp-composer-option-control">
+                    <div className="yolo-composer-option-control">
                       <ObsidianTextInput
                         value={quickAskTrigger}
                         onChange={(value) => {
@@ -1324,22 +560,22 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                       />
                     </div>
                   </div>
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
+                  <div className="yolo-composer-option">
+                    <div className="yolo-composer-option-info">
+                      <div className="yolo-composer-option-title">
                         {t(
                           'settings.continuation.quickAskContextBeforeChars',
                           '上文字符数',
                         )}
                       </div>
-                      <div className="smtcmp-composer-option-desc">
+                      <div className="yolo-composer-option-desc">
                         {t(
                           'settings.continuation.quickAskContextBeforeCharsDesc',
                           '传递给模型的光标上方最大字符数。',
                         )}
                       </div>
                     </div>
-                    <div className="smtcmp-composer-option-control">
+                    <div className="yolo-composer-option-control">
                       <ObsidianTextInput
                         type="number"
                         value={quickAskNumberInputs.contextBeforeChars}
@@ -1368,22 +604,22 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                       />
                     </div>
                   </div>
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
+                  <div className="yolo-composer-option">
+                    <div className="yolo-composer-option-info">
+                      <div className="yolo-composer-option-title">
                         {t(
                           'settings.continuation.quickAskContextAfterChars',
                           '下文字符数',
                         )}
                       </div>
-                      <div className="smtcmp-composer-option-desc">
+                      <div className="yolo-composer-option-desc">
                         {t(
                           'settings.continuation.quickAskContextAfterCharsDesc',
                           '传递给模型的光标下方最大字符数。',
                         )}
                       </div>
                     </div>
-                    <div className="smtcmp-composer-option-control">
+                    <div className="yolo-composer-option-control">
                       <ObsidianTextInput
                         type="number"
                         value={quickAskNumberInputs.contextAfterChars}
@@ -1415,20 +651,97 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                 </>
               )}
             </section>
+
+            <section className="yolo-composer-section">
+              <header className="yolo-composer-heading">
+                <div className="yolo-composer-heading-title">
+                  {t(
+                    'settings.continuation.selectionChatSubsectionTitle',
+                    'Cursor Chat',
+                  )}
+                </div>
+                <div className="yolo-composer-heading-desc">
+                  {t(
+                    'settings.continuation.selectionChatDescription',
+                    '选中文本后显示快捷操作面板，并保持同步到侧边 Chat。',
+                  )}
+                </div>
+              </header>
+              <div className="yolo-composer-option">
+                <div className="yolo-composer-option-info">
+                  <div className="yolo-composer-option-title">
+                    {t(
+                      'settings.continuation.selectionChatToggle',
+                      'Selection Chat',
+                    )}
+                  </div>
+                  <div className="yolo-composer-option-desc">
+                    {t(
+                      'settings.continuation.selectionChatToggleDesc',
+                      '选中文本后显示快捷操作面板。',
+                    )}
+                  </div>
+                </div>
+                <div className="yolo-composer-option-control">
+                  <ObsidianToggle
+                    value={enableSelectionChat}
+                    onChange={(value) =>
+                      updateContinuationOptions({
+                        enableSelectionChat: value,
+                      })
+                    }
+                  />
+                </div>
+              </div>
+              {enableSelectionChat && (
+                <div className="yolo-composer-option">
+                  <div className="yolo-composer-option-info">
+                    <div className="yolo-composer-option-title">
+                      {t(
+                        'settings.continuation.selectionChatAutoDock',
+                        '自动停靠到右上角',
+                      )}
+                    </div>
+                    <div className="yolo-composer-option-desc">
+                      {t(
+                        'settings.continuation.selectionChatAutoDockDesc',
+                        '发送问题后自动移动到编辑器右上角（拖动后不再自动跟随）。',
+                      )}
+                    </div>
+                  </div>
+                  <div className="yolo-composer-option-control">
+                    <ObsidianToggle
+                      value={
+                        settings.continuationOptions
+                          .quickAskAutoDockToTopRight ?? true
+                      }
+                      onChange={(value) =>
+                        updateContinuationOptions({
+                          quickAskAutoDockToTopRight: value,
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+              )}
+              {enableSelectionChat && (
+                <SelectionChatActionsSettings variant="composer" />
+              )}
+            </section>
           </>
         )}
 
         {activeTab === 'tab-completion' && (
           <>
-            <section className="smtcmp-composer-section">
-              <header className="smtcmp-composer-heading">
-                <div className="smtcmp-composer-heading-title">
+            <section className="yolo-composer-section">
+              <header className="yolo-composer-heading">
+                <div className="yolo-composer-heading-title">
                   {t(
                     'settings.continuation.tabCompletionBasicTitle',
                     '基础设置',
                   )}
                 </div>
-                <div className="smtcmp-composer-heading-desc">
+                <div className="yolo-composer-heading-desc">
                   {t(
                     'settings.continuation.tabCompletionBasicDesc',
                     '启用 Tab 补全并设置基础参数。',
@@ -1436,19 +749,19 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                 </div>
               </header>
 
-              <div className="smtcmp-composer-option">
-                <div className="smtcmp-composer-option-info">
-                  <div className="smtcmp-composer-option-title">
+              <div className="yolo-composer-option">
+                <div className="yolo-composer-option-info">
+                  <div className="yolo-composer-option-title">
                     {t('settings.continuation.tabCompletion', '启用 Tab 补全')}
                   </div>
-                  <div className="smtcmp-composer-option-desc">
+                  <div className="yolo-composer-option-desc">
                     {t(
                       'settings.continuation.tabCompletionDesc',
                       '开启后会在编辑器中自动触发补全建议。',
                     )}
                   </div>
                 </div>
-                <div className="smtcmp-composer-option-control">
+                <div className="yolo-composer-option-control">
                   <ObsidianToggle
                     value={enableTabCompletion}
                     onChange={(value) => {
@@ -1469,23 +782,23 @@ const Composer: React.FC<ComposerProps> = (_props) => {
 
               {enableTabCompletion && (
                 <>
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
+                  <div className="yolo-composer-option">
+                    <div className="yolo-composer-option-info">
+                      <div className="yolo-composer-option-title">
                         {t(
                           'settings.continuation.tabCompletionModel',
                           '补全模型',
                         )}
                       </div>
-                      <div className="smtcmp-composer-option-desc">
+                      <div className="yolo-composer-option-desc">
                         {t(
                           'settings.continuation.tabCompletionModelDesc',
                           '选择用于 Tab 补全的模型。',
                         )}
                       </div>
                     </div>
-                    <div className="smtcmp-composer-option-control smtcmp-composer-option-control--fluid">
-                      <div className="smtcmp-simple-select-wrapper">
+                    <div className="yolo-composer-option-control yolo-composer-option-control--fluid">
+                      <div className="yolo-simple-select-wrapper">
                         <SimpleSelect
                           value={tabCompletionModelId}
                           groupedOptions={tabCompletionOptionGroups}
@@ -1503,22 +816,30 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                     </div>
                   </div>
 
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
+                  <ReasoningPanel
+                    model={tabCompletionChatModel}
+                    value={tabCompletionOptions.reasoningLevel}
+                    onChange={(level) => {
+                      updateTabCompletionOptions({ reasoningLevel: level })
+                    }}
+                  />
+
+                  <div className="yolo-composer-option">
+                    <div className="yolo-composer-option-info">
+                      <div className="yolo-composer-option-title">
                         {t(
                           'settings.continuation.tabCompletionMaxSuggestionLength',
                           '最大补全长度',
                         )}
                       </div>
-                      <div className="smtcmp-composer-option-desc">
+                      <div className="yolo-composer-option-desc">
                         {t(
                           'settings.continuation.tabCompletionMaxSuggestionLengthDesc',
                           '控制单次建议的最大长度。',
                         )}
                       </div>
                     </div>
-                    <div className="smtcmp-composer-option-control">
+                    <div className="yolo-composer-option-control">
                       <ObsidianTextInput
                         type="number"
                         value={tabNumberInputs.maxSuggestionLength}
@@ -1549,34 +870,34 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                     </div>
                   </div>
 
-                  <div className="smtcmp-composer-option">
-                    <div className="smtcmp-composer-option-info">
-                      <div className="smtcmp-composer-option-title">
+                  <div className="yolo-composer-option">
+                    <div className="yolo-composer-option-info">
+                      <div className="yolo-composer-option-title">
                         {t(
                           'settings.continuation.tabCompletionLengthPreset',
                           '补全长度',
                         )}
                       </div>
-                      <div className="smtcmp-composer-option-desc">
+                      <div className="yolo-composer-option-desc">
                         {t(
                           'settings.continuation.tabCompletionLengthPresetDesc',
                           '提示模型生成短、中、长三档补全。',
                         )}
                       </div>
                     </div>
-                    <div className="smtcmp-composer-option-control">
+                    <div className="yolo-composer-option-control">
                       <div
-                        className="smtcmp-segmented smtcmp-segmented--glider"
+                        className="yolo-segmented yolo-segmented--glider"
                         style={
                           {
-                            '--smtcmp-segment-count': 3,
-                            '--smtcmp-segment-index':
+                            '--yolo-segment-count': 3,
+                            '--yolo-segment-index':
                               tabCompletionLengthPresetIndex,
                           } as React.CSSProperties
                         }
                       >
                         <div
-                          className="smtcmp-segmented-glider"
+                          className="yolo-segmented-glider"
                           aria-hidden="true"
                         />
                         <button
@@ -1633,15 +954,15 @@ const Composer: React.FC<ComposerProps> = (_props) => {
             </section>
 
             {enableTabCompletion && (
-              <section className="smtcmp-composer-section">
-                <header className="smtcmp-composer-heading">
-                  <div className="smtcmp-composer-heading-title">
+              <section className="yolo-composer-section">
+                <header className="yolo-composer-heading">
+                  <div className="yolo-composer-heading-title">
                     {t(
                       'settings.continuation.tabCompletionTriggersSectionTitle',
                       '触发器设置',
                     )}
                   </div>
-                  <div className="smtcmp-composer-heading-desc">
+                  <div className="yolo-composer-heading-desc">
                     {t(
                       'settings.continuation.tabCompletionTriggersSectionDesc',
                       '配置补全触发条件与规则。',
@@ -1649,22 +970,22 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                   </div>
                 </header>
 
-                <div className="smtcmp-composer-option">
-                  <div className="smtcmp-composer-option-info">
-                    <div className="smtcmp-composer-option-title">
+                <div className="yolo-composer-option">
+                  <div className="yolo-composer-option-info">
+                    <div className="yolo-composer-option-title">
                       {t(
                         'settings.continuation.tabCompletionTriggerDelay',
                         '触发延迟',
                       )}
                     </div>
-                    <div className="smtcmp-composer-option-desc">
+                    <div className="yolo-composer-option-desc">
                       {t(
                         'settings.continuation.tabCompletionTriggerDelayDesc',
                         '输入后延迟触发的毫秒数。',
                       )}
                     </div>
                   </div>
-                  <div className="smtcmp-composer-option-control">
+                  <div className="yolo-composer-option-control">
                     <ObsidianTextInput
                       type="number"
                       value={tabNumberInputs.triggerDelayMs}
@@ -1693,24 +1014,24 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                   </div>
                 </div>
 
-                <div className="smtcmp-composer-option smtcmp-composer-option--table">
-                  <div className="smtcmp-composer-option-info">
-                    <div className="smtcmp-composer-option-title">
+                <div className="yolo-composer-option yolo-composer-option--table">
+                  <div className="yolo-composer-option-info">
+                    <div className="yolo-composer-option-title">
                       {t(
                         'settings.continuation.tabCompletionTriggersTitle',
                         '触发器',
                       )}
                     </div>
-                    <div className="smtcmp-composer-option-desc">
+                    <div className="yolo-composer-option-desc">
                       {t(
                         'settings.continuation.tabCompletionTriggersDesc',
                         '配置补全触发规则。',
                       )}
                     </div>
                   </div>
-                  <div className="smtcmp-composer-option-control smtcmp-composer-option-control--full">
-                    <div className="smtcmp-settings-table-container">
-                      <table className="smtcmp-settings-table">
+                  <div className="yolo-composer-option-control yolo-composer-option-control--full">
+                    <div className="yolo-settings-table-container">
+                      <table className="yolo-settings-table">
                         <thead>
                           <tr>
                             <th>
@@ -1824,15 +1145,15 @@ const Composer: React.FC<ComposerProps> = (_props) => {
             )}
 
             {enableTabCompletion && (
-              <section className="smtcmp-composer-section">
-                <header className="smtcmp-composer-heading">
-                  <div className="smtcmp-composer-heading-title">
+              <section className="yolo-composer-section">
+                <header className="yolo-composer-heading">
+                  <div className="yolo-composer-heading-title">
                     {t(
                       'settings.continuation.tabCompletionAutoSectionTitle',
                       '自动补全设置',
                     )}
                   </div>
-                  <div className="smtcmp-composer-heading-desc">
+                  <div className="yolo-composer-heading-desc">
                     {t(
                       'settings.continuation.tabCompletionAutoSectionDesc',
                       '配置停顿后的自动补全行为。',
@@ -1840,22 +1161,22 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                   </div>
                 </header>
 
-                <div className="smtcmp-composer-option">
-                  <div className="smtcmp-composer-option-info">
-                    <div className="smtcmp-composer-option-title">
+                <div className="yolo-composer-option">
+                  <div className="yolo-composer-option-info">
+                    <div className="yolo-composer-option-title">
                       {t(
                         'settings.continuation.tabCompletionAutoTrigger',
                         '自动补全（停顿后）',
                       )}
                     </div>
-                    <div className="smtcmp-composer-option-desc">
+                    <div className="yolo-composer-option-desc">
                       {t(
                         'settings.continuation.tabCompletionAutoTriggerDesc',
                         '启用后，停止输入一段时间也会触发补全。',
                       )}
                     </div>
                   </div>
-                  <div className="smtcmp-composer-option-control">
+                  <div className="yolo-composer-option-control">
                     <ObsidianToggle
                       value={tabCompletionOptions.idleTriggerEnabled}
                       onChange={(value) => {
@@ -1869,22 +1190,22 @@ const Composer: React.FC<ComposerProps> = (_props) => {
 
                 {tabCompletionOptions.idleTriggerEnabled && (
                   <>
-                    <div className="smtcmp-composer-option">
-                      <div className="smtcmp-composer-option-info">
-                        <div className="smtcmp-composer-option-title">
+                    <div className="yolo-composer-option">
+                      <div className="yolo-composer-option-info">
+                        <div className="yolo-composer-option-title">
                           {t(
                             'settings.continuation.tabCompletionAutoTriggerDelay',
                             '自动补全停顿时间（毫秒）',
                           )}
                         </div>
-                        <div className="smtcmp-composer-option-desc">
+                        <div className="yolo-composer-option-desc">
                           {t(
                             'settings.continuation.tabCompletionAutoTriggerDelayDesc',
                             '停止输入后等待多久再触发自动补全。',
                           )}
                         </div>
                       </div>
-                      <div className="smtcmp-composer-option-control">
+                      <div className="yolo-composer-option-control">
                         <ObsidianTextInput
                           type="number"
                           value={tabNumberInputs.autoTriggerDelayMs}
@@ -1915,22 +1236,22 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                       </div>
                     </div>
 
-                    <div className="smtcmp-composer-option">
-                      <div className="smtcmp-composer-option-info">
-                        <div className="smtcmp-composer-option-title">
+                    <div className="yolo-composer-option">
+                      <div className="yolo-composer-option-info">
+                        <div className="yolo-composer-option-title">
                           {t(
                             'settings.continuation.tabCompletionAutoTriggerCooldown',
                             '自动补全冷却时间（毫秒）',
                           )}
                         </div>
-                        <div className="smtcmp-composer-option-desc">
+                        <div className="yolo-composer-option-desc">
                           {t(
                             'settings.continuation.tabCompletionAutoTriggerCooldownDesc',
                             '自动补全触发后冷却一段时间，避免频繁请求。',
                           )}
                         </div>
                       </div>
-                      <div className="smtcmp-composer-option-control">
+                      <div className="yolo-composer-option-control">
                         <ObsidianTextInput
                           type="number"
                           value={tabNumberInputs.autoTriggerCooldownMs}
@@ -1966,15 +1287,15 @@ const Composer: React.FC<ComposerProps> = (_props) => {
             )}
 
             {enableTabCompletion && (
-              <section className="smtcmp-composer-section smtcmp-composer-section--advanced">
-                <header className="smtcmp-composer-heading">
-                  <div className="smtcmp-composer-heading-title">
+              <section className="yolo-composer-section yolo-composer-section--advanced">
+                <header className="yolo-composer-heading">
+                  <div className="yolo-composer-heading-title">
                     {t(
                       'settings.continuation.tabCompletionAdvanced',
                       '高级设置',
                     )}
                   </div>
-                  <div className="smtcmp-composer-heading-desc">
+                  <div className="yolo-composer-heading-desc">
                     {t(
                       'settings.continuation.tabCompletionAdvancedSectionDesc',
                       '配置 Tab 补全的高级参数。',
@@ -1983,7 +1304,7 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                 </header>
 
                 <div
-                  className={`smtcmp-settings-advanced-toggle smtcmp-clickable${
+                  className={`yolo-settings-advanced-toggle yolo-clickable${
                     showTabAdvanced ? ' is-expanded' : ''
                   }`}
                   onClick={() => setShowTabAdvanced((prev) => !prev)}
@@ -1996,30 +1317,28 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                     }
                   }}
                 >
-                  <span className="smtcmp-settings-advanced-toggle-icon">
-                    ▶
-                  </span>
+                  <span className="yolo-settings-advanced-toggle-icon">▶</span>
                   {t('settings.continuation.tabCompletionAdvanced', '高级设置')}
                 </div>
 
                 {showTabAdvanced && (
                   <>
-                    <div className="smtcmp-composer-option">
-                      <div className="smtcmp-composer-option-info">
-                        <div className="smtcmp-composer-option-title">
+                    <div className="yolo-composer-option">
+                      <div className="yolo-composer-option-info">
+                        <div className="yolo-composer-option-title">
                           {t(
                             'settings.continuation.tabCompletionContextRange',
                             '上下文范围',
                           )}
                         </div>
-                        <div className="smtcmp-composer-option-desc">
+                        <div className="yolo-composer-option-desc">
                           {t(
                             'settings.continuation.tabCompletionContextRangeDesc',
                             '控制上下文范围大小。',
                           )}
                         </div>
                       </div>
-                      <div className="smtcmp-composer-option-control">
+                      <div className="yolo-composer-option-control">
                         <ObsidianTextInput
                           type="number"
                           value={tabNumberInputs.contextRange}
@@ -2048,22 +1367,22 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                       </div>
                     </div>
 
-                    <div className="smtcmp-composer-option">
-                      <div className="smtcmp-composer-option-info">
-                        <div className="smtcmp-composer-option-title">
+                    <div className="yolo-composer-option">
+                      <div className="yolo-composer-option-info">
+                        <div className="yolo-composer-option-title">
                           {t(
                             'settings.continuation.tabCompletionMinContextLength',
                             '最小上下文长度',
                           )}
                         </div>
-                        <div className="smtcmp-composer-option-desc">
+                        <div className="yolo-composer-option-desc">
                           {t(
                             'settings.continuation.tabCompletionMinContextLengthDesc',
                             '低于该长度不会触发补全。',
                           )}
                         </div>
                       </div>
-                      <div className="smtcmp-composer-option-control">
+                      <div className="yolo-composer-option-control">
                         <ObsidianTextInput
                           type="number"
                           value={tabNumberInputs.minContextLength}
@@ -2094,22 +1413,22 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                       </div>
                     </div>
 
-                    <div className="smtcmp-composer-option">
-                      <div className="smtcmp-composer-option-info">
-                        <div className="smtcmp-composer-option-title">
+                    <div className="yolo-composer-option">
+                      <div className="yolo-composer-option-info">
+                        <div className="yolo-composer-option-title">
                           {t(
                             'settings.continuation.tabCompletionTemperature',
                             '温度',
                           )}
                         </div>
-                        <div className="smtcmp-composer-option-desc">
+                        <div className="yolo-composer-option-desc">
                           {t(
                             'settings.continuation.tabCompletionTemperatureDesc',
                             '控制生成的发散程度。',
                           )}
                         </div>
                       </div>
-                      <div className="smtcmp-composer-option-control">
+                      <div className="yolo-composer-option-control">
                         <ObsidianTextInput
                           type="number"
                           value={tabNumberInputs.temperature}
@@ -2139,22 +1458,22 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                       </div>
                     </div>
 
-                    <div className="smtcmp-composer-option">
-                      <div className="smtcmp-composer-option-info">
-                        <div className="smtcmp-composer-option-title">
+                    <div className="yolo-composer-option">
+                      <div className="yolo-composer-option-info">
+                        <div className="yolo-composer-option-title">
                           {t(
                             'settings.continuation.tabCompletionRequestTimeout',
                             '请求超时',
                           )}
                         </div>
-                        <div className="smtcmp-composer-option-desc">
+                        <div className="yolo-composer-option-desc">
                           {t(
                             'settings.continuation.tabCompletionRequestTimeoutDesc',
                             '超过该时间将取消请求。',
                           )}
                         </div>
                       </div>
-                      <div className="smtcmp-composer-option-control">
+                      <div className="yolo-composer-option-control">
                         <ObsidianTextInput
                           type="number"
                           value={tabNumberInputs.requestTimeoutMs}
@@ -2185,22 +1504,22 @@ const Composer: React.FC<ComposerProps> = (_props) => {
                       </div>
                     </div>
 
-                    <div className="smtcmp-composer-option">
-                      <div className="smtcmp-composer-option-info">
-                        <div className="smtcmp-composer-option-title">
+                    <div className="yolo-composer-option">
+                      <div className="yolo-composer-option-info">
+                        <div className="yolo-composer-option-title">
                           {t(
                             'settings.continuation.tabCompletionConstraints',
                             '补全约束',
                           )}
                         </div>
-                        <div className="smtcmp-composer-option-desc">
+                        <div className="yolo-composer-option-desc">
                           {t(
                             'settings.continuation.tabCompletionConstraintsDesc',
                             '插入到补全提示词中的附加规则。',
                           )}
                         </div>
                       </div>
-                      <div className="smtcmp-composer-option-control smtcmp-composer-option-control--full">
+                      <div className="yolo-composer-option-control yolo-composer-option-control--full">
                         <ObsidianTextArea
                           value={
                             settings.continuationOptions

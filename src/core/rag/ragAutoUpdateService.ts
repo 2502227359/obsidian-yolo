@@ -1,33 +1,61 @@
 import { minimatch } from 'minimatch'
-import { Notice, TAbstractFile, TFile, TFolder } from 'obsidian'
+import { TAbstractFile, TFile, TFolder } from 'obsidian'
 
-import { SmartComposerSettings } from '../../settings/schema/setting.types'
+import { YoloSettings } from '../../settings/schema/setting.types'
 
-import { RAGEngine } from './ragEngine'
+import { classifyRagIndexError } from './ragIndexErrors'
+
+/**
+ * Snapshot of pending vault changes the auto-updater wants reconciled.
+ * `kind: 'all'` means the change set is too broad to enumerate (folder
+ * rename/delete) and a vault-wide reconcile is required.
+ */
+export type AutoUpdateRunRequest =
+  | { kind: 'all' }
+  | { kind: 'paths'; paths: string[] }
 
 type RagAutoUpdateServiceDeps = {
-  getSettings: () => SmartComposerSettings
-  setSettings: (settings: SmartComposerSettings) => Promise<void>
-  getRagEngine: () => Promise<RAGEngine>
-  t: (key: string, fallback?: string) => string
+  getSettings: () => YoloSettings
+  setSettings: (settings: YoloSettings) => Promise<void>
+  runIndex: (request: AutoUpdateRunRequest) => Promise<void>
+  markRetryScheduled: (input: {
+    retryAt: number
+    failureMessage?: string
+  }) => Promise<void>
+  clearRetryScheduled: () => Promise<void>
 }
 
 export class RagAutoUpdateService {
-  private readonly getSettings: () => SmartComposerSettings
-  private readonly setSettings: (
-    settings: SmartComposerSettings,
-  ) => Promise<void>
-  private readonly getRagEngine: () => Promise<RAGEngine>
-  private readonly t: (key: string, fallback?: string) => string
+  private static readonly EDIT_IDLE_WINDOW_MS = 5 * 60 * 1000
+  private static readonly WINDOW_BLUR_GRACE_MS = 15 * 1000
+  private static readonly SUCCESS_COOLDOWN_MS = 2 * 60 * 1000
+  private static readonly FAILURE_RETRY_DELAY_MS = 5 * 60 * 1000
+
+  private readonly getSettings: () => YoloSettings
+  private readonly setSettings: (settings: YoloSettings) => Promise<void>
+  private readonly runIndex: (request: AutoUpdateRunRequest) => Promise<void>
+  private readonly markRetryScheduled: (input: {
+    retryAt: number
+    failureMessage?: string
+  }) => Promise<void>
+  private readonly clearRetryScheduled: () => Promise<void>
 
   private autoUpdateTimer: ReturnType<typeof setTimeout> | null = null
   private isAutoUpdating = false
+  private pendingDirtyPaths = new Set<string>()
+  private hasPendingChangesDuringRun = false
+  private hasRecoveredRetry = false
+  private requiresFullScan = false
+  private lastRelevantEditAt: number | null = null
+  private lastRunFinishedAt: number | null = null
+  private lastRunError: string | null = null
 
   constructor(deps: RagAutoUpdateServiceDeps) {
     this.getSettings = deps.getSettings
     this.setSettings = deps.setSettings
-    this.getRagEngine = deps.getRagEngine
-    this.t = deps.t
+    this.runIndex = deps.runIndex
+    this.markRetryScheduled = deps.markRetryScheduled
+    this.clearRetryScheduled = deps.clearRetryScheduled
   }
 
   cleanup() {
@@ -35,39 +63,133 @@ export class RagAutoUpdateService {
       clearTimeout(this.autoUpdateTimer)
       this.autoUpdateTimer = null
     }
+    this.pendingDirtyPaths.clear()
+    this.hasPendingChangesDuringRun = false
+    this.hasRecoveredRetry = false
+    this.requiresFullScan = false
   }
 
-  onVaultFileChanged(file: TAbstractFile) {
+  restoreRetryScheduled(retryAt?: number, minDelayMs = 0): void {
+    const settings = this.getSettings()
+    if (!this.isAutoUpdateEnabled(settings)) return
+
+    this.hasRecoveredRetry = true
+    const delayMs = Math.max(
+      retryAt === undefined ? 0 : retryAt - Date.now(),
+      minDelayMs,
+    )
+    this.scheduleAutoUpdate(delayMs)
+  }
+
+  onVaultFileChanged(
+    file: TAbstractFile,
+    changeType: 'create' | 'modify' | 'delete' | 'rename' = 'modify',
+  ) {
     try {
-      if (file instanceof TFile || file instanceof TFolder) {
-        this.onVaultPathChanged(file.path)
+      if (file instanceof TFile) {
+        const settings = this.getSettings()
+        if (file.extension === 'md') {
+          this.markDirty(file.path)
+          return
+        }
+        if (
+          file.extension === 'pdf' &&
+          (settings.ragOptions.indexPdf ?? true)
+        ) {
+          this.markDirty(file.path)
+        }
+        return
+      }
+
+      if (
+        file instanceof TFolder &&
+        (changeType === 'rename' || changeType === 'delete')
+      ) {
+        this.markDirty(file.path, { requiresFullScan: true })
       }
     } catch {
       // Ignore unexpected file type changes during event handling.
     }
   }
 
-  onVaultPathChanged(path: string) {
-    const settings = this.getSettings()
-    if (!settings?.ragOptions?.autoUpdateEnabled) return
-    if (!this.isPathSelectedByIncludeExclude(path, settings)) return
+  onVaultPathChanged(path: string, options?: { requiresFullScan?: boolean }) {
+    this.markDirty(path, options)
+  }
 
-    const intervalMs =
-      (settings.ragOptions.autoUpdateIntervalHours ?? 24) * 60 * 60 * 1000
-    const last = settings.ragOptions.lastAutoUpdateAt ?? 0
-    const now = Date.now()
-    if (now - last < intervalMs) {
+  onWindowBlur() {
+    if (this.pendingDirtyPaths.size === 0 || this.isAutoUpdating) {
       return
     }
 
-    if (this.autoUpdateTimer) clearTimeout(this.autoUpdateTimer)
-    this.autoUpdateTimer = setTimeout(() => void this.runAutoUpdate(), 3000)
+    const elapsedSinceEdit =
+      this.lastRelevantEditAt === null
+        ? Number.POSITIVE_INFINITY
+        : Date.now() - this.lastRelevantEditAt
+
+    if (elapsedSinceEdit < RagAutoUpdateService.WINDOW_BLUR_GRACE_MS) {
+      return
+    }
+
+    this.scheduleAutoUpdate(0)
+  }
+
+  private isAutoUpdateEnabled(settings: YoloSettings): boolean {
+    if (
+      !settings?.ragOptions?.enabled ||
+      !settings?.ragOptions?.autoUpdateEnabled
+    ) {
+      return false
+    }
+    // Skip auto-update when no valid embedding model is configured so that
+    // fresh installations don't immediately surface a confusing error.
+    const id = settings.embeddingModelId
+    if (!id || !settings.embeddingModels.some((m) => m.id === id)) {
+      return false
+    }
+    return true
+  }
+
+  private markDirty(path: string, options?: { requiresFullScan?: boolean }) {
+    const settings = this.getSettings()
+    if (!this.isAutoUpdateEnabled(settings)) return
+    if (
+      !options?.requiresFullScan &&
+      !this.isPathSelectedByIncludeExclude(path, settings)
+    ) {
+      return
+    }
+
+    this.pendingDirtyPaths.add(path)
+    this.lastRelevantEditAt = Date.now()
+    this.lastRunError = null
+
+    if (options?.requiresFullScan) {
+      this.requiresFullScan = true
+    }
+
+    if (this.isAutoUpdating) {
+      this.hasPendingChangesDuringRun = true
+      return
+    }
+
+    this.scheduleAutoUpdate(RagAutoUpdateService.EDIT_IDLE_WINDOW_MS)
   }
 
   private isPathSelectedByIncludeExclude(
     path: string,
-    settings: SmartComposerSettings,
+    settings: YoloSettings,
   ): boolean {
+    const lower = path.toLowerCase()
+    if (lower.endsWith('.md')) {
+      // continue
+    } else if (
+      lower.endsWith('.pdf') &&
+      (settings.ragOptions.indexPdf ?? true)
+    ) {
+      // continue
+    } else {
+      return false
+    }
     const { includePatterns = [], excludePatterns = [] } =
       settings?.ragOptions ?? {}
     if (excludePatterns.some((p) => minimatch(path, p))) return false
@@ -75,12 +197,57 @@ export class RagAutoUpdateService {
     return includePatterns.some((p) => minimatch(path, p))
   }
 
+  private scheduleAutoUpdate(delayMs: number) {
+    if (this.autoUpdateTimer) {
+      clearTimeout(this.autoUpdateTimer)
+    }
+
+    this.autoUpdateTimer = setTimeout(() => {
+      this.autoUpdateTimer = null
+      void this.runAutoUpdate()
+    }, delayMs)
+  }
+
   private async runAutoUpdate() {
     if (this.isAutoUpdating) return
+    if (
+      this.pendingDirtyPaths.size === 0 &&
+      !this.requiresFullScan &&
+      !this.hasRecoveredRetry
+    ) {
+      return
+    }
+
+    if (
+      this.lastRunFinishedAt !== null &&
+      Date.now() - this.lastRunFinishedAt <
+        RagAutoUpdateService.SUCCESS_COOLDOWN_MS
+    ) {
+      this.scheduleAutoUpdate(
+        RagAutoUpdateService.SUCCESS_COOLDOWN_MS -
+          (Date.now() - this.lastRunFinishedAt),
+      )
+      return
+    }
+
     this.isAutoUpdating = true
+    const pendingSnapshot = new Set(this.pendingDirtyPaths)
+    const requiresFullScanSnapshot = this.requiresFullScan
+    const recoveredRetrySnapshot = this.hasRecoveredRetry
+    let hasScheduledTransientRetry = false
+    let shouldRescheduleDirtyWork = false
+
     try {
-      const ragEngine = await this.getRagEngine()
-      await ragEngine.updateVaultIndex({ reindexAll: false }, undefined)
+      this.pendingDirtyPaths.clear()
+      this.requiresFullScan = false
+      this.hasPendingChangesDuringRun = false
+      this.hasRecoveredRetry = false
+      await this.clearRetryScheduled()
+      const request: AutoUpdateRunRequest =
+        requiresFullScanSnapshot || recoveredRetrySnapshot
+          ? { kind: 'all' }
+          : { kind: 'paths', paths: [...pendingSnapshot] }
+      await this.runIndex(request)
       const settings = this.getSettings()
       await this.setSettings({
         ...settings,
@@ -89,13 +256,44 @@ export class RagAutoUpdateService {
           lastAutoUpdateAt: Date.now(),
         },
       })
-      new Notice(this.t('notices.indexUpdated'))
+      this.lastRunFinishedAt = Date.now()
+      this.lastRunError = null
     } catch (e) {
       console.error('Auto update index failed:', e)
-      new Notice(this.t('notices.indexUpdateFailed'))
+      this.lastRunFinishedAt = Date.now()
+      this.lastRunError = e instanceof Error ? e.message : String(e)
+      for (const path of pendingSnapshot) {
+        this.pendingDirtyPaths.add(path)
+      }
+      this.requiresFullScan = this.requiresFullScan || requiresFullScanSnapshot
+      const failureKind = classifyRagIndexError(e)
+
+      if (failureKind === 'transient') {
+        const retryAt = Date.now() + RagAutoUpdateService.FAILURE_RETRY_DELAY_MS
+        this.hasRecoveredRetry =
+          recoveredRetrySnapshot &&
+          pendingSnapshot.size === 0 &&
+          !requiresFullScanSnapshot
+        await this.markRetryScheduled({
+          retryAt,
+          failureMessage: this.lastRunError,
+        })
+        this.scheduleAutoUpdate(RagAutoUpdateService.FAILURE_RETRY_DELAY_MS)
+        hasScheduledTransientRetry = true
+      } else if (failureKind === 'aborted') {
+        shouldRescheduleDirtyWork = true
+      }
     } finally {
       this.isAutoUpdating = false
-      this.autoUpdateTimer = null
+      if (!hasScheduledTransientRetry) {
+        this.autoUpdateTimer = null
+      }
+      if (
+        !hasScheduledTransientRetry &&
+        (shouldRescheduleDirtyWork || this.hasPendingChangesDuringRun)
+      ) {
+        this.scheduleAutoUpdate(RagAutoUpdateService.EDIT_IDLE_WINDOW_MS)
+      }
     }
   }
 }

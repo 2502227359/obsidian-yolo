@@ -13,8 +13,10 @@ import { useCallback, useEffect, useState } from 'react'
 
 import { useLanguage } from '../../../contexts/language-context'
 import { useSettings } from '../../../contexts/settings-context'
+import { pruneOrphanedAssistantToolPreferences } from '../../../core/agent/tool-preferences'
+import { getLocalFileToolServerName } from '../../../core/mcp/localFileTools'
 import { McpManager } from '../../../core/mcp/mcpManager'
-import SmartComposerPlugin from '../../../main'
+import YoloPlugin from '../../../main'
 import {
   McpServerState,
   McpServerStatus,
@@ -23,6 +25,7 @@ import {
 import { ObsidianButton } from '../../common/ObsidianButton'
 import { ObsidianToggle } from '../../common/ObsidianToggle'
 import { ConfirmModal } from '../../modals/ConfirmModal'
+import { CollapsibleToolDescription } from '../common/CollapsibleToolDescription'
 import {
   AddMcpServerModal,
   EditMcpServerModal,
@@ -30,7 +33,7 @@ import {
 
 type McpSectionProps = {
   app: App
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
   embedded?: boolean
 }
 
@@ -70,29 +73,29 @@ export function McpSection({ app, plugin, embedded = false }: McpSectionProps) {
   }, [mcpManager])
 
   return (
-    <div className="smtcmp-settings-section">
+    <div className="yolo-settings-section">
       {embedded ? (
-        <div className="smtcmp-settings-sub-header">
+        <div className="yolo-settings-sub-header">
           {t('settings.mcp.title')}
         </div>
       ) : (
-        <div className="smtcmp-settings-header">{t('settings.mcp.title')}</div>
+        <div className="yolo-settings-header">{t('settings.mcp.title')}</div>
       )}
 
-      <div className="smtcmp-settings-desc smtcmp-settings-callout">
+      <div className="yolo-settings-desc yolo-settings-callout">
         <strong>Warning:</strong> {t('settings.mcp.warning')}
       </div>
 
-      {mcpManager?.disabled ? (
-        <div className="smtcmp-settings-sub-header-container">
-          <div className="smtcmp-settings-sub-header">
+      {mcpManager?.remoteMcpDisabled ? (
+        <div className="yolo-settings-sub-header-container">
+          <div className="yolo-settings-sub-header">
             {t('settings.mcp.notSupportedOnMobile')}
           </div>
         </div>
       ) : (
         <>
-          <div className="smtcmp-settings-sub-header-container">
-            <div className="smtcmp-settings-sub-header">
+          <div className="yolo-settings-sub-header-container">
+            <div className="yolo-settings-sub-header">
               {t('settings.mcp.mcpServers')}
             </div>
             <ObsidianButton
@@ -101,8 +104,8 @@ export function McpSection({ app, plugin, embedded = false }: McpSectionProps) {
             />
           </div>
 
-          <div className="smtcmp-mcp-servers-container">
-            <div className="smtcmp-mcp-servers-header">
+          <div className="yolo-mcp-servers-container">
+            <div className="yolo-mcp-servers-header">
               <div>{t('settings.mcp.server')}</div>
               <div>{t('settings.mcp.status')}</div>
               <div>{t('settings.mcp.enabled')}</div>
@@ -118,7 +121,7 @@ export function McpSection({ app, plugin, embedded = false }: McpSectionProps) {
                 />
               ))
             ) : (
-              <div className="smtcmp-mcp-servers-empty">
+              <div className="yolo-mcp-servers-empty">
                 {t('settings.mcp.noServersFound')}
               </div>
             )}
@@ -136,7 +139,7 @@ function McpServerComponent({
 }: {
   server: McpServerState
   app: App
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
 }) {
   const { settings, setSettings } = useSettings()
   const { t } = useLanguage()
@@ -150,12 +153,23 @@ function McpServerComponent({
     const message = `${t('settings.mcp.deleteServerConfirm')} "${server.name}"?`
     const deleteServer = async () => {
       try {
+        const nextServers = settings.mcp.servers.filter(
+          (s) => s.id !== server.name,
+        )
+        const knownServerNames = new Set<string>([
+          getLocalFileToolServerName(),
+          ...nextServers.map((s) => s.id),
+        ])
+        const nextAssistants = settings.assistants.map((assistant) =>
+          pruneOrphanedAssistantToolPreferences(assistant, knownServerNames),
+        )
         await setSettings({
           ...settings,
           mcp: {
             ...settings.mcp,
-            servers: settings.mcp.servers.filter((s) => s.id !== server.name),
+            servers: nextServers,
           },
+          assistants: nextAssistants,
         })
       } catch (error: unknown) {
         console.error('Failed to delete MCP server', error)
@@ -194,19 +208,19 @@ function McpServerComponent({
   )
 
   return (
-    <div className="smtcmp-mcp-server">
-      <div className="smtcmp-mcp-server-row">
-        <div className="smtcmp-mcp-server-name">{server.name}</div>
-        <div className="smtcmp-mcp-server-status">
+    <div className="yolo-mcp-server">
+      <div className="yolo-mcp-server-row">
+        <div className="yolo-mcp-server-name">{server.name}</div>
+        <div className="yolo-mcp-server-status">
           <McpServerStatusBadge status={server.status} />
         </div>
-        <div className="smtcmp-mcp-server-toggle">
+        <div className="yolo-mcp-server-toggle">
           <ObsidianToggle
             value={server.config.enabled}
             onChange={(enabled) => void handleToggleEnabled(enabled)}
           />
         </div>
-        <div className="smtcmp-mcp-server-actions">
+        <div className="yolo-mcp-server-actions">
           <button
             onClick={handleEdit}
             className="clickable-icon"
@@ -248,13 +262,13 @@ function ExpandedServerInfo({ server }: { server: McpServerState }) {
   }
 
   return (
-    <div className="smtcmp-server-expanded-info">
+    <div className="yolo-server-expanded-info">
       {server.status === McpServerStatus.Connected && (
         <div>
-          <div className="smtcmp-server-expanded-info-header">
+          <div className="yolo-server-expanded-info-header">
             {t('settings.mcp.tools')}
           </div>
-          <div className="smtcmp-server-tools-container">
+          <div className="yolo-server-tools-container">
             {server.tools.map((tool) => (
               <McpToolComponent key={tool.name} tool={tool} server={server} />
             ))}
@@ -263,10 +277,10 @@ function ExpandedServerInfo({ server }: { server: McpServerState }) {
       )}
       {server.status === McpServerStatus.Error && (
         <div>
-          <div className="smtcmp-server-expanded-info-header">
+          <div className="yolo-server-expanded-info-header">
             {t('settings.mcp.error')}
           </div>
-          <div className="smtcmp-server-error-message">
+          <div className="yolo-server-error-message">
             {server.error.message}
           </div>
         </div>
@@ -281,31 +295,31 @@ function McpServerStatusBadge({ status }: { status: McpServerStatus }) {
     [McpServerStatus.Connected]: {
       icon: <Check size={16} />,
       label: t('settings.mcp.connected'),
-      statusClass: 'smtcmp-mcp-server-status-badge--connected',
+      statusClass: 'yolo-mcp-server-status-badge--connected',
     },
     [McpServerStatus.Connecting]: {
-      icon: <Loader2 size={16} className="smtcmp-spinner" />,
+      icon: <Loader2 size={16} className="yolo-spinner" />,
       label: t('settings.mcp.connecting'),
-      statusClass: 'smtcmp-mcp-server-status-badge--connecting',
+      statusClass: 'yolo-mcp-server-status-badge--connecting',
     },
     [McpServerStatus.Error]: {
       icon: <X size={16} />,
       label: t('settings.mcp.error'),
-      statusClass: 'smtcmp-mcp-server-status-badge--error',
+      statusClass: 'yolo-mcp-server-status-badge--error',
     },
     [McpServerStatus.Disconnected]: {
       icon: <CircleMinus size={16} />,
       label: t('settings.mcp.disconnected'),
-      statusClass: 'smtcmp-mcp-server-status-badge--disconnected',
+      statusClass: 'yolo-mcp-server-status-badge--disconnected',
     },
   }
 
   const { icon, label, statusClass } = statusConfig[status]
 
   return (
-    <div className={`smtcmp-mcp-server-status-badge ${statusClass}`}>
+    <div className={`yolo-mcp-server-status-badge ${statusClass}`}>
       {icon}
-      <div className="smtcmp-mcp-server-status-badge-label">{label}</div>
+      <div className="yolo-mcp-server-status-badge-label">{label}</div>
     </div>
   )
 }
@@ -322,14 +336,13 @@ function McpToolComponent({
 
   const toolOption = server.config.toolOptions[tool.name]
   const disabled = toolOption?.disabled ?? false
-  const allowAutoExecution = toolOption?.allowAutoExecution ?? false
 
   const handleToggleEnabled = (enabled: boolean) => {
     const toolOptions = {
       ...server.config.toolOptions,
       [tool.name]: {
         disabled: !enabled,
-        allowAutoExecution,
+        ...server.config.toolOptions[tool.name],
       },
     }
     Promise.resolve(
@@ -352,54 +365,21 @@ function McpToolComponent({
     })
   }
 
-  const handleToggleAutoExecution = (autoExecution: boolean) => {
-    const toolOptions = { ...server.config.toolOptions }
-    toolOptions[tool.name] = {
-      ...toolOptions[tool.name],
-      allowAutoExecution: autoExecution,
-    }
-    Promise.resolve(
-      setSettings({
-        ...settings,
-        mcp: {
-          ...settings.mcp,
-          servers: settings.mcp.servers.map((s) =>
-            s.id === server.name
-              ? {
-                  ...s,
-                  toolOptions,
-                }
-              : s,
-          ),
-        },
-      }),
-    ).catch((error: unknown) => {
-      console.error('Failed to toggle MCP tool auto execution', error)
-    })
-  }
-
   return (
-    <div className="smtcmp-mcp-tool">
-      <div className="smtcmp-mcp-tool-info">
-        <div className="smtcmp-mcp-tool-name">{tool.name}</div>
-        <div className="smtcmp-mcp-tool-description">{tool.description}</div>
+    <div className="yolo-mcp-tool">
+      <div className="yolo-mcp-tool-info">
+        <CollapsibleToolDescription
+          name={tool.name}
+          description={tool.description}
+        />
       </div>
-      <div className="smtcmp-mcp-tool-toggle">
-        <span className="smtcmp-mcp-tool-toggle-label">
+      <div className="yolo-mcp-tool-toggle">
+        <span className="yolo-mcp-tool-toggle-label">
           {t('settings.mcp.enabled')}
         </span>
         <ObsidianToggle
           value={!disabled}
           onChange={(value) => handleToggleEnabled(value)}
-        />
-      </div>
-      <div className="smtcmp-mcp-tool-toggle">
-        <span className="smtcmp-mcp-tool-toggle-label">
-          {t('settings.mcp.autoExecute')}
-        </span>
-        <ObsidianToggle
-          value={allowAutoExecution}
-          onChange={(value) => handleToggleAutoExecution(value)}
         />
       </div>
     </div>

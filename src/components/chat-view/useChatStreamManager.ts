@@ -1,11 +1,22 @@
 import { UseMutationResult, useMutation } from '@tanstack/react-query'
-import { Notice, TFile } from 'obsidian'
-import { useCallback, useRef } from 'react'
+import { TFile } from 'obsidian'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useApp } from '../../contexts/app-context'
 import { useMcp } from '../../contexts/mcp-context'
 import { usePlugin } from '../../contexts/plugin-context'
 import { useSettings } from '../../contexts/settings-context'
+import {
+  buildManualCompactionState,
+  createConversationCompactionSummary,
+  getLastAssistantPromptTokens,
+} from '../../core/agent/compaction'
+import { estimateContinuationRequestContextTokens } from '../../core/agent/requestContextEstimate'
+import type {
+  AgentConversationRunSummary,
+  AgentConversationState,
+} from '../../core/agent/service'
+import { getEnabledAssistantToolNames } from '../../core/agent/tool-preferences'
 import {
   LLMAPIKeyInvalidException,
   LLMAPIKeyNotSetException,
@@ -13,88 +24,627 @@ import {
   LLMModelNotFoundException,
 } from '../../core/llm/exception'
 import { getChatModelClient } from '../../core/llm/manager'
+import type { AutoPromotedTransportMode } from '../../core/llm/requestTransport'
+import { shouldUseStreamingForProvider } from '../../core/llm/streamingPolicy'
+import { promoteProviderTransportModeToObsidian } from '../../core/llm/transportModePromotion'
 import { listLiteSkillEntries } from '../../core/skills/liteSkills'
 import { isSkillEnabledForAssistant } from '../../core/skills/skillPolicy'
-import { ChatMessage } from '../../types/chat'
+import {
+  ChatConversationCompaction,
+  ChatConversationCompactionState,
+  ChatMessage,
+  ChatToolMessage,
+} from '../../types/chat'
 import { ConversationOverrideSettings } from '../../types/conversation-settings.types'
-import { PromptGenerator } from '../../utils/chat/promptGenerator'
-import { mergeCustomParameters } from '../../utils/custom-parameters'
+import { ReasoningLevel } from '../../types/reasoning'
+import { ToolCallResponseStatus } from '../../types/tool-call.types'
+import type { ContextualInjection } from '../../utils/chat/contextual-injections'
+import { RequestContextBuilder } from '../../utils/chat/requestContextBuilder'
 import { ErrorModal } from '../modals/ErrorModal'
 
 import { ChatMode } from './chat-input/ChatModeSelect'
-import { ReasoningLevel } from './chat-input/ReasoningSelect'
+import { resolveWorkspaceScopeForRuntimeInput } from './chat-runtime-inputs'
+import { resolveChatModeRuntime } from './chat-runtime-profiles'
+import type { ContextBreakdownInputs } from './useContextBreakdown'
 
 type UseChatStreamManagerParams = {
   setChatMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>
+  setCompactionState: React.Dispatch<
+    React.SetStateAction<ChatConversationCompactionState>
+  >
+  setPendingCompactionAnchorMessageId: React.Dispatch<
+    React.SetStateAction<string | null>
+  >
   autoScrollToBottom: () => void
-  promptGenerator: PromptGenerator
+  requestContextBuilder: RequestContextBuilder
+  currentConversationId: string
   conversationOverrides?: ConversationOverrideSettings
   modelId: string
   chatMode: ChatMode
   currentFileOverride?: TFile | null
+  currentFileViewState?: import('../../types/mentionable').CurrentFileViewState
   assistantIdOverride?: string
+  compaction?: ChatConversationCompactionState
+  onRunSettled?: (result: { aborted: boolean; failed: boolean }) => void
 }
 
-const DEFAULT_MAX_AUTO_TOOL_ITERATIONS = 100
+type ActiveBranchRun = {
+  branchId: string
+  branchConversationId: string
+  sourceUserMessageId: string
+  branchModelId: string
+  branchLabel: string
+}
+
+type BranchRetryTarget = {
+  branchId: string
+  sourceUserMessageId: string
+  branchModelId?: string
+  branchLabel?: string
+}
+
+const buildRunSummary = ({
+  conversationId,
+  status,
+  messages,
+}: AgentConversationState): AgentConversationRunSummary => {
+  let hasApproval = false
+  let hasAwaitingUser = false
+  for (const message of messages) {
+    if (message.role !== 'tool') continue
+    for (const toolCall of message.toolCalls) {
+      if (toolCall.response.status === ToolCallResponseStatus.PendingApproval) {
+        hasApproval = true
+      } else if (
+        toolCall.response.status === ToolCallResponseStatus.AwaitingUserInput
+      ) {
+        hasAwaitingUser = true
+      }
+      if (hasApproval && hasAwaitingUser) break
+    }
+    if (hasApproval && hasAwaitingUser) break
+  }
+  const isWaitingApproval = hasApproval || hasAwaitingUser
+
+  return {
+    conversationId,
+    status,
+    isRunning: status === 'running' && !isWaitingApproval,
+    isWaitingApproval,
+    isWaitingUserInput: hasAwaitingUser,
+  }
+}
 
 export type UseChatStreamManager = {
-  abortActiveStreams: () => void
+  abortConversationRun: (conversationId: string) => void
+  compactConversation: (
+    messages: ChatMessage[],
+  ) => Promise<ChatConversationCompaction | null>
+  currentConversationRunSummary: AgentConversationRunSummary
+  buildContextBreakdownInputs: (
+    messages: ChatMessage[],
+  ) => Promise<ContextBreakdownInputs | null>
   submitChatMutation: UseMutationResult<
-    void,
+    { aborted: boolean },
     Error,
     {
       chatMessages: ChatMessage[]
+      requestMessages?: ChatMessage[]
       conversationId: string
       reasoningLevel?: ReasoningLevel
+      modelIds?: string[]
+      branchTarget?: BranchRetryTarget
+      compactionOverride?: ChatConversationCompactionState
     }
   >
 }
 
+const isRunSummaryActive = (summary: AgentConversationRunSummary): boolean => {
+  return summary.isRunning || summary.isWaitingApproval
+}
+
+/**
+ * Sidebar Chat focus sync → current-file-pointer injection.
+ * Returns an empty array when the user has disabled focus sync or no file
+ * is active.
+ */
+const buildChatContextualInjections = ({
+  includeCurrentFileContent,
+  currentFile,
+  currentFileViewState,
+}: {
+  includeCurrentFileContent: boolean
+  currentFile: TFile | null | undefined
+  currentFileViewState?: import('../../types/mentionable').CurrentFileViewState
+}): ContextualInjection[] => {
+  if (!includeCurrentFileContent || !currentFile) {
+    return []
+  }
+  return [
+    {
+      type: 'current-file-pointer',
+      file: currentFile,
+      viewState: currentFileViewState,
+    },
+  ]
+}
+
+const annotateBranchMessages = (
+  messages: ChatMessage[],
+  branch: ActiveBranchRun,
+  branchState: AgentConversationState,
+): ChatMessage[] => {
+  const branchRunSummary = buildRunSummary(branchState)
+
+  return messages.map((message) => {
+    if (message.role === 'assistant') {
+      return {
+        ...message,
+        metadata: {
+          ...message.metadata,
+          sourceUserMessageId: branch.sourceUserMessageId,
+          branchId: branch.branchId,
+          branchModelId: branch.branchModelId,
+          branchLabel: branch.branchLabel,
+          branchConversationId: branch.branchConversationId,
+          branchRunStatus: branchState.status,
+          branchWaitingApproval: branchRunSummary.isWaitingApproval,
+        },
+      }
+    }
+
+    if (message.role === 'tool') {
+      const toolMessage: ChatToolMessage = {
+        ...message,
+        metadata: {
+          ...message.metadata,
+          sourceUserMessageId: branch.sourceUserMessageId,
+          branchId: branch.branchId,
+          branchModelId: branch.branchModelId,
+          branchLabel: branch.branchLabel,
+          branchConversationId: branch.branchConversationId,
+          branchRunStatus: branchState.status,
+          branchWaitingApproval: branchRunSummary.isWaitingApproval,
+        },
+      }
+      return toolMessage
+    }
+
+    return message
+  })
+}
+
 export function useChatStreamManager({
   setChatMessages,
+  setCompactionState,
+  setPendingCompactionAnchorMessageId,
   autoScrollToBottom,
-  promptGenerator,
+  requestContextBuilder,
+  currentConversationId,
   conversationOverrides,
   modelId,
   chatMode,
   currentFileOverride,
+  currentFileViewState,
   assistantIdOverride,
+  compaction,
+  onRunSettled,
 }: UseChatStreamManagerParams): UseChatStreamManager {
   const app = useApp()
   const plugin = usePlugin()
-  const { settings } = useSettings()
+  const { settings, setSettings } = useSettings()
   const { getMcpManager } = useMcp()
 
-  const activeStreamAbortControllersRef = useRef<AbortController[]>([])
+  const activeStreamAbortControllersRef = useRef<Map<string, AbortController>>(
+    new Map(),
+  )
+  const activeBranchRunsRef = useRef<Map<string, ActiveBranchRun>>(new Map())
+  const branchStateMapRef = useRef<Map<string, AgentConversationState>>(
+    new Map(),
+  )
+  const baseConversationMessagesRef = useRef<ChatMessage[]>([])
+  const baseCompactionStateRef = useRef<ChatConversationCompactionState>(
+    compaction ?? [],
+  )
+  const [currentConversationRunSummary, setCurrentConversationRunSummary] =
+    useState<AgentConversationRunSummary>(() =>
+      plugin.getAgentService().getConversationRunSummary(currentConversationId),
+    )
 
-  const abortActiveStreams = useCallback(() => {
-    for (const abortController of activeStreamAbortControllersRef.current) {
-      abortController.abort()
+  const buildVisibleConversationMessages = useCallback(
+    (baseMessages: ChatMessage[]): ChatMessage[] => {
+      const activeBranches = Array.from(activeBranchRunsRef.current.values())
+      if (activeBranches.length === 0) {
+        return baseMessages
+      }
+
+      const result: ChatMessage[] = []
+      for (const message of baseMessages) {
+        result.push(message)
+        if (message.role !== 'user') {
+          continue
+        }
+
+        for (const branch of activeBranches) {
+          if (branch.sourceUserMessageId !== message.id) {
+            continue
+          }
+          const branchState = branchStateMapRef.current.get(
+            branch.branchConversationId,
+          )
+          if (!branchState) {
+            continue
+          }
+          const anchorIndex = branchState.messages.findIndex(
+            (candidate) => candidate.id === branch.sourceUserMessageId,
+          )
+          const responseMessages =
+            anchorIndex >= 0
+              ? branchState.messages.slice(anchorIndex + 1)
+              : branchState.messages
+          result.push(
+            ...annotateBranchMessages(responseMessages, branch, branchState),
+          )
+        }
+      }
+
+      return result
+    },
+    [],
+  )
+
+  const syncVisibleConversationState = useCallback(
+    (baseMessages?: ChatMessage[]) => {
+      const resolvedBaseMessages =
+        baseMessages ?? baseConversationMessagesRef.current
+      const visibleMessages =
+        buildVisibleConversationMessages(resolvedBaseMessages)
+      setChatMessages(visibleMessages)
+
+      const branchSummaries = Array.from(
+        activeBranchRunsRef.current.values(),
+      ).map((branch) => {
+        const state = branchStateMapRef.current.get(branch.branchConversationId)
+        return state ? buildRunSummary(state) : null
+      })
+      const activeSummaries = branchSummaries.filter(
+        (summary): summary is AgentConversationRunSummary =>
+          summary !== null && isRunSummaryActive(summary),
+      )
+      if (activeSummaries.length > 0) {
+        const hasWaitingApproval = activeSummaries.some(
+          (summary) => summary.isWaitingApproval,
+        )
+        const hasWaitingUserInput = activeSummaries.some(
+          (summary) => summary.isWaitingUserInput,
+        )
+        setCurrentConversationRunSummary({
+          conversationId: currentConversationId,
+          status: hasWaitingApproval ? 'running' : 'running',
+          isRunning: activeSummaries.some((summary) => summary.isRunning),
+          isWaitingApproval: hasWaitingApproval,
+          isWaitingUserInput: hasWaitingUserInput,
+        })
+      }
+    },
+    [buildVisibleConversationMessages, currentConversationId, setChatMessages],
+  )
+
+  const handleAutoPromoteTransportMode = useCallback(
+    (providerId: string, mode: AutoPromotedTransportMode) => {
+      void promoteProviderTransportModeToObsidian({
+        getSettings: () => plugin.settings,
+        setSettings,
+        providerId,
+        mode,
+      })
+    },
+    [plugin, setSettings],
+  )
+
+  useEffect(() => {
+    const agentService = plugin.getAgentService()
+
+    const syncConversationState = (state: AgentConversationState) => {
+      baseConversationMessagesRef.current = state.messages
+      baseCompactionStateRef.current = state.compaction ?? []
+      const runSummary = buildRunSummary(state)
+      const hasTrackedState =
+        state.messages.length > 0 || state.status !== 'idle'
+      if (!hasTrackedState) {
+        return
+      }
+
+      if (activeBranchRunsRef.current.size === 0) {
+        setCurrentConversationRunSummary(runSummary)
+      }
+      syncVisibleConversationState(state.messages)
+      setCompactionState(state.compaction ?? [])
+      setPendingCompactionAnchorMessageId(
+        state.pendingCompactionAnchorMessageId ?? null,
+      )
+      if (
+        !(state.status === 'running' || runSummary.isWaitingApproval) &&
+        activeBranchRunsRef.current.size === 0
+      ) {
+        return
+      }
+
+      const visibleMessages = buildVisibleConversationMessages(state.messages)
+      if (
+        visibleMessages.length > 0 &&
+        !visibleMessages.some(
+          (message) =>
+            message.role === 'assistant' &&
+            message.metadata?.generationState === 'streaming',
+        )
+      ) {
+        requestAnimationFrame(() => {
+          autoScrollToBottom()
+        })
+      }
     }
-    activeStreamAbortControllersRef.current = []
-  }, [])
+
+    // Reset summary on conversation switch — syncConversationState below
+    // bails out early for fresh/idle conversations and would otherwise leave
+    // stale flags (e.g. isWaitingUserInput) from the previous conversation
+    // bleeding into the new one's input-box guards.
+    setCurrentConversationRunSummary(
+      agentService.getConversationRunSummary(currentConversationId),
+    )
+
+    syncConversationState(agentService.getState(currentConversationId))
+
+    const unsubscribe = agentService.subscribe(
+      currentConversationId,
+      syncConversationState,
+      { emitCurrent: false },
+    )
+
+    return () => {
+      unsubscribe()
+    }
+  }, [
+    autoScrollToBottom,
+    currentConversationId,
+    plugin,
+    setCompactionState,
+    setPendingCompactionAnchorMessageId,
+    buildVisibleConversationMessages,
+    syncVisibleConversationState,
+  ])
+
+  const abortConversationRun = useCallback(
+    (conversationId: string) => {
+      activeStreamAbortControllersRef.current.get(conversationId)?.abort()
+      activeStreamAbortControllersRef.current.delete(conversationId)
+      plugin.getAgentService().abortConversation(conversationId)
+    },
+    [plugin],
+  )
+
+  const resolveCompactionClient = useCallback(() => {
+    const effectiveAssistantId =
+      assistantIdOverride ?? settings.currentAssistantId
+    const selectedAssistant = effectiveAssistantId
+      ? (settings.assistants || []).find(
+          (assistant) => assistant.id === effectiveAssistantId,
+        ) || null
+      : null
+
+    const requestedModelId =
+      modelId || selectedAssistant?.modelId || settings.chatModelId
+    const compactionModelId = settings.chatTitleModelId || requestedModelId
+
+    let resolvedClient: ReturnType<typeof getChatModelClient>
+    try {
+      resolvedClient = getChatModelClient({
+        settings,
+        modelId: requestedModelId,
+        onAutoPromoteTransportMode: handleAutoPromoteTransportMode,
+      })
+    } catch (error) {
+      if (
+        error instanceof LLMModelNotFoundException &&
+        settings.chatModels.length > 0
+      ) {
+        resolvedClient = getChatModelClient({
+          settings,
+          modelId: settings.chatModels[0].id,
+          onAutoPromoteTransportMode: handleAutoPromoteTransportMode,
+        })
+      } else {
+        throw error
+      }
+    }
+
+    try {
+      return getChatModelClient({
+        settings,
+        modelId: compactionModelId,
+        onAutoPromoteTransportMode: handleAutoPromoteTransportMode,
+      })
+    } catch {
+      return resolvedClient
+    }
+  }, [assistantIdOverride, handleAutoPromoteTransportMode, modelId, settings])
+
+  const compactConversation = useCallback(
+    async (messages: ChatMessage[]) => {
+      if (messages.length === 0) {
+        return null
+      }
+
+      const effectiveAssistantId =
+        assistantIdOverride ?? settings.currentAssistantId
+      const selectedAssistant = effectiveAssistantId
+        ? (settings.assistants || []).find(
+            (assistant) => assistant.id === effectiveAssistantId,
+          ) || null
+        : null
+      const requestedModelId =
+        modelId || selectedAssistant?.modelId || settings.chatModelId
+
+      let resolvedClient: ReturnType<typeof getChatModelClient>
+      try {
+        resolvedClient = getChatModelClient({
+          settings,
+          modelId: requestedModelId,
+          onAutoPromoteTransportMode: handleAutoPromoteTransportMode,
+        })
+      } catch (error) {
+        if (
+          error instanceof LLMModelNotFoundException &&
+          settings.chatModels.length > 0
+        ) {
+          resolvedClient = getChatModelClient({
+            settings,
+            modelId: settings.chatModels[0].id,
+            onAutoPromoteTransportMode: handleAutoPromoteTransportMode,
+          })
+        } else {
+          throw error
+        }
+      }
+
+      const effectiveModel = resolvedClient.model
+      const disabledSkillIds = settings.skills?.disabledSkillIds ?? []
+      const enabledSkillEntries = selectedAssistant
+        ? listLiteSkillEntries(app, { settings }).filter((skill) =>
+            isSkillEnabledForAssistant({
+              assistant: selectedAssistant,
+              skillId: skill.id,
+              disabledSkillIds,
+            }),
+          )
+        : []
+      const allowedSkillIds = enabledSkillEntries.map((skill) => skill.id)
+      const allowedSkillNames = enabledSkillEntries.map((skill) => skill.name)
+      const chatModeRuntime = resolveChatModeRuntime({
+        mode: chatMode,
+        assistant: selectedAssistant,
+        assistantEnabledToolNames:
+          getEnabledAssistantToolNames(selectedAssistant),
+      })
+      const effectiveEnableTools = chatModeRuntime.loopConfig.enableTools
+      const effectiveIncludeBuiltinTools =
+        chatModeRuntime.loopConfig.includeBuiltinTools
+      const effectiveAllowedToolNames = chatModeRuntime.allowedToolNames
+      const resolvedCompactionClient = resolveCompactionClient()
+      const summary = await createConversationCompactionSummary({
+        providerClient: resolvedCompactionClient.providerClient,
+        model: resolvedCompactionClient.model,
+        messages,
+        retainLatestToolBoundary: false,
+      })
+
+      const nextCompaction = await buildManualCompactionState({
+        messages,
+        summary,
+        summaryModelId: resolvedCompactionClient.model.id,
+      })
+
+      if (!nextCompaction) {
+        return null
+      }
+
+      const manualEstimateProvider = settings.providers.find(
+        (provider) => provider.id === effectiveModel.providerId,
+      )
+      try {
+        nextCompaction.estimatedNextContextTokens =
+          await estimateContinuationRequestContextTokens({
+            requestContextBuilder,
+            mcpManager: await getMcpManager(),
+            model: effectiveModel,
+            messages,
+            conversationId: currentConversationId,
+            compaction: nextCompaction,
+            enableTools: effectiveEnableTools,
+            includeBuiltinTools: effectiveIncludeBuiltinTools,
+            apiType: manualEstimateProvider?.apiType ?? null,
+            allowedToolNames: effectiveAllowedToolNames,
+            enableToolDisclosure: settings.mcp.enableToolDisclosure,
+            toolPreferences: chatModeRuntime.toolPreferences,
+            allowedSkillIds,
+            allowedSkillNames,
+            contextualInjections: buildChatContextualInjections({
+              includeCurrentFileContent:
+                settings.chatOptions.includeCurrentFileContent,
+              currentFile: currentFileOverride,
+              currentFileViewState,
+            }),
+          })
+      } catch (error) {
+        console.warn(
+          '[YOLO][Compact] failed to estimate continuation context tokens',
+          error,
+        )
+      }
+
+      const preCompactionTokens = getLastAssistantPromptTokens(messages)
+      if (
+        typeof preCompactionTokens === 'number' &&
+        typeof nextCompaction.estimatedNextContextTokens === 'number'
+      ) {
+        const saved =
+          preCompactionTokens - nextCompaction.estimatedNextContextTokens
+        if (saved > 0) {
+          nextCompaction.estimatedTokensSaved = saved
+        }
+      }
+
+      return nextCompaction
+    },
+    [
+      app,
+      assistantIdOverride,
+      chatMode,
+      currentConversationId,
+      currentFileOverride,
+      currentFileViewState,
+      getMcpManager,
+      handleAutoPromoteTransportMode,
+      modelId,
+      requestContextBuilder,
+      resolveCompactionClient,
+      settings,
+    ],
+  )
 
   const submitChatMutation = useMutation({
     mutationFn: async ({
       chatMessages,
+      requestMessages,
       conversationId,
       reasoningLevel,
+      modelIds,
+      branchTarget,
+      compactionOverride,
     }: {
       chatMessages: ChatMessage[]
+      requestMessages?: ChatMessage[]
       conversationId: string
       reasoningLevel?: ReasoningLevel
+      modelIds?: string[]
+      branchTarget?: BranchRetryTarget
+      compactionOverride?: ChatConversationCompactionState
     }) => {
       const lastMessage = chatMessages.at(-1)
       if (!lastMessage) {
-        // chatMessages is empty
-        return
+        return {
+          aborted: false,
+        }
       }
+      const requestLastMessage = (requestMessages ?? chatMessages).at(-1)
 
-      abortActiveStreams()
+      abortConversationRun(conversationId)
+
       const abortController = new AbortController()
-      activeStreamAbortControllersRef.current.push(abortController)
-
-      let unsubscribeRunner: (() => void) | undefined
+      activeStreamAbortControllersRef.current.set(
+        conversationId,
+        abortController,
+      )
 
       try {
         const effectiveAssistantId =
@@ -107,160 +657,260 @@ export function useChatStreamManager({
 
         const requestedModelId =
           modelId || selectedAssistant?.modelId || settings.chatModelId
+        const targetModelIds = branchTarget?.branchModelId?.trim()
+          ? [branchTarget.branchModelId]
+          : modelIds && modelIds.length > 0
+            ? modelIds
+            : [requestedModelId]
 
-        let resolvedClient: ReturnType<typeof getChatModelClient>
-        try {
-          resolvedClient = getChatModelClient({
-            settings,
-            modelId: requestedModelId,
-          })
-        } catch (error) {
-          if (
-            error instanceof LLMModelNotFoundException &&
-            settings.chatModels.length > 0
-          ) {
-            resolvedClient = getChatModelClient({
+        const resolveClientForModelId = (
+          requestedId: string,
+        ): ReturnType<typeof getChatModelClient> => {
+          try {
+            return getChatModelClient({
               settings,
-              modelId: settings.chatModels[0].id,
+              modelId: requestedId,
+              onAutoPromoteTransportMode: handleAutoPromoteTransportMode,
             })
-          } else {
+          } catch (error) {
+            if (
+              error instanceof LLMModelNotFoundException &&
+              settings.chatModels.length > 0
+            ) {
+              return getChatModelClient({
+                settings,
+                modelId: settings.chatModels[0].id,
+                onAutoPromoteTransportMode: handleAutoPromoteTransportMode,
+              })
+            }
             throw error
           }
         }
 
+        const resolvedClient = resolveClientForModelId(targetModelIds[0])
+
+        const currentProvider = settings.providers.find(
+          (provider) => provider.id === resolvedClient.model.providerId,
+        )
+        const resolvedCompactionClient = resolveCompactionClient()
+        const shouldStreamResponse = shouldUseStreamingForProvider({
+          requestedStream: conversationOverrides?.stream ?? true,
+          provider: currentProvider,
+        })
+
         const modelTemperature = resolvedClient.model.temperature
         const modelTopP = resolvedClient.model.topP
         const modelMaxTokens = resolvedClient.model.maxOutputTokens
-        const assistantTemperature =
-          chatMode === 'agent' ? selectedAssistant?.temperature : undefined
-        const assistantTopP =
-          chatMode === 'agent' ? selectedAssistant?.topP : undefined
-        const assistantMaxTokens =
-          chatMode === 'agent' ? selectedAssistant?.maxOutputTokens : undefined
-        const assistantMaxContextMessages =
-          chatMode === 'agent'
-            ? selectedAssistant?.maxContextMessages
-            : undefined
-        const effectiveModel =
-          chatMode === 'agent' && selectedAssistant
-            ? {
-                ...resolvedClient.model,
-                customParameters: mergeCustomParameters(
-                  resolvedClient.model.customParameters,
-                  selectedAssistant.customParameters,
-                ),
-              }
-            : resolvedClient.model
+        const effectiveModel = resolvedClient.model
         const disabledSkillIds = settings.skills?.disabledSkillIds ?? []
-        const enabledSkillEntries =
-          chatMode === 'agent' && selectedAssistant
-            ? listLiteSkillEntries(app, { settings }).filter((skill) =>
-                isSkillEnabledForAssistant({
-                  assistant: selectedAssistant,
-                  skillId: skill.id,
-                  disabledSkillIds,
-                }),
-              )
-            : []
+        const enabledSkillEntries = selectedAssistant
+          ? listLiteSkillEntries(app, { settings }).filter((skill) =>
+              isSkillEnabledForAssistant({
+                assistant: selectedAssistant,
+                skillId: skill.id,
+                disabledSkillIds,
+              }),
+            )
+          : []
         const allowedSkillIds = enabledSkillEntries.map((skill) => skill.id)
         const allowedSkillNames = enabledSkillEntries.map((skill) => skill.name)
 
-        const effectiveEnableTools =
-          chatMode === 'agent'
-            ? (selectedAssistant?.enableTools ?? true)
-            : false
-        const effectiveIncludeBuiltinTools = effectiveEnableTools
-          ? (selectedAssistant?.includeBuiltinTools ?? true)
-          : false
+        const chatModeRuntime = resolveChatModeRuntime({
+          mode: chatMode,
+          assistant: selectedAssistant,
+          assistantEnabledToolNames:
+            getEnabledAssistantToolNames(selectedAssistant),
+        })
 
         const mcpManager = await getMcpManager()
-        const onRunnerMessages = (responseMessages: ChatMessage[]) => {
-          setChatMessages((prevChatMessages) => {
-            const lastMessageIndex = prevChatMessages.findIndex(
-              (message) => message.id === lastMessage.id,
-            )
-            if (lastMessageIndex === -1) {
-              // The last message no longer exists in the chat history.
-              // This likely means a new message was submitted while this stream was running.
-              // Abort this stream and keep the current chat history.
-              abortController.abort()
-              return prevChatMessages
-            }
-            return [
-              ...prevChatMessages.slice(0, lastMessageIndex + 1),
-              ...responseMessages,
-            ]
-          })
-          autoScrollToBottom()
+
+        const loopConfig = chatModeRuntime.loopConfig
+        const requestParams = {
+          stream: shouldStreamResponse,
+          temperature: conversationOverrides?.temperature ?? modelTemperature,
+          top_p: conversationOverrides?.top_p ?? modelTopP,
+          max_tokens: modelMaxTokens,
+          primaryRequestTimeoutMs:
+            settings.continuationOptions.primaryRequestTimeoutMs,
+          streamFallbackRecoveryEnabled:
+            settings.continuationOptions.streamFallbackRecoveryEnabled,
+        }
+        const effectiveCompactionForRequest = compactionOverride ?? compaction
+        const baseInput = {
+          messages: chatMessages,
+          assistantId: selectedAssistant?.id,
+          requestContextBuilder,
+          mcpManager,
+          compaction: effectiveCompactionForRequest,
+          compactionProviderClient: resolvedCompactionClient.providerClient,
+          compactionModel: resolvedCompactionClient.model,
+          apiType: currentProvider?.apiType ?? null,
+          reasoningLevel,
+          allowedToolNames: chatModeRuntime.allowedToolNames,
+          enableToolDisclosure: settings.mcp.enableToolDisclosure,
+          toolPreferences: chatModeRuntime.toolPreferences,
+          workspaceScope:
+            resolveWorkspaceScopeForRuntimeInput(selectedAssistant),
+          allowedSkillIds,
+          allowedSkillNames,
+          requestParams,
+          contextualInjections: buildChatContextualInjections({
+            includeCurrentFileContent:
+              settings.chatOptions.includeCurrentFileContent,
+            currentFile: currentFileOverride,
+            currentFileViewState,
+          }),
+          geminiTools: {
+            useWebSearch: conversationOverrides?.useWebSearch ?? false,
+            useUrlContext: conversationOverrides?.useUrlContext ?? false,
+          },
         }
 
-        const agentService = plugin.getAgentService()
-        unsubscribeRunner = agentService.subscribe(
-          conversationId,
-          (state) => {
-            onRunnerMessages(state.messages)
-          },
-          { emitCurrent: false },
-        )
-        await agentService.run({
-          conversationId,
-          loopConfig: {
-            enableTools: effectiveEnableTools,
-            maxAutoIterations: DEFAULT_MAX_AUTO_TOOL_ITERATIONS,
-            includeBuiltinTools: effectiveIncludeBuiltinTools,
-          },
-          input: {
-            providerClient: resolvedClient.providerClient,
-            model: effectiveModel,
-            messages: chatMessages,
+        if (branchTarget && requestLastMessage?.role === 'user') {
+          const branchRunMessages = requestMessages ?? chatMessages
+          baseConversationMessagesRef.current = chatMessages
+          plugin
+            .getAgentService()
+            .replaceConversationMessages(
+              conversationId,
+              chatMessages,
+              effectiveCompactionForRequest,
+              { persistState: true },
+            )
+
+          await plugin.getAgentService().run({
             conversationId,
-            promptGenerator,
-            mcpManager,
-            abortSignal: abortController.signal,
-            reasoningLevel,
-            allowedToolNames: effectiveEnableTools
-              ? selectedAssistant?.enabledToolNames
-              : undefined,
-            allowedSkillIds,
-            allowedSkillNames,
-            requestParams: {
-              stream: conversationOverrides?.stream ?? true,
-              temperature:
-                conversationOverrides?.temperature ??
-                assistantTemperature ??
-                modelTemperature,
-              top_p: conversationOverrides?.top_p ?? assistantTopP ?? modelTopP,
-              max_tokens: assistantMaxTokens ?? modelMaxTokens,
+            persistState: true,
+            loopConfig,
+            input: {
+              ...baseInput,
+              messages: branchRunMessages,
+              requestMessages,
+              providerClient: resolvedClient.providerClient,
+              model: effectiveModel,
+              conversationId,
+              branchId: branchTarget.branchId,
+              sourceUserMessageId: branchTarget.sourceUserMessageId,
+              branchLabel:
+                branchTarget.branchLabel ??
+                effectiveModel.name ??
+                effectiveModel.model ??
+                effectiveModel.id,
+              abortSignal: abortController.signal,
             },
-            maxContextOverride:
-              conversationOverrides?.maxContextMessages ??
-              assistantMaxContextMessages ??
-              undefined,
-            currentFileContextMode: chatMode === 'agent' ? 'summary' : 'full',
-            currentFileOverride,
-            geminiTools: {
-              useWebSearch: conversationOverrides?.useWebSearch ?? false,
-              useUrlContext: conversationOverrides?.useUrlContext ?? false,
+          })
+        } else if (
+          targetModelIds.length <= 1 ||
+          requestLastMessage?.role !== 'user'
+        ) {
+          await plugin.getAgentService().run({
+            conversationId,
+            loopConfig,
+            input: {
+              ...baseInput,
+              requestMessages,
+              providerClient: resolvedClient.providerClient,
+              model: effectiveModel,
+              conversationId,
+              abortSignal: abortController.signal,
             },
-          },
-        })
+          })
+        } else {
+          baseConversationMessagesRef.current = chatMessages
+          plugin
+            .getAgentService()
+            .replaceConversationMessages(
+              conversationId,
+              chatMessages,
+              baseCompactionStateRef.current,
+              { persistState: true },
+            )
+
+          const runPromises = targetModelIds.map(async (targetModelId) => {
+            const branchResolvedClient = resolveClientForModelId(targetModelId)
+            const branchProvider = settings.providers.find(
+              (provider) =>
+                provider.id === branchResolvedClient.model.providerId,
+            )
+            const branchShouldStream = shouldUseStreamingForProvider({
+              requestedStream: conversationOverrides?.stream ?? true,
+              provider: branchProvider,
+            })
+            const branchAbortController = new AbortController()
+            const branchModel = branchResolvedClient.model
+            const branchLabel =
+              branchModel.name?.trim() || branchModel.model || branchModel.id
+            const branchId = `${lastMessage.id}:${branchModel.id}`
+
+            await plugin.getAgentService().run({
+              conversationId,
+              persistState: true,
+              loopConfig,
+              input: {
+                ...baseInput,
+                requestMessages,
+                providerClient: branchResolvedClient.providerClient,
+                model: branchModel,
+                apiType: branchProvider?.apiType ?? null,
+                conversationId,
+                branchId,
+                sourceUserMessageId: lastMessage.id,
+                branchLabel,
+                abortSignal: branchAbortController.signal,
+                requestParams: {
+                  ...requestParams,
+                  stream: branchShouldStream,
+                  temperature:
+                    conversationOverrides?.temperature ??
+                    branchResolvedClient.model.temperature,
+                  top_p:
+                    conversationOverrides?.top_p ??
+                    branchResolvedClient.model.topP,
+                  max_tokens: branchResolvedClient.model.maxOutputTokens,
+                },
+              },
+            })
+          })
+
+          await Promise.allSettled(runPromises)
+        }
+
+        if (abortController.signal.aborted) {
+          return {
+            aborted: true,
+          }
+        }
       } catch (error) {
-        // Ignore AbortError
         if (error instanceof Error && error.name === 'AbortError') {
-          return
+          return {
+            aborted: true,
+          }
         }
         throw error
       } finally {
-        if (unsubscribeRunner) {
-          unsubscribeRunner()
+        if (
+          activeStreamAbortControllersRef.current.get(conversationId) ===
+          abortController
+        ) {
+          activeStreamAbortControllersRef.current.delete(conversationId)
         }
-        activeStreamAbortControllersRef.current =
-          activeStreamAbortControllersRef.current.filter(
-            (controller) => controller !== abortController,
-          )
+      }
+
+      return {
+        aborted: false,
       }
     },
+    onSuccess: (data) => {
+      onRunSettled?.({
+        aborted: data.aborted,
+        failed: false,
+      })
+    },
     onError: (error) => {
+      onRunSettled?.({
+        aborted: false,
+        failed: true,
+      })
       if (
         error instanceof LLMAPIKeyNotSetException ||
         error instanceof LLMAPIKeyInvalidException ||
@@ -270,14 +920,121 @@ export function useChatStreamManager({
           showSettingsButton: true,
         }).open()
       } else {
-        new Notice(error.message)
         console.error('Failed to generate response', error)
       }
     },
   })
 
+  /**
+   * Build the input bag for the per-bucket context-breakdown estimator. Mirrors
+   * the resolution done in `compactConversation` / submit so the popover sees
+   * exactly what the next request would send. Returns null if no model can be
+   * resolved or no messages exist (popover surfaces this as an error state).
+   */
+  const buildContextBreakdownInputs = useCallback(
+    async (messages: ChatMessage[]): Promise<ContextBreakdownInputs | null> => {
+      if (messages.length === 0) {
+        return null
+      }
+
+      const effectiveAssistantId =
+        assistantIdOverride ?? settings.currentAssistantId
+      const selectedAssistant = effectiveAssistantId
+        ? (settings.assistants || []).find(
+            (assistant) => assistant.id === effectiveAssistantId,
+          ) || null
+        : null
+      const requestedModelId =
+        modelId || selectedAssistant?.modelId || settings.chatModelId
+
+      let resolvedClient: ReturnType<typeof getChatModelClient>
+      try {
+        resolvedClient = getChatModelClient({
+          settings,
+          modelId: requestedModelId,
+          onAutoPromoteTransportMode: handleAutoPromoteTransportMode,
+        })
+      } catch (error) {
+        if (
+          error instanceof LLMModelNotFoundException &&
+          settings.chatModels.length > 0
+        ) {
+          resolvedClient = getChatModelClient({
+            settings,
+            modelId: settings.chatModels[0].id,
+            onAutoPromoteTransportMode: handleAutoPromoteTransportMode,
+          })
+        } else {
+          return null
+        }
+      }
+
+      const effectiveModel = resolvedClient.model
+      const disabledSkillIds = settings.skills?.disabledSkillIds ?? []
+      const enabledSkillEntries = selectedAssistant
+        ? listLiteSkillEntries(app, { settings }).filter((skill) =>
+            isSkillEnabledForAssistant({
+              assistant: selectedAssistant,
+              skillId: skill.id,
+              disabledSkillIds,
+            }),
+          )
+        : []
+      const chatModeRuntime = resolveChatModeRuntime({
+        mode: chatMode,
+        assistant: selectedAssistant,
+        assistantEnabledToolNames:
+          getEnabledAssistantToolNames(selectedAssistant),
+      })
+      const provider = settings.providers.find(
+        (p) => p.id === effectiveModel.providerId,
+      )
+
+      const mcpManager = await getMcpManager()
+      return {
+        requestContextBuilder,
+        mcpManager,
+        model: effectiveModel,
+        messages,
+        conversationId: currentConversationId ?? '',
+        compaction,
+        enableTools: chatModeRuntime.loopConfig.enableTools,
+        includeBuiltinTools: chatModeRuntime.loopConfig.includeBuiltinTools,
+        apiType: provider?.apiType ?? null,
+        allowedToolNames: chatModeRuntime.allowedToolNames,
+        enableToolDisclosure: settings.mcp.enableToolDisclosure,
+        toolPreferences: chatModeRuntime.toolPreferences,
+        allowedSkillIds: enabledSkillEntries.map((s) => s.id),
+        allowedSkillNames: enabledSkillEntries.map((s) => s.name),
+        contextualInjections: buildChatContextualInjections({
+          includeCurrentFileContent:
+            settings.chatOptions.includeCurrentFileContent,
+          currentFile: currentFileOverride,
+          currentFileViewState,
+        }),
+      }
+    },
+    [
+      app,
+      assistantIdOverride,
+      chatMode,
+      compaction,
+      currentConversationId,
+      currentFileOverride,
+      currentFileViewState,
+      getMcpManager,
+      handleAutoPromoteTransportMode,
+      modelId,
+      requestContextBuilder,
+      settings,
+    ],
+  )
+
   return {
-    abortActiveStreams,
+    abortConversationRun,
+    currentConversationRunSummary,
+    compactConversation,
     submitChatMutation,
+    buildContextBreakdownInputs,
   }
 }

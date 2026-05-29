@@ -11,26 +11,25 @@ import {
   WidgetType,
 } from '@codemirror/view'
 
-import type SmartComposerPlugin from '../../main'
-import type { ApplyViewState } from '../../types/apply-view.types'
 import {
-  createDiffBlocks,
-  type DiffBlock,
-  type InlineDiffLine,
-  type InlineDiffToken,
-} from '../../utils/chat/diff'
+  type ReviewDecision,
+  buildInlineReviewBlocks,
+  countOriginalLines,
+} from '../../features/editor/diff-review/review-model'
+import { ReviewSession } from '../../features/editor/diff-review/review-session'
+import type YoloPlugin from '../../main'
+import type { ApplyViewState } from '../../types/apply-view.types'
+import { type DiffBlock, type InlineDiffToken } from '../../utils/chat/diff'
 
-import type { ApplyViewActions } from './ApplyViewRoot'
+import type { ApplyViewActions } from './types'
 
 type InlineDiffReviewOverlayOptions = {
-  plugin: SmartComposerPlugin
+  plugin: YoloPlugin
   view: EditorView
   state: ApplyViewState
   onClose: () => void
   onActionsReady?: (actions: ApplyViewActions | null) => void
 }
-
-type BlockDecision = 'pending' | 'incoming' | 'current'
 
 type ModifiedReviewBlock = {
   blockIndex: number
@@ -41,18 +40,18 @@ type ModifiedReviewBlock = {
   endLine: number
 }
 
-type ApplyParagraph = {
-  lines: InlineDiffLine[]
-  hasChanges: boolean
-  isEmpty: boolean
-}
+const FLOATING_RAIL_POSITION_TRANSITION =
+  'top 180ms ease, height 180ms ease, left 180ms ease, opacity 140ms ease'
+const FLOATING_ACTIONS_POSITION_TRANSITION =
+  'top 180ms ease, left 180ms ease, opacity 140ms ease'
+const FLOATING_OPACITY_TRANSITION = 'opacity 140ms ease'
 
 class InlineReviewWidget extends WidgetType {
   constructor(
     private readonly block: Extract<DiffBlock, { type: 'modified' }>,
     private readonly reviewIndex: number,
     private readonly isActive: boolean,
-    private readonly decision: BlockDecision,
+    private readonly decision: ReviewDecision,
     private readonly onHover: (reviewIndex: number) => void,
   ) {
     super()
@@ -64,7 +63,7 @@ class InlineReviewWidget extends WidgetType {
 
   override toDOM(): HTMLElement {
     const root = document.createElement('div')
-    root.className = `smtcmp-inline-review-widget${this.isActive ? ' is-active' : ''}`
+    root.className = `yolo-inline-review-widget${this.isActive ? ' is-active' : ''}`
     root.setAttribute('data-review-index', String(this.reviewIndex))
 
     if (this.decision !== 'pending') {
@@ -74,11 +73,11 @@ class InlineReviewWidget extends WidgetType {
           ? (this.block.modifiedValue ?? this.block.originalValue ?? '')
           : (this.block.originalValue ?? '')
       const resolvedContainer = document.createElement('div')
-      resolvedContainer.className = 'smtcmp-inline-review-resolved'
+      resolvedContainer.className = 'yolo-inline-review-resolved'
       const resolvedLines = resolved.split('\n')
       resolvedLines.forEach((line) => {
         const lineEl = document.createElement('div')
-        lineEl.className = 'smtcmp-inline-review-line'
+        lineEl.className = 'yolo-inline-review-line'
         lineEl.textContent = line
         resolvedContainer.appendChild(lineEl)
       })
@@ -87,15 +86,28 @@ class InlineReviewWidget extends WidgetType {
     }
 
     const content = document.createElement('div')
-    content.className = 'smtcmp-inline-review-content'
-    this.block.inlineLines.forEach((line) => {
-      const lineEl = document.createElement('div')
-      lineEl.className = `smtcmp-inline-review-line is-${line.type}`
-      line.tokens.forEach((token) => {
-        lineEl.appendChild(createTokenElement(token))
+    content.className = 'yolo-inline-review-content'
+    if (this.block.presentation === 'block') {
+      if (this.block.originalValue !== undefined) {
+        content.appendChild(
+          createBlockSection(this.block.originalValue, 'del', 'removed'),
+        )
+      }
+      if (this.block.modifiedValue !== undefined) {
+        content.appendChild(
+          createBlockSection(this.block.modifiedValue, 'add', 'added'),
+        )
+      }
+    } else {
+      this.block.inlineLines.forEach((line) => {
+        const lineEl = document.createElement('div')
+        lineEl.className = `yolo-inline-review-line is-${line.type}`
+        line.tokens.forEach((token) => {
+          lineEl.appendChild(createTokenElement(token))
+        })
+        content.appendChild(lineEl)
       })
-      content.appendChild(lineEl)
-    })
+    }
     root.appendChild(content)
 
     root.addEventListener('mousedown', (event) => {
@@ -118,13 +130,31 @@ function createTokenElement(token: InlineDiffToken): HTMLElement {
   const span = document.createElement('span')
   span.textContent = token.text
   if (token.type === 'add') {
-    span.className = 'smtcmp-inline-diff smtcmp-inline-diff-add'
+    span.className = 'yolo-inline-diff yolo-inline-diff-add'
   } else if (token.type === 'del') {
-    span.className = 'smtcmp-inline-diff smtcmp-inline-diff-del'
+    span.className = 'yolo-inline-diff yolo-inline-diff-del'
   } else {
-    span.className = 'smtcmp-inline-diff'
+    span.className = 'yolo-inline-diff'
   }
   return span
+}
+
+function createBlockSection(
+  text: string,
+  tokenType: 'add' | 'del',
+  stateClass: 'added' | 'removed',
+): HTMLElement {
+  const section = document.createElement('div')
+  section.className = `yolo-inline-review-section is-${stateClass}`
+
+  text.split('\n').forEach((line) => {
+    const lineEl = document.createElement('div')
+    lineEl.className = 'yolo-inline-review-line'
+    lineEl.appendChild(createTokenElement({ type: tokenType, text: line }))
+    section.appendChild(lineEl)
+  })
+
+  return section
 }
 
 function createActionButton(
@@ -134,17 +164,17 @@ function createActionButton(
 ): HTMLButtonElement {
   const button = document.createElement('button')
   button.type = 'button'
-  button.className = 'smtcmp-apply-action'
+  button.className = 'yolo-apply-action'
   if (icon === '✓') {
-    button.classList.add('smtcmp-apply-action-accept')
+    button.classList.add('yolo-apply-action-accept')
   }
   if (icon === '×') {
-    button.classList.add('smtcmp-apply-action-reject')
+    button.classList.add('yolo-apply-action-reject')
   }
   button.title = label
   button.setAttribute('aria-label', label)
   const iconEl = document.createElement('span')
-  iconEl.className = 'smtcmp-apply-action-icon'
+  iconEl.className = 'yolo-apply-action-icon'
   iconEl.textContent = icon
   button.appendChild(iconEl)
   button.addEventListener('mousedown', (event) => {
@@ -161,151 +191,6 @@ function createActionButton(
 
 function clampNumber(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
-}
-
-function countOriginalLines(block: DiffBlock): number {
-  if (block.type === 'unchanged') return block.value.split('\n').length
-  if (block.originalValue === undefined) return 0
-  return block.originalValue.split('\n').length
-}
-
-function isInlineLineEmpty(line: InlineDiffLine): boolean {
-  if (line.tokens.length === 0) return true
-  return line.tokens.every((token) => token.text.length === 0)
-}
-
-function lineHasChanges(line: InlineDiffLine): boolean {
-  if (line.type === 'added' || line.type === 'removed') return true
-  return line.tokens.some(
-    (token) => token.type === 'add' || token.type === 'del',
-  )
-}
-
-function splitInlineLinesIntoParagraphs(
-  lines: InlineDiffLine[],
-): ApplyParagraph[] {
-  if (lines.length === 0) return []
-
-  const paragraphs: ApplyParagraph[] = []
-  let currentLines: InlineDiffLine[] = []
-  let currentHasChanges = false
-
-  const pushCurrentParagraph = () => {
-    if (currentLines.length === 0) return
-    paragraphs.push({
-      lines: currentLines,
-      hasChanges: currentHasChanges,
-      isEmpty: false,
-    })
-    currentLines = []
-    currentHasChanges = false
-  }
-
-  lines.forEach((line) => {
-    if (isInlineLineEmpty(line)) {
-      pushCurrentParagraph()
-      paragraphs.push({
-        lines: [],
-        hasChanges: false,
-        isEmpty: true,
-      })
-      return
-    }
-
-    currentLines.push(line)
-    currentHasChanges = currentHasChanges || lineHasChanges(line)
-  })
-
-  pushCurrentParagraph()
-  return paragraphs
-}
-
-function inlineTokensToText(
-  tokens: InlineDiffToken[],
-  variant: 'original' | 'modified',
-): string {
-  return tokens
-    .filter((token) =>
-      variant === 'original' ? token.type !== 'add' : token.type !== 'del',
-    )
-    .map((token) => token.text)
-    .join('')
-}
-
-function inlineLinesToText(
-  lines: InlineDiffLine[],
-  variant: 'original' | 'modified',
-): string {
-  return lines
-    .map((line) => inlineTokensToText(line.tokens, variant))
-    .join('\n')
-}
-
-function mergeAdjacentUnchangedBlocks(blocks: DiffBlock[]): DiffBlock[] {
-  const merged: DiffBlock[] = []
-  blocks.forEach((block) => {
-    const last = merged[merged.length - 1]
-    if (block.type === 'unchanged' && last?.type === 'unchanged') {
-      last.value = `${last.value}\n${block.value}`
-      return
-    }
-    merged.push(block)
-  })
-  return merged
-}
-
-function splitDiffBlocksByParagraph(blocks: DiffBlock[]): DiffBlock[] {
-  const paragraphBlocks: DiffBlock[] = []
-
-  blocks.forEach((block) => {
-    if (block.type === 'unchanged') {
-      paragraphBlocks.push(block)
-      return
-    }
-
-    const paragraphs = splitInlineLinesIntoParagraphs(block.inlineLines)
-    if (paragraphs.length === 0) {
-      paragraphBlocks.push(block)
-      return
-    }
-
-    paragraphs.forEach((paragraph) => {
-      if (paragraph.isEmpty) {
-        paragraphBlocks.push({
-          type: 'unchanged',
-          value: '',
-        })
-        return
-      }
-
-      if (!paragraph.hasChanges) {
-        paragraphBlocks.push({
-          type: 'unchanged',
-          value: inlineLinesToText(paragraph.lines, 'original'),
-        })
-        return
-      }
-
-      const hasOriginalLines = paragraph.lines.some(
-        (line) => line.type !== 'added',
-      )
-      const hasModifiedLines = paragraph.lines.some(
-        (line) => line.type !== 'removed',
-      )
-      paragraphBlocks.push({
-        type: 'modified',
-        originalValue: hasOriginalLines
-          ? inlineLinesToText(paragraph.lines, 'original')
-          : undefined,
-        modifiedValue: hasModifiedLines
-          ? inlineLinesToText(paragraph.lines, 'modified')
-          : undefined,
-        inlineLines: paragraph.lines,
-      })
-    })
-  })
-
-  return mergeAdjacentUnchangedBlocks(paragraphBlocks)
 }
 
 function lineStartOffset(view: EditorView, line: number): number {
@@ -374,8 +259,8 @@ function findSelectionTargetIndex(
 
 export class InlineDiffReviewOverlay {
   private readonly blocks: DiffBlock[]
+  private readonly session: ReviewSession
   private readonly modifiedBlocks: ModifiedReviewBlock[]
-  private readonly decisions = new Map<number, BlockDecision>()
   private currentIndex = 0
   private closed = false
 
@@ -389,12 +274,18 @@ export class InlineDiffReviewOverlay {
   private onKeydown: ((event: KeyboardEvent) => void) | null = null
   private onEditorMouseDownCapture: ((event: MouseEvent) => void) | null = null
   private previousActiveElement: HTMLElement | null = null
-  private previousCaretColor = ''
+  private onAbort: (() => void) | null = null
 
   constructor(private readonly options: InlineDiffReviewOverlayOptions) {
-    this.blocks = splitDiffBlocksByParagraph(
-      createDiffBlocks(options.state.originalContent, options.state.newContent),
+    this.blocks = buildInlineReviewBlocks(
+      options.state.originalContent,
+      options.state.newContent,
     )
+    this.session = new ReviewSession({
+      file: options.state.file,
+      vault: options.plugin.app.vault,
+      blocks: this.blocks,
+    })
     this.modifiedBlocks = resolveModifiedBlocks(options.view, this.blocks)
     this.currentIndex = findSelectionTargetIndex(
       this.modifiedBlocks,
@@ -421,6 +312,19 @@ export class InlineDiffReviewOverlay {
       return
     }
 
+    const abortSignal = this.options.state.abortSignal
+    if (abortSignal?.aborted) {
+      this.options.onClose()
+      return
+    }
+    if (abortSignal) {
+      const onAbort = () => {
+        this.options.onClose()
+      }
+      this.onAbort = onAbort
+      abortSignal.addEventListener('abort', onAbort, { once: true })
+    }
+
     this.options.view.dispatch({
       effects: StateEffect.appendConfig.of([
         this.decorationCompartment.of([this.decorationsField]),
@@ -435,9 +339,7 @@ export class InlineDiffReviewOverlay {
       acceptIncomingActive: () => this.acceptIncomingActive(),
       acceptCurrentActive: () => this.acceptCurrentActive(),
       undoActive: () => this.undoActive(),
-      close: () => {
-        void this.persistAndClose(this.generateFinalContent('current'))
-      },
+      close: () => this.options.onClose(),
     })
   }
 
@@ -445,6 +347,10 @@ export class InlineDiffReviewOverlay {
     this.options.onActionsReady?.(null)
     if (this.closed) return
     this.closed = true
+    if (this.onAbort) {
+      this.options.state.abortSignal?.removeEventListener('abort', this.onAbort)
+      this.onAbort = null
+    }
     this.unmountFloatingControls()
     this.options.view.dispatch({
       effects: this.decorationCompartment.reconfigure([]),
@@ -455,38 +361,21 @@ export class InlineDiffReviewOverlay {
     if (this.floatingRoot) return
 
     const host = this.options.view.dom
-    host.classList.add('smtcmp-inline-review-host')
+    host.classList.add('yolo-inline-review-host')
 
     const root = document.createElement('div')
-    root.className = 'smtcmp-inline-review-floating-root'
+    root.className = 'yolo-inline-review-floating-root'
     root.tabIndex = -1
     root.setAttribute('aria-label', 'Inline review controls')
-    root.style.position = 'absolute'
-    root.style.inset = '0'
-    root.style.pointerEvents = 'none'
-    root.style.overflow = 'visible'
-    root.style.zIndex = '8'
 
     const rail = document.createElement('div')
-    rail.className = 'smtcmp-inline-review-floating-rail'
-    rail.style.position = 'absolute'
-    rail.style.width = '2px'
-    rail.style.borderRadius = '999px'
-    rail.style.background =
-      'color-mix(in srgb, var(--interactive-accent) 65%, transparent)'
-    rail.style.opacity = '0.95'
-    rail.style.transition = 'top 180ms ease, height 180ms ease, left 180ms ease'
+    rail.className = 'yolo-inline-review-floating-rail'
+    rail.style.transition = FLOATING_RAIL_POSITION_TRANSITION
     root.appendChild(rail)
 
     const actions = document.createElement('div')
-    actions.className = 'smtcmp-inline-review-floating-actions'
-    actions.style.position = 'absolute'
-    actions.style.display = 'flex'
-    actions.style.flexDirection = 'column'
-    actions.style.gap = '10px'
-    actions.style.pointerEvents = 'auto'
-    actions.style.transition =
-      'top 180ms ease, left 180ms ease, opacity 140ms ease'
+    actions.className = 'yolo-inline-review-floating-actions'
+    actions.style.transition = FLOATING_ACTIONS_POSITION_TRANSITION
     actions.appendChild(
       createActionButton('×', 'Accept current', () =>
         this.acceptCurrentActive(),
@@ -509,14 +398,12 @@ export class InlineDiffReviewOverlay {
       document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null
-    this.previousCaretColor = this.options.view.contentDOM.style.caretColor
-    this.options.view.contentDOM.style.caretColor = 'transparent'
     this.options.view.contentDOM.blur()
     root.focus({ preventScroll: true })
 
     const onEditorMouseDownCapture = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null
-      if (target?.closest('.smtcmp-inline-review-floating-actions')) {
+      if (target?.closest('.yolo-inline-review-floating-actions')) {
         return
       }
       event.preventDefault()
@@ -531,7 +418,8 @@ export class InlineDiffReviewOverlay {
       true,
     )
 
-    const onViewportChange = () => this.updateFloatingPosition()
+    const onViewportChange = () =>
+      this.updateFloatingPosition({ animate: false })
     this.onViewportChange = onViewportChange
     this.options.view.scrollDOM.addEventListener('scroll', onViewportChange, {
       passive: true,
@@ -544,7 +432,7 @@ export class InlineDiffReviewOverlay {
       if (event.key === 'Escape') {
         event.preventDefault()
         event.stopPropagation()
-        void this.persistAndClose(this.generateFinalContent('current'))
+        this.options.onClose()
         return
       }
       if (isMod && event.key === 'Enter') {
@@ -599,8 +487,7 @@ export class InlineDiffReviewOverlay {
     this.floatingRoot = null
     this.floatingRail = null
     this.floatingActions = null
-    this.options.view.dom.classList.remove('smtcmp-inline-review-host')
-    this.options.view.contentDOM.style.caretColor = this.previousCaretColor
+    this.options.view.dom.classList.remove('yolo-inline-review-host')
 
     if (this.previousActiveElement?.isConnected) {
       this.previousActiveElement.focus({ preventScroll: true })
@@ -608,12 +495,29 @@ export class InlineDiffReviewOverlay {
     this.previousActiveElement = null
   }
 
-  private updateFloatingPosition(): void {
+  private setFloatingPositionTransitionEnabled(enabled: boolean): void {
+    if (this.floatingRail) {
+      this.floatingRail.style.transition = enabled
+        ? FLOATING_RAIL_POSITION_TRANSITION
+        : FLOATING_OPACITY_TRANSITION
+    }
+    if (this.floatingActions) {
+      this.floatingActions.style.transition = enabled
+        ? FLOATING_ACTIONS_POSITION_TRANSITION
+        : FLOATING_OPACITY_TRANSITION
+    }
+  }
+
+  private updateFloatingPosition(
+    options: { animate: boolean } = { animate: false },
+  ): void {
     const active = this.modifiedBlocks[this.currentIndex]
     const root = this.floatingRoot
     const rail = this.floatingRail
     const actions = this.floatingActions
     if (!active || !root || !rail || !actions) return
+
+    this.setFloatingPositionTransitionEnabled(options.animate)
 
     const hostRect = this.options.view.dom.getBoundingClientRect()
     const fromRect = this.options.view.coordsAtPos(active.from)
@@ -621,7 +525,7 @@ export class InlineDiffReviewOverlay {
     const toRect = this.options.view.coordsAtPos(toProbe)
     const widgetRect = this.options.view.dom
       .querySelector(
-        `.smtcmp-inline-review-widget[data-review-index="${this.currentIndex}"]`,
+        `.yolo-inline-review-widget[data-review-index="${this.currentIndex}"]`,
       )
       ?.getBoundingClientRect()
 
@@ -686,14 +590,14 @@ export class InlineDiffReviewOverlay {
   private undoActive(): void {
     const item = this.modifiedBlocks[this.currentIndex]
     if (!item) return
-    this.decisions.set(item.blockIndex, 'pending')
+    this.session.clearDecision(item.blockIndex)
     this.renderBlocks({ ensureVisible: false })
   }
 
   private resolveActive(decision: 'incoming' | 'current'): void {
     const item = this.modifiedBlocks[this.currentIndex]
     if (!item) return
-    this.decisions.set(item.blockIndex, decision)
+    this.session.setDecision(item.blockIndex, decision)
 
     const nextPending = this.findNextPendingIndex(this.currentIndex + 1)
     if (nextPending !== null) {
@@ -702,7 +606,7 @@ export class InlineDiffReviewOverlay {
       return
     }
 
-    void this.persistAndClose(this.generateFinalContent('current'))
+    void this.persistAndClose()
   }
 
   private findNextPendingIndex(start: number): number | null {
@@ -710,7 +614,7 @@ export class InlineDiffReviewOverlay {
       const candidate = (start + index) % this.modifiedBlocks.length
       const blockIndex = this.modifiedBlocks[candidate]?.blockIndex
       if (blockIndex === undefined) continue
-      const decision = this.decisions.get(blockIndex)
+      const decision = this.session.getDecision(blockIndex)
       if (!decision || decision === 'pending') return candidate
     }
     return null
@@ -719,7 +623,7 @@ export class InlineDiffReviewOverlay {
   private renderBlocks(options: { ensureVisible: boolean }): void {
     const builder = new RangeSetBuilder<Decoration>()
     this.modifiedBlocks.forEach((item, reviewIndex) => {
-      const decision = this.decisions.get(item.blockIndex) ?? 'pending'
+      const decision = this.session.getDecision(item.blockIndex) ?? 'pending'
       const widget = new InlineReviewWidget(
         item.block,
         reviewIndex,
@@ -757,7 +661,7 @@ export class InlineDiffReviewOverlay {
       effects: this.setDecorationsEffect.of(builder.finish()),
     })
 
-    this.updateFloatingPosition()
+    this.updateFloatingPosition({ animate: true })
   }
 
   private collapseSelectionNearActive(active: ModifiedReviewBlock): void {
@@ -791,31 +695,24 @@ export class InlineDiffReviewOverlay {
     if (nextIndex === this.currentIndex) return
     if (nextIndex < 0 || nextIndex >= this.modifiedBlocks.length) return
     this.currentIndex = nextIndex
-    this.renderBlocks({ ensureVisible: false })
+    this.updateFloatingPosition({ animate: true })
   }
 
-  private generateFinalContent(
-    defaultDecision: 'incoming' | 'current',
-  ): string {
-    return this.blocks
-      .map((block, index) => {
-        if (block.type === 'unchanged') return block.value
-        const decision = this.decisions.get(index) ?? defaultDecision
-        const incoming = block.modifiedValue ?? block.originalValue ?? ''
-        const current = block.originalValue ?? ''
-        if (decision === 'incoming') return incoming
-        return current
-      })
-      .join('\n')
-  }
-
-  private async persistAndClose(content: string): Promise<void> {
+  private async persistAndClose(finalContent?: string): Promise<void> {
     if (this.closed) return
+    const resolvedContent =
+      finalContent ?? this.session.getFinalContent('current')
     try {
-      await this.options.plugin.app.vault.modify(
-        this.options.state.file,
-        content,
+      await this.session.persist(
+        resolvedContent,
+        this.options.state.abortSignal,
       )
+      if (this.options.state.abortSignal?.aborted) {
+        return
+      }
+      this.options.state.callbacks?.onComplete?.({
+        finalContent: resolvedContent,
+      })
     } catch (error) {
       console.error('[InlineDiffReview] Failed to persist inline review', error)
     } finally {

@@ -5,8 +5,8 @@ import type { SerializedEditorState } from 'lexical'
 import type { Editor, MarkdownView } from 'obsidian'
 
 import { SmartSpaceWidget } from '../../../components/panels/SmartSpacePanel'
-import type SmartComposerPlugin from '../../../main'
-import type { SmartComposerSettings } from '../../../settings/schema/setting.types'
+import type YoloPlugin from '../../../main'
+import type { YoloSettings } from '../../../settings/schema/setting.types'
 import type { SerializedMentionable } from '../../../types/mentionable'
 
 export type SmartSpaceDraftState = {
@@ -18,7 +18,7 @@ export type SmartSpaceDraftState = {
 type SmartSpaceWidgetPayload = {
   pos: number
   options: {
-    plugin: SmartComposerPlugin
+    plugin: YoloPlugin
     editor: Editor
     view: EditorView
     onClose: () => void
@@ -39,8 +39,8 @@ type SmartSpaceLastTrigger = {
 } | null
 
 type SmartSpaceControllerDeps = {
-  plugin: SmartComposerPlugin
-  getSettings: () => SmartComposerSettings
+  plugin: YoloPlugin
+  getSettings: () => YoloSettings
   getActiveMarkdownView: () => MarkdownView | null
   getEditorView: (editor: Editor) => EditorView | null
   clearPendingSelectionRewrite: () => void
@@ -107,7 +107,7 @@ export class SmartSpaceController {
     state.view.focus()
   }
 
-  show(editor: Editor, view: EditorView, showQuickActions = true) {
+  show(editor: Editor, view: EditorView, showQuickActions = false) {
     const selection = view.state.selection.main
     // Use the end of selection (max of head and anchor) to always position at the visual end
     // This ensures the widget appears below the selection regardless of selection direction
@@ -307,13 +307,8 @@ export class SmartSpaceController {
         if (update.docChanged) {
           state.pos = update.changes.mapPos(state.pos)
         }
-
-        if (update.selectionSet) {
-          const head = update.state.selection.main
-          if (!head.empty || head.head !== state.pos) {
-            this.close()
-          }
-        }
+        // 移除 selectionSet 关闭逻辑，与 inline suggestion 行为一致
+        // 外部点击关闭由 handlePointerDown 处理
       }),
     ]
   }

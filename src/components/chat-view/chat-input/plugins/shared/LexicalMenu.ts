@@ -8,6 +8,7 @@
  * - Added custom positioning logic for menu placement
  */
 
+import { autoUpdate } from '@floating-ui/dom'
 import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext'
 import { mergeRegister } from '@lexical/utils'
 import {
@@ -16,6 +17,8 @@ import {
   COMMAND_PRIORITY_LOW,
   CommandListenerPriority,
   KEY_ARROW_DOWN_COMMAND,
+  KEY_ARROW_LEFT_COMMAND,
+  KEY_ARROW_RIGHT_COMMAND,
   KEY_ARROW_UP_COMMAND,
   KEY_ENTER_COMMAND,
   KEY_ESCAPE_COMMAND,
@@ -41,6 +44,11 @@ import {
   clearDynamicStyleClass,
   updateDynamicStyleClass,
 } from '../../../../../utils/dom/dynamicStyleManager'
+import {
+  getNodeBody,
+  getNodeDocument,
+  getNodeWindow,
+} from '../../../../../utils/dom/window-context'
 
 export type MenuTextMatch = {
   leadOffset: number
@@ -71,6 +79,20 @@ export class MenuOption {
   }
 }
 
+/**
+ * 共享层（LexicalMenu/LexicalTypeaheadMenuPlugin）原本只暴露默认键盘行为；
+ * MentionPlugin 需要在 ↑/↓/←/→/Enter 之前注入自己的逻辑（hover 预览子面板的
+ * 跨面板焦点切换），又不能动 SkillSlashPlugin 的现有体验。这里以可选 prop 的
+ * 形式给出唯一扩展点：handler 返回 true 即"已处理"，跳过默认逻辑；返回 false
+ * 走原默认。SkillSlash 不传 = 完全等价旧行为。 */
+export type CustomKeyHandlers = {
+  onArrowUp?: (event: KeyboardEvent) => boolean
+  onArrowDown?: (event: KeyboardEvent) => boolean
+  onArrowLeft?: (event: KeyboardEvent) => boolean
+  onArrowRight?: (event: KeyboardEvent) => boolean
+  onEnter?: (event: KeyboardEvent | null) => boolean
+}
+
 export type MenuRenderFn<TOption extends MenuOption> = (
   anchorElementRef: MutableRefObject<HTMLElement | null>,
   itemProps: {
@@ -83,14 +105,16 @@ export type MenuRenderFn<TOption extends MenuOption> = (
 ) => ReactPortal | ReactJSX.Element | null
 
 const scrollIntoViewIfNeeded = (target: HTMLElement) => {
-  const typeaheadContainerNode = document.getElementById('typeahead-menu')
+  const ownerDocument = getNodeDocument(target)
+  const ownerWindow = getNodeWindow(target)
+  const typeaheadContainerNode = ownerDocument.getElementById('typeahead-menu')
   if (!typeaheadContainerNode) {
     return
   }
 
   const typeaheadRect = typeaheadContainerNode.getBoundingClientRect()
 
-  if (typeaheadRect.top + typeaheadRect.height > window.innerHeight) {
+  if (typeaheadRect.top + typeaheadRect.height > ownerWindow.innerHeight) {
     typeaheadContainerNode.scrollIntoView({
       block: 'center',
     })
@@ -171,7 +195,7 @@ export function getScrollParent(
   const excludeStaticParent = style.position === 'absolute'
   const overflowRegex = includeHidden ? /(auto|scroll|hidden)/ : /(auto|scroll)/
   if (style.position === 'fixed') {
-    return document.body
+    return getNodeBody(element)
   }
   for (
     let parent: HTMLElement | null = element;
@@ -188,7 +212,7 @@ export function getScrollParent(
       return parent
     }
   }
-  return document.body
+  return getNodeBody(element)
 }
 
 function isTriggerVisibleInNearestScrollContainer(
@@ -210,24 +234,31 @@ export function useDynamicPositioning(
   const [editor] = useLexicalComposerContext()
   useEffect(() => {
     if (targetElement != null && resolution != null) {
+      const ownerDocument = getNodeDocument(targetElement)
       const rootElement = editor.getRootElement()
       const rootScrollParent =
         rootElement != null
           ? getScrollParent(rootElement, false)
-          : document.body
-      let ticking = false
+          : getNodeBody(targetElement)
+
+      // Position tracking: 由 Floating UI 的 autoUpdate 统一处理 resize、
+      // 祖先 scroll、ResizeObserver,以及 animationFrame 轮询
+      // (后者是关键 —— Quick Ask 浮窗拖拽改的是内联 left/top,既不触发 resize
+      // 也不触发 scroll,只能靠 rAF 比对 getBoundingClientRect 才能感知)。
+      const cleanupAutoUpdate = autoUpdate(
+        targetElement,
+        targetElement,
+        onReposition,
+        { animationFrame: true },
+      )
+
+      // Visibility tracking: trigger 滚出最近 scroll container 时关闭菜单。
+      // autoUpdate 不负责这个语义,所以单独保留一个轻量 scroll handler。
       let previousIsInView = isTriggerVisibleInNearestScrollContainer(
         targetElement,
         rootScrollParent,
       )
-      const handleScroll = function () {
-        if (!ticking) {
-          window.requestAnimationFrame(function () {
-            onReposition()
-            ticking = false
-          })
-          ticking = true
-        }
+      const handleVisibilityScroll = () => {
         const isInView = isTriggerVisibleInNearestScrollContainer(
           targetElement,
           rootScrollParent,
@@ -239,17 +270,18 @@ export function useDynamicPositioning(
           }
         }
       }
-      const resizeObserver = new ResizeObserver(onReposition)
-      window.addEventListener('resize', onReposition)
-      document.addEventListener('scroll', handleScroll, {
+      ownerDocument.addEventListener('scroll', handleVisibilityScroll, {
         capture: true,
         passive: true,
       })
-      resizeObserver.observe(targetElement)
+
       return () => {
-        resizeObserver.unobserve(targetElement)
-        window.removeEventListener('resize', onReposition)
-        document.removeEventListener('scroll', handleScroll, true)
+        cleanupAutoUpdate()
+        ownerDocument.removeEventListener(
+          'scroll',
+          handleVisibilityScroll,
+          true,
+        )
       }
     }
   }, [targetElement, editor, onVisibilityChange, onReposition, resolution])
@@ -271,6 +303,7 @@ export function LexicalMenu<TOption extends MenuOption>({
   shouldSplitNodeWithQuery = false,
   commandPriority = COMMAND_PRIORITY_LOW,
   getDefaultHighlightedIndex,
+  customKeyHandlers,
 }: {
   close: () => void
   editor: LexicalEditor
@@ -287,8 +320,18 @@ export function LexicalMenu<TOption extends MenuOption>({
   ) => void
   commandPriority?: CommandListenerPriority
   getDefaultHighlightedIndex?: (options: TOption[]) => number
+  customKeyHandlers?: CustomKeyHandlers
 }): ReactJSX.Element | null {
   const [selectedIndex, setHighlightedIndex] = useState<null | number>(null)
+
+  // 把最新的 customKeyHandlers 放进 ref，避免每次 props 变化都重新注册 lexical
+  // command（注册成本不大但会改变命令优先级排序，徒增不确定性）。
+  const customKeyHandlersRef = useRef<CustomKeyHandlers | undefined>(
+    customKeyHandlers,
+  )
+  useEffect(() => {
+    customKeyHandlersRef.current = customKeyHandlers
+  }, [customKeyHandlers])
 
   const matchingString = resolution.match?.matchingString
 
@@ -392,6 +435,14 @@ export function LexicalMenu<TOption extends MenuOption>({
         KEY_ARROW_DOWN_COMMAND,
         (payload) => {
           const event = payload
+          const customHandler = customKeyHandlersRef.current?.onArrowDown
+          if (customHandler && customHandler(event)) {
+            event.preventDefault()
+            event.stopImmediatePropagation()
+            return true
+          }
+          // IME 合成期放行 Lexical 默认行为，避免抢占中文候选词导航。
+          if (event?.isComposing) return false
           if (options?.length && selectedIndex !== null) {
             const newSelectedIndex =
               selectedIndex !== options.length - 1 ? selectedIndex + 1 : 0
@@ -417,6 +468,14 @@ export function LexicalMenu<TOption extends MenuOption>({
         KEY_ARROW_UP_COMMAND,
         (payload) => {
           const event = payload
+          const customHandler = customKeyHandlersRef.current?.onArrowUp
+          if (customHandler && customHandler(event)) {
+            event.preventDefault()
+            event.stopImmediatePropagation()
+            return true
+          }
+          // IME 合成期放行 Lexical 默认行为，避免抢占中文候选词导航。
+          if (event?.isComposing) return false
           if (options?.length && selectedIndex !== null) {
             const newSelectedIndex =
               selectedIndex !== 0 ? selectedIndex - 1 : options.length - 1
@@ -429,6 +488,35 @@ export function LexicalMenu<TOption extends MenuOption>({
             event.stopImmediatePropagation()
           }
           return true
+        },
+        commandPriority,
+      ),
+      editor.registerCommand<KeyboardEvent>(
+        KEY_ARROW_LEFT_COMMAND,
+        (payload) => {
+          const event = payload
+          const customHandler = customKeyHandlersRef.current?.onArrowLeft
+          if (customHandler && customHandler(event)) {
+            event.preventDefault()
+            event.stopImmediatePropagation()
+            return true
+          }
+          // 没有自定义 handler 处理 → 走 Lexical 默认（光标移动），不拦截。
+          return false
+        },
+        commandPriority,
+      ),
+      editor.registerCommand<KeyboardEvent>(
+        KEY_ARROW_RIGHT_COMMAND,
+        (payload) => {
+          const event = payload
+          const customHandler = customKeyHandlersRef.current?.onArrowRight
+          if (customHandler && customHandler(event)) {
+            event.preventDefault()
+            event.stopImmediatePropagation()
+            return true
+          }
+          return false
         },
         commandPriority,
       ),
@@ -473,6 +561,16 @@ export function LexicalMenu<TOption extends MenuOption>({
       editor.registerCommand(
         KEY_ENTER_COMMAND,
         (event: KeyboardEvent | null) => {
+          const customHandler = customKeyHandlersRef.current?.onEnter
+          if (customHandler && customHandler(event)) {
+            if (event !== null) {
+              event.preventDefault()
+              event.stopImmediatePropagation()
+            }
+            return true
+          }
+          // IME 合成期放行 Lexical 默认行为，避免抢占中文候选词确认。
+          if (event?.isComposing) return false
           if (
             options === null ||
             selectedIndex === null ||
@@ -523,175 +621,245 @@ export function useMenuAnchorRef(
   resolution: MenuResolution | null,
   setResolution: (r: MenuResolution | null) => void,
   className?: string,
-  parent: HTMLElement = document.body,
+  parent?: HTMLElement,
   _shouldIncludePageYOffset__EXPERIMENTAL = true,
 ): MutableRefObject<HTMLElement> {
   const [editor] = useLexicalComposerContext()
   const anchorElementRef = useRef<HTMLElement>(document.createElement('div'))
+  // 缓存上一次写入 containerDiv 的位置,autoUpdate animationFrame 模式下每帧都会
+  // 调用 positionMenu;若坐标未变则跳过 updateDynamicStyleClass,避免样式 churn。
+  // 菜单关闭时(useEffect cleanup)必须重置为 null —— containerDiv 会被 remove,
+  // 重新打开时若坐标恰好相同会被错误跳过,导致新 containerDiv 无内联样式。
+  const lastWrittenPositionRef = useRef<{
+    left: number
+    top: number
+    width: number
+  } | null>(null)
   const positionMenu = useCallback(() => {
-    // 通过动态样式类固定定位弹窗容器
-    const containerDiv = anchorElementRef.current
-    containerDiv.classList.remove(
-      'smtcmp-menu-above',
-      'smtcmp-menu-right-align',
-    )
-
     const rootElement = editor.getRootElement()
+    if (rootElement === null || resolution === null) {
+      return
+    }
+
+    const ownerDocument = getNodeDocument(rootElement)
+    const ownerWindow = getNodeWindow(rootElement)
+    const portalParent = parent ?? getNodeBody(rootElement)
+    let containerDiv = anchorElementRef.current
+
+    if (containerDiv.ownerDocument !== ownerDocument) {
+      if (containerDiv.isConnected) {
+        clearDynamicStyleClass(containerDiv)
+        containerDiv.remove()
+      }
+      containerDiv = ownerDocument.createElement('div')
+      anchorElementRef.current = containerDiv
+    }
+
+    // 通过动态样式类固定定位弹窗容器
+    containerDiv.classList.remove('yolo-menu-above', 'yolo-menu-right-align')
+
     const menuEle = containerDiv.firstChild as HTMLElement | null
 
-    if (rootElement !== null && resolution !== null) {
-      const rect = resolution.getRect()
-      const { left, top } = rect
+    const rect = resolution.getRect()
+    const { left, top } = rect
 
-      if (!containerDiv.isConnected) {
-        if (className != null) {
-          containerDiv.className = className
-        }
-        containerDiv.classList.add('smtcmp-typeahead-menu')
-        containerDiv.setAttribute('aria-label', 'Typeahead menu')
-        containerDiv.setAttribute('id', 'typeahead-menu')
-        containerDiv.setAttribute('role', 'listbox')
-        // defer append to reposition() so we can choose the correct parent
+    if (!containerDiv.isConnected) {
+      if (className != null) {
+        containerDiv.className = className
       }
+      containerDiv.classList.add('yolo-typeahead-menu')
+      containerDiv.setAttribute('aria-label', 'Typeahead menu')
+      containerDiv.setAttribute('id', 'typeahead-menu')
+      containerDiv.setAttribute('role', 'listbox')
+      // defer append to reposition() so we can choose the correct parent
+    }
 
-      const reposition = () => {
-        const offsetTop = 4
-        const margin = 8
-        const containerEl = rootElement.closest(
-          '.smtcmp-chat-user-input-container, .smtcmp-quick-ask-panel',
-        )
+    const reposition = () => {
+      const offsetTop = 4
+      const margin = 8
+      const containerEl = rootElement.closest(
+        '.yolo-chat-user-input-container, .yolo-quick-ask-input-row',
+      )
+      const centeredChatContainer = rootElement.closest(
+        '.yolo-chat-container--centered',
+      )
+      const isCenteredChatContainer = Boolean(centeredChatContainer)
+      const centeredChatTypeaheadMaxWidth = centeredChatContainer
+        ? getComputedStyle(centeredChatContainer)
+            .getPropertyValue('--yolo-chat-typeahead-max-width')
+            .trim() || '560px'
+        : '560px'
 
-        if (containerEl) {
-          // Position the menu in document.body with fixed positioning to avoid clipping by container bounds
-          if (containerDiv.parentElement !== parent) {
-            parent.appendChild(containerDiv)
+      if (containerEl) {
+        // Position the menu in the current window body to avoid clipping by container bounds
+        if (containerDiv.parentElement !== portalParent) {
+          portalParent.appendChild(containerDiv)
+        }
+
+        const rect = containerEl.getBoundingClientRect()
+        const boundaryRect =
+          rootElement
+            .closest('.yolo-chat-container')
+            ?.getBoundingClientRect() ?? rect
+        const cs = getComputedStyle(containerEl)
+
+        // Calculate focus ring thickness from box-shadow
+        const boxShadow = cs.boxShadow || ''
+        let ring = 0
+        const matches = boxShadow.match(/0px\s+0px\s+0px\s+([0-9.]+)px/g)
+        if (matches) {
+          for (const m of matches) {
+            const match = m.match(/([0-9.]+)px$/)
+            const value = match ? match[1] : '0'
+            const n = parseFloat(value) || 0
+            if (n > ring) ring = n
           }
+        }
 
-          const rect = containerEl.getBoundingClientRect()
-          const cs = getComputedStyle(containerEl)
+        // Position menu to align with the outermost edge of the focus ring
+        const menuLeft = Math.round(rect.left - ring)
+        const menuWidth = Math.round(rect.width + ring * 2)
+        const menuTop = Math.round(rect.top - offsetTop)
 
-          // Calculate focus ring thickness from box-shadow
-          const boxShadow = cs.boxShadow || ''
-          let ring = 0
-          const matches = boxShadow.match(/0px\s+0px\s+0px\s+([0-9.]+)px/g)
-          if (matches) {
-            for (const m of matches) {
-              const match = m.match(/([0-9.]+)px$/)
-              const value = match ? match[1] : '0'
-              const n = parseFloat(value) || 0
-              if (n > ring) ring = n
-            }
+        // 与上次写入的坐标相同则跳过,避免 animationFrame 模式下每帧重写样式。
+        // menuEle 也要复检 —— 它的 absolute 定位完全依赖 containerDiv,
+        // 但 menuEle 的内容/可见性可能变,所以这里只跳过 containerDiv 的写。
+        const last = lastWrittenPositionRef.current
+        const positionUnchanged =
+          last !== null &&
+          last.left === menuLeft &&
+          last.top === menuTop &&
+          last.width === menuWidth
+        if (!positionUnchanged) {
+          lastWrittenPositionRef.current = {
+            left: menuLeft,
+            top: menuTop,
+            width: menuWidth,
           }
-
-          // Position menu to align with the outermost edge of the focus ring
-          const menuLeft = rect.left - ring
-          const menuWidth = rect.width + ring * 2
-          const menuTop = rect.top - offsetTop
-
-          updateDynamicStyleClass(containerDiv, 'smtcmp-typeahead-menu-pos', {
+          updateDynamicStyleClass(containerDiv, 'yolo-typeahead-menu-pos', {
             position: 'fixed',
-            left: Math.round(menuLeft),
-            top: Math.round(menuTop),
-            width: Math.round(menuWidth),
+            left: menuLeft,
+            top: menuTop,
+            width: menuWidth,
             zIndex: '1000',
           })
-
-          if (menuEle) {
-            const available = Math.max(margin, Math.floor(rect.top - margin))
-            const isMentionPopover = menuEle.classList.contains(
-              'smtcmp-smart-space-mention-popover',
-            )
-            if (isMentionPopover) {
-              updateDynamicStyleClass(menuEle, 'smtcmp-typeahead-pop', {
-                position: 'absolute',
-                left: 0,
-                right: 0,
-                bottom: 0,
-                width: '100%',
-                maxWidth: 'none',
-                boxSizing: 'border-box',
-                overflow: 'visible',
-                '--smtcmp-typeahead-available-height': `${available}px`,
-              })
-            } else {
-              updateDynamicStyleClass(menuEle, 'smtcmp-typeahead-pop', {
-                position: 'absolute',
-                left: 0,
-                right: 0,
-                bottom: 0,
-                width: '100%',
-                maxWidth: 'none',
-                boxSizing: 'border-box',
-                overflowY: 'auto',
-                maxHeight: available,
-              })
-            }
-            // Limit height to available space above the input
-            // Top cleared automatically by omission
-          }
-          return
         }
 
-        // Fallback: position fixed above the caret rect
-        const estimatedH = 260
-        const leftPos = Math.max(
-          margin,
-          Math.min(left, window.innerWidth - margin),
-        )
-        const topPos = Math.max(margin, top - offsetTop - estimatedH)
-        if (!containerDiv.isConnected) parent.append(containerDiv)
-        updateDynamicStyleClass(containerDiv, 'smtcmp-typeahead-menu-pos', {
-          position: 'fixed',
-          left: Math.round(leftPos),
-          top: Math.round(topPos),
-          width: 360,
-          zIndex: '1000',
-        })
-        // Avoid adding smtcmp-menu-above here; topPos is already computed above the caret
         if (menuEle) {
-          updateDynamicStyleClass(menuEle, 'smtcmp-typeahead-pop', {
-            width: '100%',
-          })
-          requestAnimationFrame(() => {
-            const finalH = menuEle.getBoundingClientRect().height || estimatedH
-            const t2 = Math.max(margin, top - offsetTop - finalH)
-            updateDynamicStyleClass(containerDiv, 'smtcmp-typeahead-menu-pos', {
-              position: 'fixed',
-              left: Math.round(leftPos),
-              top: Math.round(t2),
-              width: 360,
-              zIndex: '1000',
+          const available = Math.max(margin, Math.floor(rect.top - margin))
+          const isMentionPopover = menuEle.classList.contains(
+            'yolo-smart-space-mention-popover',
+          )
+          if (isMentionPopover) {
+            const mentionPopoverWidth = isCenteredChatContainer
+              ? `min(100%, ${centeredChatTypeaheadMaxWidth})`
+              : '100%'
+            updateDynamicStyleClass(menuEle, 'yolo-typeahead-pop', {
+              position: 'absolute',
+              left: 0,
+              right: isCenteredChatContainer ? 'auto' : 0,
+              bottom: 0,
+              width: mentionPopoverWidth,
+              maxWidth: mentionPopoverWidth,
+              boxSizing: 'border-box',
+              overflow: 'visible',
+              '--yolo-typeahead-available-height': `${available}px`,
+              '--yolo-typeahead-boundary-left': `${Math.round(
+                boundaryRect.left,
+              )}px`,
+              '--yolo-typeahead-boundary-right': `${Math.round(
+                boundaryRect.right,
+              )}px`,
             })
-          })
+          } else {
+            updateDynamicStyleClass(menuEle, 'yolo-typeahead-pop', {
+              position: 'absolute',
+              left: 0,
+              right: 0,
+              bottom: 0,
+              width: '100%',
+              maxWidth: 'none',
+              boxSizing: 'border-box',
+              overflowY: 'auto',
+              maxHeight: available,
+            })
+          }
+          // Limit height to available space above the input
+          // Top cleared automatically by omission
         }
+        return
       }
 
-      reposition()
-      anchorElementRef.current = containerDiv
-      rootElement.setAttribute('aria-controls', 'typeahead-menu')
+      // Fallback: position fixed above the caret rect
+      const estimatedH = 260
+      const leftPos = Math.max(
+        margin,
+        Math.min(left, ownerWindow.innerWidth - margin),
+      )
+      const topPos = Math.max(margin, top - offsetTop - estimatedH)
+      if (!containerDiv.isConnected) {
+        portalParent.append(containerDiv)
+      }
+      updateDynamicStyleClass(containerDiv, 'yolo-typeahead-menu-pos', {
+        position: 'fixed',
+        left: Math.round(leftPos),
+        top: Math.round(topPos),
+        width: 360,
+        zIndex: '1000',
+      })
+      // Avoid adding yolo-menu-above here; topPos is already computed above the caret
+      if (menuEle) {
+        updateDynamicStyleClass(menuEle, 'yolo-typeahead-pop', {
+          width: '100%',
+        })
+        ownerWindow.requestAnimationFrame(() => {
+          const finalH = menuEle.getBoundingClientRect().height || estimatedH
+          const t2 = Math.max(margin, top - offsetTop - finalH)
+          updateDynamicStyleClass(containerDiv, 'yolo-typeahead-menu-pos', {
+            position: 'fixed',
+            left: Math.round(leftPos),
+            top: Math.round(t2),
+            width: 360,
+            zIndex: '1000',
+          })
+        })
+      }
     }
+
+    reposition()
+    anchorElementRef.current = containerDiv
+    rootElement.setAttribute('aria-controls', 'typeahead-menu')
   }, [editor, resolution, className, parent])
 
-  useEffect(() => {
+  const cleanupMenu = useCallback(() => {
     const rootElement = editor.getRootElement()
+    if (rootElement !== null) {
+      rootElement.removeAttribute('aria-controls')
+    }
+
+    const containerDiv = anchorElementRef.current
+    if (containerDiv?.isConnected) {
+      clearDynamicStyleClass(containerDiv)
+      containerDiv.remove()
+    }
+    if (containerDiv?.firstChild instanceof HTMLElement) {
+      clearDynamicStyleClass(containerDiv.firstChild)
+    }
+    // 重置位置缓存:containerDiv 已被 remove,下次打开必须重新写样式。
+    lastWrittenPositionRef.current = null
+  }, [editor])
+
+  useLayoutEffect(() => {
     if (resolution !== null) {
       positionMenu()
-      return () => {
-        if (rootElement !== null) {
-          rootElement.removeAttribute('aria-controls')
-        }
-
-        const containerDiv = anchorElementRef.current
-        if (containerDiv?.isConnected) {
-          clearDynamicStyleClass(containerDiv)
-          containerDiv.remove()
-        }
-        if (containerDiv?.firstChild instanceof HTMLElement) {
-          clearDynamicStyleClass(containerDiv.firstChild)
-        }
-      }
+    } else {
+      cleanupMenu()
     }
-  }, [editor, positionMenu, resolution])
+  }, [cleanupMenu, positionMenu, resolution])
+
+  useEffect(() => {
+    return cleanupMenu
+  }, [cleanupMenu])
 
   const onVisibilityChange = useCallback(
     (isInView: boolean) => {
