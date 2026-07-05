@@ -55,6 +55,17 @@ export type MentionableUrl = {
   type: 'url'
   url: string
 }
+export type MentionableWebSelection = {
+  type: 'web-selection'
+  content: string
+  url: string
+  title: string
+  pageId?: string
+  source?: 'web-selection-sync' | 'web-selection-pinned'
+  contentHash?: string
+  contentCount?: number
+  contentUnit?: 'characters' | 'words' | 'wordsCharacters'
+}
 export type MentionableImage = {
   type: 'image'
   name: string
@@ -74,6 +85,29 @@ export type MentionablePDF = {
   data?: string
   pageCount?: number
 }
+export type MentionableOffice = {
+  type: 'office'
+  name: string
+  kind: 'docx' | 'pptx' | 'xlsx'
+  rawData: string
+  extractedText: string
+}
+export type TextAttachmentKind =
+  | 'txt'
+  | 'md'
+  | 'csv'
+  | 'tsv'
+  | 'json'
+  | 'yaml'
+  | 'yml'
+  | 'xml'
+  | 'log'
+export type MentionableTextAttachment = {
+  type: 'text-attachment'
+  name: string
+  kind: TextAttachmentKind
+  content: string
+}
 export type MentionableModel = {
   type: 'model'
   modelId: string
@@ -86,8 +120,11 @@ export type Mentionable =
   | MentionableBlock
   | MentionableAssistantQuote
   | MentionableUrl
+  | MentionableWebSelection
   | MentionableImage
   | MentionablePDF
+  | MentionableOffice
+  | MentionableTextAttachment
   | MentionableModel
 export type SerializedMentionableFile = {
   type: 'file'
@@ -119,8 +156,11 @@ export type SerializedMentionableAssistantQuote = {
   contentUnit?: 'characters' | 'words' | 'wordsCharacters'
 }
 export type SerializedMentionableUrl = MentionableUrl
+export type SerializedMentionableWebSelection = MentionableWebSelection
 export type SerializedMentionableImage = MentionableImage
 export type SerializedMentionablePDF = MentionablePDF
+export type SerializedMentionableOffice = MentionableOffice
+export type SerializedMentionableTextAttachment = MentionableTextAttachment
 export type SerializedMentionableModel = MentionableModel
 export type SerializedMentionable =
   | SerializedMentionableFile
@@ -128,6 +168,9 @@ export type SerializedMentionable =
   | SerializedMentionableBlock
   | SerializedMentionableAssistantQuote
   | SerializedMentionableUrl
+  | SerializedMentionableWebSelection
   | SerializedMentionableImage
   | SerializedMentionablePDF
+  | SerializedMentionableOffice
+  | SerializedMentionableTextAttachment
   | SerializedMentionableModel

@@ -10,10 +10,20 @@ const providerHeaderSchema = z.object({
 })
 
 export const requestTransportModeSchema = z.enum([
-  'auto',
   'browser',
   'obsidian',
   'node',
+])
+
+export const requestTransportModeByPlatformSchema = z.object({
+  desktop: requestTransportModeSchema.optional(),
+  mobile: z.enum(['browser', 'obsidian']).optional(),
+})
+
+export const responseStreamingModeSchema = z.enum([
+  'auto',
+  'streaming',
+  'non-streaming',
 ])
 
 export const providerPresetTypeSchema = z.enum([
@@ -81,19 +91,17 @@ const normalizeApiType = (
 }
 
 export function getDefaultRequestTransportModeForPresetType(
-  presetType: LLMProviderPresetType,
+  _presetType: LLMProviderPresetType,
   isDesktop: boolean,
-): RequestTransportMode | undefined {
-  if (
-    isDesktop &&
-    (presetType === 'chatgpt-oauth' ||
-      presetType === 'gemini-oauth' ||
-      presetType === 'qwen-oauth')
-  ) {
-    return 'node'
-  }
+): RequestTransportMode {
+  return isDesktop ? 'node' : 'browser'
+}
 
-  return undefined
+export function getDefaultRequestTransportModeByPlatform(): RequestTransportModeByPlatform {
+  return {
+    desktop: 'node',
+    mobile: 'browser',
+  }
 }
 
 const DEFAULT_PROVIDER_API_TYPE_BY_PRESET: Record<
@@ -150,6 +158,9 @@ export function getSupportedApiTypesForPresetType(
       break
     case 'gemini':
       defaults.add('openai-compatible')
+      break
+    case 'deepseek':
+      defaults.add('anthropic')
       break
     case 'amazon-bedrock':
       defaults.add('openai-compatible')
@@ -231,3 +242,8 @@ export const llmProviderSchema = baseLlmProviderInputSchema
 export type LLMProvider = z.infer<typeof llmProviderSchema>
 export type ProviderHeader = z.infer<typeof providerHeaderSchema>
 export type RequestTransportMode = z.infer<typeof requestTransportModeSchema>
+export type ResponseStreamingMode = z.infer<typeof responseStreamingModeSchema>
+export type RequestTransportModeByPlatform = {
+  desktop?: RequestTransportMode
+  mobile?: Extract<RequestTransportMode, 'browser' | 'obsidian'>
+}

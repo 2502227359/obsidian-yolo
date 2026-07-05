@@ -1,6 +1,10 @@
 import { DEFAULT_MODEL_REQUEST_TIMEOUT_MS } from '../../settings/schema/setting.types'
 import { ChatModel } from '../../types/chat-model.types'
-import { LLMRequestBase, RequestTool } from '../../types/llm/request'
+import {
+  LLMRequestBase,
+  RequestTool,
+  RequestToolChoice,
+} from '../../types/llm/request'
 import {
   Annotation,
   LLMResponseStreaming,
@@ -9,6 +13,7 @@ import {
 } from '../../types/llm/response'
 import { LLMProvider } from '../../types/provider.types'
 import {
+  type ToolCallArgumentDiagnostics,
   type ToolCallArguments,
   getToolCallArgumentsObject,
 } from '../../types/tool-call.types'
@@ -18,9 +23,12 @@ import {
   bindLLMDebugTraceToSignal,
   runWithLLMDebugTrace,
 } from '../llm/debugCapture'
-import { stripProviderFeatures } from '../llm/strip-provider-features'
+import { applyLightweightRequestPolicy } from '../llm/lightweight-request-policy'
+import { ModelRequestTimeoutError } from '../llm/requestPolicy'
+import { ResponseDeliveryMode } from '../llm/responseDeliveryMode'
 import { isLocalFsWriteToolName } from '../mcp/localFileTools'
 
+import { markRequestErrorNonRetryable } from './requestRetry'
 import {
   ToolCallAccumulator,
   createCanonicalToolEventsFromDeltas,
@@ -39,6 +47,7 @@ export type SingleTurnExecutionResult = {
     arguments?: ToolCallArguments
     metadata?: {
       thoughtSignature?: string
+      argumentDiagnostics?: ToolCallArgumentDiagnostics
     }
   }[]
 }
@@ -49,6 +58,7 @@ type StreamedToolCall = {
   type?: 'function'
   metadata?: {
     thoughtSignature?: string
+    argumentDiagnostics?: ToolCallArgumentDiagnostics
   }
   function?: {
     name?: string
@@ -61,8 +71,14 @@ type SingleTurnExecutionInput = {
   model: ChatModel
   request: LLMRequestBase
   tools?: RequestTool[]
+  /**
+   * Override the tool-choice policy. When omitted, defaults to `'auto'` if
+   * `tools` are present (else `undefined`). Compaction passes `'none'` to keep
+   * the tools block in the cache-warm prefix while forbidding tool calls.
+   */
+  tool_choice?: RequestToolChoice
   signal?: AbortSignal
-  stream?: boolean
+  deliveryMode?: ResponseDeliveryMode
   primaryRequestTimeoutMs?: number
   streamFallbackRecoveryEnabled?: boolean
   geminiTools?: {
@@ -73,11 +89,11 @@ type SingleTurnExecutionInput = {
   /**
    * `standard` (default): forward the model as-configured, including any
    * hosted tools, reasoning, and custom-parameter injections.
-   * `auxiliary`: strip those features for one-shot helper calls
-   * (title generation, conversation compaction) that should be a plain
-   * "messages in, short reply out" round trip.
+   * `lightweight`: apply the lightweight request policy for one-shot helper
+   * calls (title generation, tab completion, short summaries) that
+   * should not inherit hosted tools or heavyweight model customizations.
    */
-  purpose?: 'standard' | 'auxiliary'
+  purpose?: 'standard' | 'lightweight'
   onStreamDelta?: (delta: {
     contentDelta: string
     reasoningDelta: string
@@ -87,6 +103,8 @@ type SingleTurnExecutionInput = {
 }
 
 const DEFAULT_PRIMARY_REQUEST_TIMEOUT_MS = DEFAULT_MODEL_REQUEST_TIMEOUT_MS
+const TOOL_ARGUMENT_RETRY_HINT =
+  'The previous streaming response produced empty or placeholder tool-call arguments. Retry with complete, valid JSON tool_call arguments. Keep each tool_call argument object small; prefer narrower file edits or smaller parameter payloads instead of sending huge file contents in one call.'
 
 const normalizeToolName = (toolName: string): string => {
   if (!toolName.includes('__')) {
@@ -94,10 +112,6 @@ const normalizeToolName = (toolName: string): string => {
   }
   const parts = toolName.split('__')
   return parts[parts.length - 1] ?? toolName
-}
-
-const isObjectRecord = (value: unknown): value is Record<string, unknown> => {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
 
 const isStringField = (args: Record<string, unknown>, key: string): boolean => {
@@ -128,66 +142,27 @@ const isPositiveIntegerField = (
   return typeof value === 'number' && Number.isInteger(value) && value > 0
 }
 
-const isRecordArrayField = (
-  args: Record<string, unknown>,
-  key: string,
-  itemValidator: (value: Record<string, unknown>) => boolean,
-): boolean => {
-  const value = args[key]
-  if (!Array.isArray(value) || value.length === 0) {
+const isValidFsEditArgs = (args: Record<string, unknown>): boolean => {
+  if (!isStringField(args, 'newText')) {
     return false
   }
+  const hasOldText = args.oldText !== undefined && args.oldText !== null
+  const hasLineRange =
+    (args.startLine !== undefined && args.startLine !== null) ||
+    (args.endLine !== undefined && args.endLine !== null)
 
-  return value.every((item) => isObjectRecord(item) && itemValidator(item))
-}
-
-const isValidFsCreateFileItem = (value: Record<string, unknown>): boolean => {
-  return isStringField(value, 'path') && isStringField(value, 'content')
-}
-
-const isValidFsDeleteFileItem = (value: Record<string, unknown>): boolean => {
-  return isStringField(value, 'path')
-}
-
-const isValidFsCreateDirItem = (value: Record<string, unknown>): boolean => {
-  return isStringField(value, 'path')
-}
-
-const isValidFsDeleteDirItem = (value: Record<string, unknown>): boolean => {
-  return (
-    isStringField(value, 'path') && isOptionalBooleanField(value, 'recursive')
-  )
-}
-
-const isValidFsMoveItem = (value: Record<string, unknown>): boolean => {
-  return isStringField(value, 'oldPath') && isStringField(value, 'newPath')
-}
-
-const isValidFsEditOperation = (value: unknown): boolean => {
-  if (!isObjectRecord(value)) {
-    return false
+  // Exact-text mode: oldText alone.
+  if (hasOldText && !hasLineRange) {
+    return isNonEmptyStringField(args, 'oldText')
   }
-  const operationType = value.type
-  if (operationType === 'replace') {
+  // Line-range mode: startLine + endLine alone.
+  if (hasLineRange && !hasOldText) {
     return (
-      isNonEmptyStringField(value, 'oldText') && isStringField(value, 'newText')
+      isPositiveIntegerField(args, 'startLine') &&
+      isPositiveIntegerField(args, 'endLine')
     )
   }
-  if (operationType === 'insert_after') {
-    return (
-      isNonEmptyStringField(value, 'anchor') && isStringField(value, 'content')
-    )
-  }
-  if (operationType === 'replace_lines') {
-    return (
-      isPositiveIntegerField(value, 'startLine') &&
-      isPositiveIntegerField(value, 'endLine') &&
-      isStringField(value, 'newText')
-    )
-  }
-  if (operationType === 'append') {
-    return isStringField(value, 'content')
-  }
+  // Both groups or neither group is invalid.
   return false
 }
 
@@ -204,69 +179,25 @@ const isValidWriteToolArguments = ({
     if (!isStringField(args, 'path')) {
       return false
     }
-    return isValidFsEditOperation(args.operation)
+    return isValidFsEditArgs(args)
   }
 
-  if (normalizedToolName === 'fs_create_file') {
-    if (args.items !== undefined) {
-      return (
-        isRecordArrayField(args, 'items', isValidFsCreateFileItem) &&
-        isOptionalBooleanField(args, 'dryRun')
-      )
-    }
+  if (normalizedToolName === 'fs_write') {
+    return isStringField(args, 'path') && isStringField(args, 'content')
+  }
+
+  if (normalizedToolName === 'fs_delete') {
     return (
-      isStringField(args, 'path') &&
-      isStringField(args, 'content') &&
-      isOptionalBooleanField(args, 'dryRun')
+      isStringField(args, 'path') && isOptionalBooleanField(args, 'recursive')
     )
-  }
-
-  if (normalizedToolName === 'fs_delete_file') {
-    if (args.items !== undefined) {
-      return (
-        isRecordArrayField(args, 'items', isValidFsDeleteFileItem) &&
-        isOptionalBooleanField(args, 'dryRun')
-      )
-    }
-    return isStringField(args, 'path') && isOptionalBooleanField(args, 'dryRun')
   }
 
   if (normalizedToolName === 'fs_create_dir') {
-    if (args.items !== undefined) {
-      return (
-        isRecordArrayField(args, 'items', isValidFsCreateDirItem) &&
-        isOptionalBooleanField(args, 'dryRun')
-      )
-    }
-    return isStringField(args, 'path') && isOptionalBooleanField(args, 'dryRun')
-  }
-
-  if (normalizedToolName === 'fs_delete_dir') {
-    if (args.items !== undefined) {
-      return (
-        isRecordArrayField(args, 'items', isValidFsDeleteDirItem) &&
-        isOptionalBooleanField(args, 'dryRun')
-      )
-    }
-    return (
-      isStringField(args, 'path') &&
-      isOptionalBooleanField(args, 'recursive') &&
-      isOptionalBooleanField(args, 'dryRun')
-    )
+    return isStringField(args, 'path')
   }
 
   if (normalizedToolName === 'fs_move') {
-    if (args.items !== undefined) {
-      return (
-        isRecordArrayField(args, 'items', isValidFsMoveItem) &&
-        isOptionalBooleanField(args, 'dryRun')
-      )
-    }
-    return (
-      isStringField(args, 'oldPath') &&
-      isStringField(args, 'newPath') &&
-      isOptionalBooleanField(args, 'dryRun')
-    )
+    return isStringField(args, 'oldPath') && isStringField(args, 'newPath')
   }
 
   return true
@@ -290,13 +221,28 @@ const hasInvalidWriteToolArguments = (
   })
 }
 
+const hasSuspiciousEmptyToolArguments = (
+  toolCalls: SingleTurnExecutionResult['toolCalls'],
+): boolean => {
+  return toolCalls.some((toolCall) => {
+    const args = toolCall.arguments
+    if (!args) {
+      return true
+    }
+    if (args.kind === 'partial') {
+      return args.rawText.trim().length === 0
+    }
+    return Object.keys(args.value).length === 0
+  })
+}
+
 const logStreamingRecoverTriggered = ({
   reason,
   finishReason,
   toolCalls,
   error,
 }: {
-  reason: 'invalid_write_args' | 'stream_protocol_error'
+  reason: 'empty_tool_args' | 'invalid_write_args' | 'stream_protocol_error'
   finishReason?: string | null
   toolCalls?: SingleTurnExecutionResult['toolCalls']
   error?: string
@@ -314,8 +260,9 @@ export async function executeSingleTurn({
   model,
   request,
   tools,
+  tool_choice,
   signal,
-  stream = true,
+  deliveryMode = 'incremental',
   primaryRequestTimeoutMs = DEFAULT_PRIMARY_REQUEST_TIMEOUT_MS,
   streamFallbackRecoveryEnabled = true,
   geminiTools,
@@ -323,15 +270,49 @@ export async function executeSingleTurn({
   purpose = 'standard',
   onStreamDelta,
 }: SingleTurnExecutionInput): Promise<SingleTurnExecutionResult> {
-  const isAuxiliary = purpose === 'auxiliary'
-  const effectiveModel = isAuxiliary ? stripProviderFeatures(model) : model
-  // Auxiliary calls must never carry Gemini-native hosted tools, regardless of
-  // what the caller passes in — the option lives outside the ChatModel object
-  // and would otherwise bypass stripProviderFeatures.
-  const effectiveGeminiTools = isAuxiliary ? undefined : geminiTools
+  const resolvedToolChoice: RequestToolChoice | undefined =
+    tool_choice ?? (tools ? 'auto' : undefined)
+  const isLightweight = purpose === 'lightweight'
+  const baseProviderOptions = { geminiTools }
+  const effectivePolicy = isLightweight
+    ? applyLightweightRequestPolicy({
+        model,
+        options: baseProviderOptions,
+      })
+    : { model, options: baseProviderOptions }
+  const effectiveModel = effectivePolicy.model
+  const effectiveProviderOptions = effectivePolicy.options
+  const executionMode =
+    providerClient.resolveResponseExecutionMode(deliveryMode)
   const withDebugTrace = <T>(run: () => Promise<T>): Promise<T> =>
     runWithLLMDebugTrace(debugTraceId, run)
-  const runNonStreaming = async (): Promise<SingleTurnExecutionResult> => {
+  const createRequestWithSystemHint = (
+    systemHint: string | undefined,
+  ): LLMRequestBase => {
+    if (!systemHint) {
+      return request
+    }
+    const [firstMessage, ...restMessages] = request.messages
+    if (firstMessage?.role === 'system') {
+      return {
+        ...request,
+        messages: [
+          {
+            ...firstMessage,
+            content: `${firstMessage.content}\n\n${systemHint}`,
+          },
+          ...restMessages,
+        ],
+      }
+    }
+    return {
+      ...request,
+      messages: [{ role: 'system', content: systemHint }, ...request.messages],
+    }
+  }
+  const runNonStreaming = async (options?: {
+    systemHint?: string
+  }): Promise<SingleTurnExecutionResult> => {
     const requestController = new AbortController()
     const handleRequestAbort = () => requestController.abort()
     if (signal?.aborted) {
@@ -346,15 +327,15 @@ export async function executeSingleTurn({
         providerClient.generateResponse(
           effectiveModel,
           {
-            ...request,
+            ...createRequestWithSystemHint(options?.systemHint),
             tools,
-            tool_choice: tools ? 'auto' : undefined,
+            tool_choice: resolvedToolChoice,
             stream: false,
           },
           {
             signal: requestController.signal,
             debugTraceId,
-            geminiTools: effectiveGeminiTools,
+            geminiTools: effectiveProviderOptions.geminiTools,
           },
         ),
       )
@@ -378,6 +359,7 @@ export async function executeSingleTurn({
                 name,
                 arguments: createToolCallArguments(
                   toolCall.function?.arguments,
+                  { allowPartial: true },
                 ),
                 metadata: toolCall.metadata,
               }
@@ -391,15 +373,30 @@ export async function executeSingleTurn({
     }
   }
 
-  if (!stream) {
+  if (executionMode === 'non-streaming') {
     return runNonStreaming()
   }
 
+  const isBufferedStreaming = executionMode === 'buffered-streaming'
   const streamController = new AbortController()
   bindLLMDebugTraceToSignal(debugTraceId, streamController.signal)
-  const handleAbort = () => streamController.abort()
-  if (signal?.aborted) {
+  let rejectBufferedInterruption: ((error: Error) => void) | undefined
+  const bufferedInterruption = new Promise<never>((_, reject) => {
+    rejectBufferedInterruption = reject
+  })
+  const createAbortError = (): Error => {
+    const error = new Error('Aborted')
+    error.name = 'AbortError'
+    return error
+  }
+  const handleAbort = () => {
     streamController.abort()
+    if (isBufferedStreaming) {
+      rejectBufferedInterruption?.(createAbortError())
+    }
+  }
+  if (signal?.aborted) {
+    handleAbort()
   } else {
     signal?.addEventListener('abort', handleAbort, { once: true })
   }
@@ -427,28 +424,35 @@ export async function executeSingleTurn({
     timeoutId = setTimeout(() => {
       timedOut = true
       streamController.abort()
+      if (isBufferedStreaming) {
+        rejectBufferedInterruption?.(
+          new ModelRequestTimeoutError(primaryRequestTimeoutMs),
+        )
+      }
     }, primaryRequestTimeoutMs)
 
-    await withDebugTrace(async () => {
+    const consumeStream = withDebugTrace(async () => {
       const streamIterator = await providerClient.streamResponse(
         effectiveModel,
         {
           ...request,
           tools,
-          tool_choice: tools ? 'auto' : undefined,
+          tool_choice: resolvedToolChoice,
           stream: true,
         },
         {
           signal: streamController.signal,
           debugTraceId,
-          geminiTools: effectiveGeminiTools,
+          geminiTools: effectiveProviderOptions.geminiTools,
         },
       )
 
       for await (const chunk of streamIterator) {
         if (!hasReceivedFirstChunk) {
           hasReceivedFirstChunk = true
-          clearTimeoutId()
+          if (!isBufferedStreaming) {
+            clearTimeoutId()
+          }
         }
         if (signal?.aborted) {
           break
@@ -502,17 +506,22 @@ export async function executeSingleTurn({
 
         const streamedToolCallList = toolCallAccumulator.getSnapshots()
 
-        onStreamDelta?.({
-          contentDelta,
-          reasoningDelta,
-          chunk,
-          toolCalls:
-            streamedToolCallList.length > 0
-              ? streamedToolCallList.sort((a, b) => a.index - b.index)
-              : undefined,
-        })
+        if (!isBufferedStreaming) {
+          onStreamDelta?.({
+            contentDelta,
+            reasoningDelta,
+            chunk,
+            toolCalls:
+              streamedToolCallList.length > 0
+                ? streamedToolCallList.sort((a, b) => a.index - b.index)
+                : undefined,
+          })
+        }
       }
     })
+    await (isBufferedStreaming
+      ? Promise.race([consumeStream, bufferedInterruption])
+      : consumeStream)
 
     const streamEndedAt = Date.now()
     toolCallAccumulator.sealOpenCalls('stream_end', streamEndedAt)
@@ -525,19 +534,36 @@ export async function executeSingleTurn({
         if (!name) {
           return null
         }
+        const shouldAttachDiagnostics =
+          Boolean(toolCall.metadata) ||
+          toolCall.diagnostics.parseState !== 'valid' ||
+          toolCall.diagnostics.rawArgsLength === 0
         return {
           id: toolCall.id,
           name,
-          arguments:
-            toolCall.function?.arguments?.kind === 'complete'
-              ? toolCall.function.arguments
-              : undefined,
-          metadata: toolCall.metadata,
+          arguments: toolCall.function?.arguments,
+          metadata: shouldAttachDiagnostics
+            ? {
+                ...toolCall.metadata,
+                argumentDiagnostics: {
+                  ...toolCall.diagnostics,
+                  finishReason,
+                  timedOut,
+                  aborted: signal?.aborted ?? false,
+                  deliveryMode,
+                },
+              }
+            : undefined,
         }
       })
       .filter((toolCall): toolCall is NonNullable<typeof toolCall> =>
         Boolean(toolCall),
       )
+
+    const hasInvalidWriteArgs =
+      hasInvalidWriteToolArguments(streamedToolCallList)
+    const hasEmptyToolArgs =
+      hasSuspiciousEmptyToolArguments(streamedToolCallList)
 
     let finalToolCalls: SingleTurnExecutionResult['toolCalls'] =
       streamedToolCallList
@@ -546,16 +572,22 @@ export async function executeSingleTurn({
     let finalProviderMetadata: ProviderMetadata | undefined = providerMetadata
 
     if (
+      !isBufferedStreaming &&
       streamFallbackRecoveryEnabled &&
-      hasInvalidWriteToolArguments(streamedToolCallList)
+      (hasInvalidWriteArgs || hasEmptyToolArgs)
     ) {
+      const recoveryReason = hasEmptyToolArgs
+        ? 'empty_tool_args'
+        : 'invalid_write_args'
       logStreamingRecoverTriggered({
-        reason: 'invalid_write_args',
+        reason: recoveryReason,
         finishReason,
         toolCalls: streamedToolCallList,
       })
       try {
-        const nonStreamingResult = await runNonStreaming()
+        const nonStreamingResult = await runNonStreaming({
+          systemHint: hasEmptyToolArgs ? TOOL_ARGUMENT_RETRY_HINT : undefined,
+        })
         if (nonStreamingResult.toolCalls.length > 0) {
           finalToolCalls = nonStreamingResult.toolCalls
           finalFinishReason = nonStreamingResult.finishReason
@@ -568,6 +600,24 @@ export async function executeSingleTurn({
       }
     }
 
+    // Guard against silent failures: if the stream completed without
+    // producing any content, reasoning, or tool calls, the response is
+    // effectively empty.  This typically indicates a misconfigured base URL
+    // (e.g. missing `/v1`) where the proxy returns a valid but contentless
+    // SSE stream.  Throw so the agent layer can surface an error message
+    // instead of showing the user a blank bubble.
+    if (
+      !content &&
+      !reasoning &&
+      finalToolCalls.length === 0 &&
+      !finalFinishReason &&
+      !signal?.aborted
+    ) {
+      throw new Error(
+        'No content received from the model — verify the API base URL (e.g. the `/v1` suffix) and that the endpoint returns a non-empty SSE stream.',
+      )
+    }
+
     return {
       content,
       reasoning: reasoning || undefined,
@@ -578,6 +628,9 @@ export async function executeSingleTurn({
       toolCalls: finalToolCalls,
     }
   } catch (error) {
+    if (isBufferedStreaming) {
+      throw markRequestErrorNonRetryable(error)
+    }
     const message =
       error instanceof Error ? error.message : String(error ?? 'Unknown error')
     const shouldFallback =

@@ -8,7 +8,6 @@ import type {
   ChatUserMessage,
 } from '../../types/chat'
 import type { ChatTimelineItem } from '../../types/chat-timeline'
-import { getToolCallArgumentsText } from '../../types/tool-call.types'
 
 const USER_MESSAGE_ESTIMATED_HEIGHT = 92
 const ASSISTANT_GROUP_ESTIMATED_HEIGHT = 180
@@ -21,6 +20,8 @@ const USER_TO_ASSISTANT_SPACING = 24
 const USER_MESSAGE_MAX_ESTIMATED_HEIGHT = 420
 const ASSISTANT_GROUP_MAX_ESTIMATED_HEIGHT = 2800
 const TOOL_MESSAGE_MAX_ESTIMATED_HEIGHT = 720
+const TOOL_MESSAGE_BASE_ESTIMATED_HEIGHT = 24
+const COLLAPSED_TOOL_CALL_ESTIMATED_HEIGHT = 34
 
 function clampEstimatedHeight(
   value: number,
@@ -119,14 +120,9 @@ function estimateAssistantMessageHeight(message: ChatAssistantMessage): number {
 
 function estimateToolMessageHeight(message: ChatToolMessage): number {
   const toolCallCount = message.toolCalls.length
-  const payloadWeight = message.toolCalls.reduce((sum, toolCall) => {
-    const requestArgsLength =
-      getToolCallArgumentsText(toolCall.request.arguments)?.length ?? 0
-    const responseLength = JSON.stringify(toolCall.response ?? {}).length
-    return sum + requestArgsLength + responseLength
-  }, 0)
-
-  const estimated = 72 + toolCallCount * 64 + Math.ceil(payloadWeight / 180)
+  const estimated =
+    TOOL_MESSAGE_BASE_ESTIMATED_HEIGHT +
+    toolCallCount * COLLAPSED_TOOL_CALL_ESTIMATED_HEIGHT
   return clampEstimatedHeight(estimated, {
     min: 72,
     max: TOOL_MESSAGE_MAX_ESTIMATED_HEIGHT,
@@ -141,8 +137,12 @@ function estimateAssistantGroupHeight(
       return sum + estimateAssistantMessageHeight(message)
     }
 
-    if (message.role === 'external_agent_result') {
-      return sum + 120 // estimated height for external agent result card
+    if (
+      message.role === 'external_agent_result' ||
+      message.role === 'subagent_result' ||
+      message.role === 'terminal_command_result'
+    ) {
+      return sum + 120
     }
 
     return sum + estimateToolMessageHeight(message)
@@ -176,14 +176,31 @@ export const getDefaultTimelineEstimatedHeight = (
 
 type BuildMessageTimelineItemsParams = {
   groupedChatMessages: (ChatUserMessage | AssistantToolMessageGroup)[]
+  revisionsById?: ReadonlyMap<string, number>
   assistantGroupBoundaryMessageIds?: readonly string[]
   activeEditableMessageId?: string | null
   activeStreamingMessageId?: string | null
   includeBottomAnchor?: boolean
 }
 
+const getMessageRevision = (
+  revisionsById: ReadonlyMap<string, number> | undefined,
+  messageId: string,
+): number => revisionsById?.get(messageId) ?? 0
+
+const getGroupRevision = (
+  messages: AssistantToolMessageGroup,
+  revisionsById: ReadonlyMap<string, number> | undefined,
+): number =>
+  messages.reduce(
+    (revision, message) =>
+      revision + getMessageRevision(revisionsById, message.id),
+    messages.length,
+  )
+
 export const buildMessageTimelineItems = ({
   groupedChatMessages,
+  revisionsById,
   assistantGroupBoundaryMessageIds = [],
   activeEditableMessageId,
   activeStreamingMessageId,
@@ -192,9 +209,22 @@ export const buildMessageTimelineItems = ({
   const assistantGroupBoundaryMessageIdSet = new Set(
     assistantGroupBoundaryMessageIds,
   )
-  const items: ChatTimelineItem[] = groupedChatMessages.map(
+  const renderableGroupedChatMessages = groupedChatMessages.filter(
+    (messageOrGroup) => {
+      if (!Array.isArray(messageOrGroup) || messageOrGroup.length !== 1) {
+        return true
+      }
+
+      const message = messageOrGroup[0]
+      return (
+        message?.role !== 'subagent_result' &&
+        message?.role !== 'terminal_command_result'
+      )
+    },
+  )
+  const items: ChatTimelineItem[] = renderableGroupedChatMessages.map(
     (messageOrGroup, index) => {
-      const previousItem = groupedChatMessages[index - 1]
+      const previousItem = renderableGroupedChatMessages[index - 1]
       const firstMessageId = Array.isArray(messageOrGroup)
         ? (messageOrGroup.at(0)?.id ?? 'assistant-group')
         : messageOrGroup.id
@@ -218,7 +248,9 @@ export const buildMessageTimelineItems = ({
           renderKey: firstMessageId,
           estimatedHeight: estimateAssistantGroupHeight(messageOrGroup),
           spacingBefore,
-          messages: messageOrGroup,
+          groupId: firstMessageId,
+          messageIds: messageOrGroup.map((message) => message.id),
+          revision: getGroupRevision(messageOrGroup, revisionsById),
           isPinnedForRender:
             activeStreamingMessageId !== null &&
             lastMessageId === activeStreamingMessageId,
@@ -232,7 +264,8 @@ export const buildMessageTimelineItems = ({
         renderKey: messageOrGroup.id,
         estimatedHeight: estimateUserMessageHeight(messageOrGroup),
         spacingBefore,
-        message: messageOrGroup,
+        messageId: messageOrGroup.id,
+        revision: getMessageRevision(revisionsById, messageOrGroup.id),
         isEditable: true,
         isActive: messageOrGroup.id === activeEditableMessageId,
         isPinnedForRender: messageOrGroup.id === activeEditableMessageId,
@@ -255,6 +288,7 @@ export const buildMessageTimelineItems = ({
 
 type BuildChatTimelineItemsParams = {
   groupedChatMessages: (ChatUserMessage | AssistantToolMessageGroup)[]
+  revisionsById?: ReadonlyMap<string, number>
   assistantGroupBoundaryMessageIds?: readonly string[]
   compactionDividerAnchorMessageIds: string[]
   latestCompaction: ChatConversationCompaction | null
@@ -268,6 +302,7 @@ type BuildChatTimelineItemsParams = {
 
 export const buildChatTimelineItems = ({
   groupedChatMessages,
+  revisionsById,
   assistantGroupBoundaryMessageIds = [],
   compactionDividerAnchorMessageIds,
   latestCompaction,
@@ -283,8 +318,23 @@ export const buildChatTimelineItems = ({
   const compactionAnchorMessageIdSet = new Set(
     compactionDividerAnchorMessageIds,
   )
+  const messagesById = new Map<
+    string,
+    ChatUserMessage | AssistantToolMessageGroup[number]
+  >()
+  groupedChatMessages.forEach((messageOrGroup) => {
+    if (Array.isArray(messageOrGroup)) {
+      messageOrGroup.forEach((message) => {
+        messagesById.set(message.id, message)
+      })
+      return
+    }
+
+    messagesById.set(messageOrGroup.id, messageOrGroup)
+  })
   const messageItems = buildMessageTimelineItems({
     groupedChatMessages,
+    revisionsById,
     assistantGroupBoundaryMessageIds,
     activeEditableMessageId,
     activeStreamingMessageId,
@@ -312,6 +362,12 @@ export const buildChatTimelineItems = ({
 
   messageItems.forEach((item) => {
     if (item.kind === 'assistant-group') {
+      const groupMessages = item.messageIds
+        .map((messageId) => messagesById.get(messageId))
+        .filter(
+          (message): message is AssistantToolMessageGroup[number] =>
+            message !== undefined && message.role !== 'user',
+        )
       let currentSlice: AssistantToolMessageGroup = []
       let sliceIndex = 0
       const pushCurrentGroup = () => {
@@ -325,19 +381,22 @@ export const buildChatTimelineItems = ({
           ...item,
           id: firstMessageId,
           renderKey: `${item.id}-slice-${sliceIndex}`,
-          messages: currentSlice,
+          groupId: firstMessageId,
+          messageIds: currentSlice.map((message) => message.id),
+          revision: getGroupRevision(currentSlice, revisionsById),
           isPinnedForRender:
-            item.isPinnedForRender ||
+            currentSlice.at(-1)?.id === activeStreamingMessageId ||
             currentSlice.some(
               (message) => message.id === activeEditingAssistantMessageId,
             ),
+          isStreaming: currentSlice.at(-1)?.id === activeStreamingMessageId,
         })
         insertPendingItem(currentSlice.at(-1)?.id ?? '')
         currentSlice = []
         sliceIndex += 1
       }
 
-      item.messages.forEach((message) => {
+      groupMessages.forEach((message) => {
         currentSlice.push(message)
         if (!compactionAnchorMessageIdSet.has(message.id)) {
           return

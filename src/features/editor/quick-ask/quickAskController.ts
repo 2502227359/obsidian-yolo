@@ -185,7 +185,7 @@ export class QuickAskController {
     },
   ) {
     this.showWithOptions(editor, view, {
-      initialMode: 'chat',
+      initialMode: 'ask',
       autoSend: true,
       initialPrompt: options.prompt,
       initialMentionables: options.mentionables,
@@ -199,6 +199,20 @@ export class QuickAskController {
     view: EditorView,
     options?: QuickAskShowOptions,
   ) {
+    void this.showWithOptionsAfterWarmup(editor, view, options).catch(
+      (error: unknown) => {
+        console.error('[YOLO] Failed to open Quick Ask:', error)
+      },
+    )
+  }
+
+  private async showWithOptionsAfterWarmup(
+    editor: Editor,
+    view: EditorView,
+    options?: QuickAskShowOptions,
+  ): Promise<void> {
+    await this.deps.plugin.warmupAgentService()
+
     const selection = view.state.selection.main
     const pos = selection.head
     const selectionAnchor =
@@ -250,7 +264,7 @@ export class QuickAskController {
 
       if (isCurrentView) {
         // Owned-highlight teardown — also runs on panel-initiated close paths
-        // (Escape, submit + auto-close, edit→review). controller.close() does
+        // (Escape, submit + auto-close, edit?review). controller.close() does
         // the same thing for externally-triggered closes; both paths must
         // clear the highlight, otherwise the selection stays painted (and the
         // shimmer keeps running) after the panel is gone.
@@ -330,6 +344,26 @@ export class QuickAskController {
     autoSend?: boolean
     initialAssistantId?: string
   }): void {
+    void this.showFromPdfAfterWarmup(args).catch((error: unknown) => {
+      console.error('[YOLO] Failed to open Quick Ask from PDF:', error)
+    })
+  }
+
+  private async showFromPdfAfterWarmup(args: {
+    leaf: WorkspaceLeaf
+    range: Range
+    file: TFile
+    pageNumber: number
+    contextText?: string
+    initialMentionables?: Mentionable[]
+    initialPrompt?: string
+    initialMode?: QuickAskLaunchMode
+    initialInput?: string
+    autoSend?: boolean
+    initialAssistantId?: string
+  }): Promise<void> {
+    await this.deps.plugin.warmupAgentService()
+
     const hostEl = getPdfLeafContentEl(args.leaf)
     if (!hostEl) {
       // PDF leaf DOM not in expected shape — refuse to mount rather than
@@ -373,7 +407,7 @@ export class QuickAskController {
       sourceFilePath: args.file.path,
       initialPrompt: args.initialPrompt,
       initialMentionables: args.initialMentionables,
-      initialMode: args.initialMode ?? 'chat',
+      initialMode: args.initialMode ?? 'ask',
       initialInput: args.initialInput,
       autoSend: args.autoSend,
       initialAssistantId: args.initialAssistantId,
@@ -384,16 +418,22 @@ export class QuickAskController {
     overlay.mount()
 
     // Mirror Markdown's persistence: register a 'sync' highlight on the PDF
-    // leaf so the selected range stays visually highlighted while Quick Ask floats.
-    const id = `quickask:${crypto.randomUUID()}`
-    this.currentPdfHighlightId = id
-    pdfSelectionHighlightController.addHighlight(
-      args.leaf,
-      id,
-      { range: args.range, pageNumber: args.pageNumber, file: args.file },
-      'sync',
-      'quickask',
-    )
+    // leaf so the selected range stays visually highlighted while the Quick
+    // Ask floats. Cleared in close()/onClose. Gated by the same setting.
+    if (
+      this.deps.getSettings().continuationOptions.persistSelectionHighlight ??
+      true
+    ) {
+      const id = `quickask:${crypto.randomUUID()}`
+      this.currentPdfHighlightId = id
+      pdfSelectionHighlightController.addHighlight(
+        args.leaf,
+        id,
+        { range: args.range, pageNumber: args.pageNumber, file: args.file },
+        'sync',
+        'quickask',
+      )
+    }
   }
 
   /**
@@ -411,6 +451,15 @@ export class QuickAskController {
   }
 
   private deferSelectionHighlightTakeover(view: EditorView, token: number) {
+    if (
+      !(
+        this.deps.getSettings().continuationOptions.persistSelectionHighlight ??
+        true
+      )
+    ) {
+      return
+    }
+
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
         if (token !== this.highlightTakeoverToken) {

@@ -11,7 +11,7 @@ import { HistoryPlugin } from '@lexical/react/LexicalHistoryPlugin'
 import { OnChangePlugin } from '@lexical/react/LexicalOnChangePlugin'
 import { RichTextPlugin } from '@lexical/react/LexicalRichTextPlugin'
 import { $getRoot, LexicalEditor, SerializedEditorState } from 'lexical'
-import { RefObject, useCallback, useEffect, useState } from 'react'
+import { RefObject, memo, useCallback, useEffect, useState } from 'react'
 
 import { useApp } from '../../../contexts/app-context'
 import { LiteSkillEntry } from '../../../core/skills/liteSkills'
@@ -32,6 +32,7 @@ import ImagePastePlugin from './plugins/image/ImagePastePlugin'
 import AutoLinkMentionPlugin from './plugins/mention/AutoLinkMentionPlugin'
 import { MentionNode } from './plugins/mention/MentionNode'
 import MentionPlugin from './plugins/mention/MentionPlugin'
+import MentionSelectionHighlightPlugin from './plugins/mention/MentionSelectionHighlightPlugin'
 import { SkillNode } from './plugins/mention/SkillNode'
 import SkillSlashPlugin, {
   type SlashCommand,
@@ -41,6 +42,8 @@ import OnEnterPlugin from './plugins/on-enter/OnEnterPlugin'
 import OnMutationPlugin, {
   NodeMutations,
 } from './plugins/on-mutation/OnMutationPlugin'
+import AttachmentPastePlugin from './plugins/paste/AttachmentPastePlugin'
+import PlainTextPastePlugin from './plugins/paste/PlainTextPastePlugin'
 // templates feature removed
 
 export type LexicalContentEditableProps = {
@@ -54,6 +57,7 @@ export type LexicalContentEditableProps = {
   onMentionNodeMutation?: (mutations: NodeMutations<MentionNode>) => void
   onSkillNodeMutation?: (mutations: NodeMutations<SkillNode>) => void
   onCreateImageMentionables?: (mentionables: MentionableImage[]) => void
+  onPasteFiles?: (files: File[]) => void
   initialEditorState?: InitialEditorStateType
   autoFocus?: boolean
   contentClassName?: string
@@ -67,13 +71,13 @@ export type LexicalContentEditableProps = {
   assistants?: Assistant[]
   currentAssistantId?: string
   onSelectAssistant?: (assistantId: string) => void
-  currentChatMode?: 'chat' | 'agent'
-  onSelectChatMode?: (mode: 'chat' | 'agent') => void
+  currentChatMode?: import('./ChatModeSelect').ChatMode
+  onSelectChatMode?: (mode: import('./ChatModeSelect').ChatMode) => void
   allowAgentModeOption?: boolean
   models?: ChatModel[]
   selectedModelIds?: string[]
   skills?: LiteSkillEntry[]
-  selectedSkillIds?: string[]
+  selectedSkillNames?: string[]
   onSelectSkill?: (skill: LiteSkillEntry) => void
   onRunSlashCommand?: (command: SlashCommand) => void
   snippets?: SnippetEntry[]
@@ -142,7 +146,7 @@ function SafeSetRootElementPatchPlugin() {
   return null
 }
 
-export default function LexicalContentEditable({
+function LexicalContentEditable({
   editorRef,
   contentEditableRef,
   onChange,
@@ -153,6 +157,7 @@ export default function LexicalContentEditable({
   onMentionNodeMutation,
   onSkillNodeMutation,
   onCreateImageMentionables,
+  onPasteFiles,
   initialEditorState,
   autoFocus = false,
   contentClassName,
@@ -172,7 +177,7 @@ export default function LexicalContentEditable({
   models = [],
   selectedModelIds = [],
   skills = [],
-  selectedSkillIds = [],
+  selectedSkillNames = [],
   onSelectSkill,
   onRunSlashCommand,
   snippets = [],
@@ -291,7 +296,7 @@ export default function LexicalContentEditable({
         <SkillSlashPlugin
           skills={skills}
           snippets={snippets}
-          selectedSkillIds={selectedSkillIds}
+          selectedSkillNames={selectedSkillNames}
           mentionDisplayMode={mentionDisplayMode}
           onMenuOpenChange={onMentionMenuToggle}
           menuContainerRef={mentionMenuContainerRef}
@@ -333,10 +338,15 @@ export default function LexicalContentEditable({
       <EditorRefPlugin editorRef={editorRef} />
       <NoFormatPlugin />
       <AutoLinkMentionPlugin />
+      <MentionSelectionHighlightPlugin />
+      <AttachmentPastePlugin onPasteFiles={onPasteFiles} />
       <ImagePastePlugin onCreateImageMentionables={onCreateImageMentionables} />
+      <PlainTextPastePlugin />
       <ObsidianFileDropPlugin />
-      <DragDropPaste onCreateImageMentionables={onCreateImageMentionables} />
+      <DragDropPaste onDropFiles={onPasteFiles} />
       {/* templates feature removed */}
     </LexicalComposer>
   )
 }
+
+export default memo(LexicalContentEditable)

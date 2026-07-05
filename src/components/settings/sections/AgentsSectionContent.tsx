@@ -1,4 +1,14 @@
-import { BookOpen, FolderOpen, Maximize2, User, Wrench, X } from 'lucide-react'
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
+import {
+  BookOpen,
+  Check,
+  ChevronDown,
+  FolderOpen,
+  Maximize2,
+  User,
+  Wrench,
+  X,
+} from 'lucide-react'
 import { App, TFile } from 'obsidian'
 import {
   useCallback,
@@ -27,6 +37,7 @@ import {
 } from '../../../core/agent/builtinToolUiMeta'
 import {
   buildDefaultBuiltinToolPreferences,
+  buildServerToolTokenBudgets,
   getAssistantToolApprovalMode,
   getAssistantToolDisclosureMode,
   getAssistantToolPreferences,
@@ -34,13 +45,10 @@ import {
   getEnabledAssistantToolNames,
   getExplicitlyEnabledAssistantToolNames,
   isAssistantToolEnabled,
+  resolveDefaultDisclosureModeForServer,
 } from '../../../core/agent/tool-preferences'
 import { applyDynamicToolDescriptions } from '../../../core/agent/tool-selection'
-import {
-  getJsSandboxSettings,
-  hasAnyJsSandboxCapEnabled,
-} from '../../../core/mcp/jsSandboxSettings'
-import { JS_SANDBOX_TOOL_NAME } from '../../../core/mcp/jsSandboxTool'
+import { getJsSandboxSettings } from '../../../core/mcp/jsSandboxSettings'
 import {
   LOCAL_FS_SPLIT_ACTION_TOOL_NAMES,
   LOCAL_MEMORY_SPLIT_ACTION_TOOL_NAMES,
@@ -51,12 +59,13 @@ import { getYoloSkillsDir } from '../../../core/paths/yoloPaths'
 import {
   LiteSkillEntry,
   getLiteSkillDocument,
-  listLiteSkillEntries,
+  humanizeSkillName,
 } from '../../../core/skills/liteSkills'
 import {
-  getDisabledSkillIdSet,
+  getDisabledSkillNameSet,
   resolveAssistantSkillPolicy,
 } from '../../../core/skills/skillPolicy'
+import { useLiteSkillEntries } from '../../../hooks/useLiteSkillEntries'
 import { YoloSettings } from '../../../settings/schema/setting.types'
 import {
   AgentPersona,
@@ -68,6 +77,7 @@ import {
   AssistantWorkspaceScope,
 } from '../../../types/assistant.types'
 import { McpTool } from '../../../types/mcp.types'
+import { stableStringify } from '../../../utils/json/stableStringify'
 import {
   estimateJsonTokens,
   estimateTextTokens,
@@ -104,7 +114,6 @@ type AgentToolView = {
 }
 
 type SkillRowView = LiteSkillEntry & {
-  globallyDisabled: boolean
   enabled: boolean
   loadMode: AssistantSkillLoadMode
 }
@@ -143,26 +152,6 @@ function fnv1aHash(text: string): string {
     hash = Math.imul(hash, 0x01000193)
   }
   return (hash >>> 0).toString(16).padStart(8, '0')
-}
-
-// Stable JSON serialization with sorted object keys, so cache keys stay
-// consistent across re-renders that recreate equivalent objects.
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value) ?? 'null'
-  }
-  if (Array.isArray(value)) {
-    return '[' + value.map(stableStringify).join(',') + ']'
-  }
-  const record = value as Record<string, unknown>
-  const keys = Object.keys(record).sort()
-  return (
-    '{' +
-    keys
-      .map((key) => JSON.stringify(key) + ':' + stableStringify(record[key]))
-      .join(',') +
-    '}'
-  )
 }
 
 function buildToolTokenPayload(tool: McpTool): Record<string, unknown> {
@@ -208,8 +197,24 @@ function estimateToolDefaultContextTokens(tool: McpTool): Promise<number> {
   return pending
 }
 
+function groupToolsByServer(tools: readonly McpTool[]): Map<string, McpTool[]> {
+  const serverTools = new Map<string, McpTool[]>()
+  for (const tool of tools) {
+    let serverName: string
+    try {
+      serverName = parseToolName(tool.name).serverName
+    } catch {
+      continue
+    }
+    const bucket = serverTools.get(serverName) ?? []
+    bucket.push(tool)
+    serverTools.set(serverName, bucket)
+  }
+  return serverTools
+}
+
 function buildSkillMetadataPrompt(skill: LiteSkillEntry): string {
-  return `- id: ${skill.id} | name: ${skill.name} | description: ${skill.description}`
+  return `- name: ${skill.name} | description: ${skill.description}`
 }
 
 function buildAlwaysOnSkillPrompt({
@@ -219,7 +224,7 @@ function buildAlwaysOnSkillPrompt({
   entry: LiteSkillEntry
   content: string
 }): string {
-  return `<skill id="${entry.id}" name="${entry.name}" path="${entry.path}">
+  return `<skill name="${entry.name}" path="${entry.path}">
 ${content}
 </skill>`
 }
@@ -249,7 +254,7 @@ async function estimateSkillDefaultContextTokens({
 
   const document = await getLiteSkillDocument({
     app,
-    id: skill.id,
+    name: skill.name,
     settings,
   })
   if (!document) {
@@ -278,8 +283,11 @@ function createNewAgent(defaultModelId: string): Assistant {
     includeBuiltinTools: true,
     enabledToolNames: [],
     toolPreferences: buildDefaultBuiltinToolPreferences(),
+    toolServerPreferences: {},
     enabledSkills: [],
     skillPreferences: {},
+    includeCurrentFileContent: true,
+    timeContextEnabled: true,
     createdAt: Date.now(),
     updatedAt: Date.now(),
   }
@@ -295,10 +303,13 @@ function toDraftAgent(
     modelId: assistant.modelId ?? fallbackModelId,
     enabledToolNames: getExplicitlyEnabledAssistantToolNames(assistant),
     toolPreferences: getAssistantToolPreferences(assistant),
+    toolServerPreferences: assistant.toolServerPreferences ?? {},
     enabledSkills: assistant.enabledSkills ?? [],
     skillPreferences: assistant.skillPreferences ?? {},
     enableTools: assistant.enableTools ?? true,
     includeBuiltinTools: assistant.includeBuiltinTools ?? true,
+    includeCurrentFileContent: assistant.includeCurrentFileContent ?? true,
+    timeContextEnabled: assistant.timeContextEnabled ?? true,
   }
 }
 
@@ -379,7 +390,6 @@ export function AgentsSectionContent({
   const tabsNavRef = useRef<HTMLDivElement | null>(null)
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   const localFsServerName = getLocalFileToolServerName()
-  const jsSandboxFullToolName = `${localFsServerName}__${JS_SANDBOX_TOOL_NAME}`
 
   const updateTabsGlider = useCallback(() => {
     const nav = tabsNavRef.current
@@ -513,6 +523,7 @@ export function AgentsSectionContent({
         draftAgent.toolPreferences,
         availableTools,
       ),
+      toolServerPreferences: draftAgent.toolServerPreferences ?? {},
       enabledToolNames: normalizeToolSelectionForPersistence(
         getExplicitlyEnabledAssistantToolNames(draftAgent),
         availableTools,
@@ -587,6 +598,25 @@ export function AgentsSectionContent({
     })
   }
 
+  const setServerApprovalMode = (
+    serverName: string,
+    approvalMode: AssistantToolApprovalMode,
+  ) => {
+    setDraftAgent((prev) => {
+      if (!prev) {
+        return prev
+      }
+
+      return {
+        ...prev,
+        toolServerPreferences: {
+          ...(prev.toolServerPreferences ?? {}),
+          [serverName]: { approvalMode },
+        },
+      }
+    })
+  }
+
   const setToolDisclosureMode = (
     toolNames: string[],
     disclosureMode: AssistantToolDisclosureMode,
@@ -617,6 +647,33 @@ export function AgentsSectionContent({
     })
   }
 
+  const clearToolDisclosureMode = (toolNames: string[]) => {
+    setDraftAgent((prev) => {
+      if (!prev) {
+        return prev
+      }
+
+      return updateDraftToolPreferences(prev, (current) => {
+        let next = { ...current }
+        for (const toolName of toolNames) {
+          const currentPreference = next[toolName]
+          if (!currentPreference) {
+            continue
+          }
+          const { disclosureMode: _disclosureMode, ...rest } = currentPreference
+          if (Object.keys(rest).length === 0) {
+            next = Object.fromEntries(
+              Object.entries(next).filter(([name]) => name !== toolName),
+            )
+          } else {
+            next[toolName] = rest
+          }
+        }
+        return next
+      })
+    })
+  }
+
   const setWorkspaceScope = (next: AssistantWorkspaceScope) => {
     setDraftAgent((prev) => {
       if (!prev) return prev
@@ -624,7 +681,7 @@ export function AgentsSectionContent({
     })
   }
 
-  const setSkillEnabled = (skillId: string, enabled: boolean) => {
+  const setSkillEnabled = (skillName: string, enabled: boolean) => {
     if (!draftAgent) {
       return
     }
@@ -634,13 +691,13 @@ export function AgentsSectionContent({
     }
 
     if (enabled) {
-      current.add(skillId)
+      current.add(skillName)
     } else {
-      current.delete(skillId)
+      current.delete(skillName)
     }
 
-    nextPreferences[skillId] = {
-      ...(nextPreferences[skillId] ?? {}),
+    nextPreferences[skillName] = {
+      ...(nextPreferences[skillName] ?? {}),
       enabled,
     }
 
@@ -652,7 +709,7 @@ export function AgentsSectionContent({
   }
 
   const setSkillLoadMode = (
-    skillId: string,
+    skillName: string,
     loadMode: AssistantSkillLoadMode,
   ) => {
     if (!draftAgent) {
@@ -661,11 +718,11 @@ export function AgentsSectionContent({
 
     const nextPreferences = {
       ...(draftAgent.skillPreferences ?? {}),
-      [skillId]: {
-        ...(draftAgent.skillPreferences?.[skillId] ?? {}),
+      [skillName]: {
+        ...(draftAgent.skillPreferences?.[skillName] ?? {}),
         enabled:
-          draftAgent.skillPreferences?.[skillId]?.enabled ??
-          draftAgent.enabledSkills?.includes(skillId) ??
+          draftAgent.skillPreferences?.[skillName]?.enabled ??
+          draftAgent.enabledSkills?.includes(skillName) ??
           true,
         loadMode,
       },
@@ -874,7 +931,13 @@ export function AgentsSectionContent({
     agentId: string | null
     value: number | null
     perTool: Map<string, number>
-  }>({ agentId: null, value: null, perTool: new Map() })
+    serverToolTokenBudgets: Map<string, number>
+  }>({
+    agentId: null,
+    value: null,
+    perTool: new Map(),
+    serverToolTokenBudgets: new Map(),
+  })
 
   useEffect(() => {
     let cancelled = false
@@ -885,6 +948,7 @@ export function AgentsSectionContent({
         agentId: currentAgentId,
         value: 0,
         perTool: new Map(),
+        serverToolTokenBudgets: new Map(),
       })
       return
     }
@@ -910,6 +974,7 @@ export function AgentsSectionContent({
         agentId: currentAgentId,
         value: 0,
         perTool: new Map(),
+        serverToolTokenBudgets: new Map(),
       })
       return
     }
@@ -919,7 +984,12 @@ export function AgentsSectionContent({
     setEstimatedToolContextTokens((prev) =>
       prev.agentId === currentAgentId
         ? prev
-        : { agentId: currentAgentId, value: null, perTool: new Map() },
+        : {
+            agentId: currentAgentId,
+            value: null,
+            perTool: new Map(),
+            serverToolTokenBudgets: new Map(),
+          },
     )
 
     // Resolve per-agent dynamic descriptions (js_eval's varies with the
@@ -928,32 +998,38 @@ export function AgentsSectionContent({
     // tool list carries. Same bridge selectAllowedTools uses at request time.
     const resolvedTools = applyDynamicToolDescriptions(eligibleTools, {
       jsSandboxSettings: getJsSandboxSettings(settings),
+      settings,
     })
 
-    void Promise.all(
-      resolvedTools.map((tool) =>
-        estimateToolDefaultContextTokens(tool).then(async (count) => {
-          const disclosureMode = getAssistantToolDisclosureMode(
-            draftAgent,
-            tool.name,
-            { enableToolDisclosure },
-          )
-          if (disclosureMode !== 'on_demand') {
-            return [tool.name, count] as const
-          }
-          const stubCount = await estimateJsonTokens(
-            buildDeferredToolStubTokenPayload(tool),
-          )
-          return [tool.name, stubCount] as const
-        }),
-      ),
-    ).then((entries) => {
+    void buildServerToolTokenBudgets(
+      groupToolsByServer(resolvedTools),
+      estimateJsonTokens,
+    ).then(async (serverToolTokenBudgets) => {
+      const entries = await Promise.all(
+        resolvedTools.map((tool) =>
+          estimateToolDefaultContextTokens(tool).then(async (count) => {
+            const disclosureMode = getAssistantToolDisclosureMode(
+              draftAgent,
+              tool.name,
+              { enableToolDisclosure, serverToolTokenBudgets },
+            )
+            if (disclosureMode !== 'on_demand') {
+              return [tool.name, count] as const
+            }
+            const stubCount = await estimateJsonTokens(
+              buildDeferredToolStubTokenPayload(tool),
+            )
+            return [tool.name, stubCount] as const
+          }),
+        ),
+      )
       if (cancelled) return
       const perTool = new Map(entries)
       setEstimatedToolContextTokens({
         agentId: currentAgentId,
         value: entries.reduce((sum, [, count]) => sum + count, 0),
         perTool,
+        serverToolTokenBudgets,
       })
     })
 
@@ -987,38 +1063,34 @@ export function AgentsSectionContent({
     return result
   }, [draftAgent, estimatedToolContextTokens.perTool, visibleToolGroups])
 
-  const skillEntries = useMemo<LiteSkillEntry[]>(
-    () => listLiteSkillEntries(app, { settings }),
-    [app, settings],
-  )
+  const skillEntries = useLiteSkillEntries(app, { settings })
 
   const disabledSkillIds = useMemo(
     () => settings.skills?.disabledSkillIds ?? [],
     [settings.skills?.disabledSkillIds],
   )
   const skillsDir = getYoloSkillsDir(settings)
-  const disabledSkillIdSet = useMemo(
-    () => getDisabledSkillIdSet(disabledSkillIds),
+  const disabledSkillNameSet = useMemo(
+    () => getDisabledSkillNameSet(disabledSkillIds),
     [disabledSkillIds],
   )
 
   const skillRows = useMemo(() => {
-    return skillEntries.map((skill) => {
-      const globallyDisabled = disabledSkillIdSet.has(skill.id)
-      const policy = resolveAssistantSkillPolicy({
-        assistant: draftAgent,
-        skillId: skill.id,
-        defaultLoadMode: skill.mode,
+    return skillEntries
+      .filter((skill) => !disabledSkillNameSet.has(skill.name))
+      .map((skill) => {
+        const policy = resolveAssistantSkillPolicy({
+          assistant: draftAgent,
+          skillName: skill.name,
+          defaultLoadMode: skill.mode,
+        })
+        return {
+          ...skill,
+          enabled: policy.enabled,
+          loadMode: policy.loadMode,
+        }
       })
-      const enabled = policy.enabled && !globallyDisabled
-      return {
-        ...skill,
-        globallyDisabled,
-        enabled,
-        loadMode: policy.loadMode,
-      }
-    })
-  }, [disabledSkillIdSet, draftAgent, skillEntries])
+  }, [disabledSkillNameSet, draftAgent, skillEntries])
 
   // Same agent-scoped pattern as estimatedToolContextTokens above.
   const [estimatedSkillContextTokens, setEstimatedSkillContextTokens] =
@@ -1074,7 +1146,7 @@ export function AgentsSectionContent({
             app,
             settings,
             skill,
-          }).then((count) => [skill.id, count] as const),
+          }).then((count) => [skill.name, count] as const),
         ),
       )
 
@@ -1304,10 +1376,6 @@ export function AgentsSectionContent({
                     'settings.agent.editorSystemPromptExpand',
                     'Expand editor',
                   )}
-                  title={t(
-                    'settings.agent.editorSystemPromptExpand',
-                    'Expand editor',
-                  )}
                   onClick={() => setIsSystemPromptExpanded(true)}
                 >
                   <Maximize2 size={14} />
@@ -1338,10 +1406,6 @@ export function AgentsSectionContent({
                           type="button"
                           className="clickable-icon yolo-agent-system-prompt-overlay-close"
                           aria-label={t(
-                            'settings.agent.editorSystemPromptCollapse',
-                            'Close editor',
-                          )}
-                          title={t(
                             'settings.agent.editorSystemPromptCollapse',
                             'Close editor',
                           )}
@@ -1378,6 +1442,34 @@ export function AgentsSectionContent({
                   </div>,
                   systemPromptOverlayTarget,
                 )}
+              <ObsidianSetting
+                name={t('settings.agent.focusSyncTitle')}
+                desc={t('settings.agent.focusSyncDesc')}
+              >
+                <ObsidianToggle
+                  value={draftAgent.includeCurrentFileContent !== false}
+                  onChange={(value) => {
+                    setDraftAgent({
+                      ...draftAgent,
+                      includeCurrentFileContent: value,
+                    })
+                  }}
+                />
+              </ObsidianSetting>
+              <ObsidianSetting
+                name={t('settings.agent.timeContextTitle')}
+                desc={t('settings.agent.timeContextDesc')}
+              >
+                <ObsidianToggle
+                  value={draftAgent.timeContextEnabled !== false}
+                  onChange={(value) => {
+                    setDraftAgent({
+                      ...draftAgent,
+                      timeContextEnabled: value,
+                    })
+                  }}
+                />
+              </ObsidianSetting>
               <ObsidianSetting
                 name={t(
                   'settings.agent.editorEnableProjectInstructions',
@@ -1482,16 +1574,77 @@ export function AgentsSectionContent({
                     !group.isBuiltin &&
                     enableToolDisclosure &&
                     group.tools.length > 0
-                  const serverDisclosureMode = showServerDisclosure
-                    ? groupToggleTargets.every(
-                        (target) =>
-                          getAssistantToolDisclosureMode(draftAgent, target, {
-                            enableToolDisclosure,
-                          }) === 'on_demand',
-                      )
-                      ? 'on_demand'
-                      : 'always'
-                    : 'on_demand'
+                  const explicitDisclosureModes = showServerDisclosure
+                    ? groupToggleTargets
+                        .map(
+                          (target) =>
+                            draftAgent.toolPreferences?.[target]
+                              ?.disclosureMode,
+                        )
+                        .filter(
+                          (mode): mode is AssistantToolDisclosureMode =>
+                            mode !== undefined,
+                        )
+                    : []
+                  const explicitDisclosureMode =
+                    explicitDisclosureModes.length ===
+                      groupToggleTargets.length &&
+                    explicitDisclosureModes.every(
+                      (mode) => mode === explicitDisclosureModes[0],
+                    )
+                      ? explicitDisclosureModes[0]
+                      : null
+                  const disclosureSelectionValue =
+                    explicitDisclosureModes.length === 0
+                      ? 'auto'
+                      : (explicitDisclosureMode ?? 'mixed')
+                  const autoDisclosureMode = (() => {
+                    const firstTarget = groupToggleTargets[0]
+                    if (!firstTarget) return null
+                    try {
+                      const { serverName } = parseToolName(firstTarget)
+                      const tokenBudget =
+                        estimatedToolContextTokens.serverToolTokenBudgets.get(
+                          serverName,
+                        )
+                      return tokenBudget === undefined
+                        ? null
+                        : resolveDefaultDisclosureModeForServer(tokenBudget)
+                    } catch {
+                      return null
+                    }
+                  })()
+                  const disclosureModeLabel = (
+                    mode: AssistantToolDisclosureMode,
+                  ) =>
+                    mode === 'on_demand'
+                      ? t('settings.agent.toolDisclosureOnDemand', 'On demand')
+                      : t(
+                          'settings.agent.toolDisclosureAlways',
+                          'Always loaded',
+                        )
+                  const autoDisclosureLabel = `${t(
+                    'settings.agent.toolDisclosureAuto',
+                    'Auto',
+                  )}${
+                    autoDisclosureMode
+                      ? `: ${disclosureModeLabel(autoDisclosureMode)}`
+                      : ''
+                  }`
+                  const autoDisclosureOptionLabel = t(
+                    'settings.agent.toolDisclosureAutoSelect',
+                    'Auto select',
+                  )
+                  const serverDisclosureLabel =
+                    disclosureSelectionValue === 'auto'
+                      ? autoDisclosureLabel
+                      : disclosureSelectionValue === 'mixed'
+                        ? t('settings.agent.toolDisclosureMixed', 'Mixed')
+                        : disclosureModeLabel(disclosureSelectionValue)
+                  const showServerApproval = !group.isBuiltin
+                  const serverApprovalMode: AssistantToolApprovalMode =
+                    draftAgent.toolServerPreferences?.[group.key]
+                      ?.approvalMode ?? 'require_approval'
                   const groupFullyDisabled =
                     !group.isBuiltin &&
                     group.tools.length > 0 &&
@@ -1521,31 +1674,164 @@ export function AgentsSectionContent({
                             </span>
                           )}
                           {showServerDisclosure && (
-                            <button
-                              type="button"
-                              className="yolo-agent-tool-group-disclosure"
-                              onClick={() =>
-                                setToolDisclosureMode(
-                                  groupToggleTargets,
-                                  serverDisclosureMode === 'on_demand'
-                                    ? 'always'
-                                    : 'on_demand',
-                                )
-                              }
-                            >
-                              {serverDisclosureMode === 'on_demand'
-                                ? t(
-                                    'settings.agent.toolDisclosureOnDemand',
-                                    'On demand',
-                                  )
-                                : t(
-                                    'settings.agent.toolDisclosureAlways',
-                                    'Always loaded',
-                                  )}
-                            </button>
+                            <DropdownMenu.Root>
+                              <DropdownMenu.Trigger asChild>
+                                <button
+                                  type="button"
+                                  className="yolo-agent-tool-group-disclosure"
+                                >
+                                  <span>{serverDisclosureLabel}</span>
+                                  <ChevronDown size={12} aria-hidden="true" />
+                                </button>
+                              </DropdownMenu.Trigger>
+                              <DropdownMenu.Portal>
+                                <DropdownMenu.Content
+                                  className="yolo-simple-select__content"
+                                  side="bottom"
+                                  align="center"
+                                  sideOffset={6}
+                                  collisionPadding={10}
+                                  loop
+                                  onCloseAutoFocus={(event) => {
+                                    event.preventDefault()
+                                  }}
+                                >
+                                  <DropdownMenu.RadioGroup
+                                    className="yolo-simple-select__list"
+                                    value={disclosureSelectionValue}
+                                    onValueChange={(nextValue) => {
+                                      if (nextValue === 'auto') {
+                                        clearToolDisclosureMode(
+                                          groupToggleTargets,
+                                        )
+                                        return
+                                      }
+                                      if (
+                                        nextValue === 'always' ||
+                                        nextValue === 'on_demand'
+                                      ) {
+                                        setToolDisclosureMode(
+                                          groupToggleTargets,
+                                          nextValue,
+                                        )
+                                      }
+                                    }}
+                                  >
+                                    <DropdownMenu.RadioItem
+                                      className="yolo-simple-select__item"
+                                      value="auto"
+                                    >
+                                      <div className="yolo-simple-select__item-text">
+                                        <div className="yolo-simple-select__item-label">
+                                          {autoDisclosureOptionLabel}
+                                        </div>
+                                      </div>
+                                      <DropdownMenu.ItemIndicator className="yolo-simple-select__item-indicator">
+                                        <Check size={12} />
+                                      </DropdownMenu.ItemIndicator>
+                                    </DropdownMenu.RadioItem>
+                                    <DropdownMenu.RadioItem
+                                      className="yolo-simple-select__item"
+                                      value="always"
+                                    >
+                                      <div className="yolo-simple-select__item-text">
+                                        <div className="yolo-simple-select__item-label">
+                                          {disclosureModeLabel('always')}
+                                        </div>
+                                      </div>
+                                      <DropdownMenu.ItemIndicator className="yolo-simple-select__item-indicator">
+                                        <Check size={12} />
+                                      </DropdownMenu.ItemIndicator>
+                                    </DropdownMenu.RadioItem>
+                                    <DropdownMenu.RadioItem
+                                      className="yolo-simple-select__item"
+                                      value="on_demand"
+                                    >
+                                      <div className="yolo-simple-select__item-text">
+                                        <div className="yolo-simple-select__item-label">
+                                          {disclosureModeLabel('on_demand')}
+                                        </div>
+                                      </div>
+                                      <DropdownMenu.ItemIndicator className="yolo-simple-select__item-indicator">
+                                        <Check size={12} />
+                                      </DropdownMenu.ItemIndicator>
+                                    </DropdownMenu.RadioItem>
+                                  </DropdownMenu.RadioGroup>
+                                </DropdownMenu.Content>
+                              </DropdownMenu.Portal>
+                            </DropdownMenu.Root>
                           )}
                         </span>
                         <span className="yolo-agent-tool-group-meta">
+                          {showServerApproval && (
+                            <DropdownMenu.Root>
+                              <DropdownMenu.Trigger asChild>
+                                <button
+                                  type="button"
+                                  className="yolo-agent-tool-group-disclosure yolo-agent-tool-group-approval-trigger"
+                                >
+                                  <span>
+                                    {serverApprovalMode === 'full_access'
+                                      ? t(
+                                          'settings.agent.toolApprovalFullAccess',
+                                          'Full access',
+                                        )
+                                      : t(
+                                          'settings.agent.toolApprovalRequire',
+                                          'Require approval',
+                                        )}
+                                  </span>
+                                  <ChevronDown size={12} aria-hidden="true" />
+                                </button>
+                              </DropdownMenu.Trigger>
+                              <DropdownMenu.Portal>
+                                <DropdownMenu.Content
+                                  className="yolo-simple-select__content"
+                                  side="bottom"
+                                  align="center"
+                                  sideOffset={6}
+                                  collisionPadding={10}
+                                  loop
+                                  onCloseAutoFocus={(event) => {
+                                    event.preventDefault()
+                                  }}
+                                >
+                                  <DropdownMenu.RadioGroup
+                                    className="yolo-simple-select__list"
+                                    value={serverApprovalMode}
+                                    onValueChange={(nextValue) => {
+                                      if (
+                                        nextValue === 'full_access' ||
+                                        nextValue === 'require_approval'
+                                      ) {
+                                        setServerApprovalMode(
+                                          group.key,
+                                          nextValue,
+                                        )
+                                      }
+                                    }}
+                                  >
+                                    {toolApprovalOptions.map((option) => (
+                                      <DropdownMenu.RadioItem
+                                        key={option.value}
+                                        className="yolo-simple-select__item"
+                                        value={option.value}
+                                      >
+                                        <div className="yolo-simple-select__item-text">
+                                          <div className="yolo-simple-select__item-label">
+                                            {option.label}
+                                          </div>
+                                        </div>
+                                        <DropdownMenu.ItemIndicator className="yolo-simple-select__item-indicator">
+                                          <Check size={12} />
+                                        </DropdownMenu.ItemIndicator>
+                                      </DropdownMenu.RadioItem>
+                                    ))}
+                                  </DropdownMenu.RadioGroup>
+                                </DropdownMenu.Content>
+                              </DropdownMenu.Portal>
+                            </DropdownMenu.Root>
+                          )}
                           <span className="yolo-agent-tool-group-count">
                             {`${groupEnabledCount} / ${group.tools.length} ${t(
                               'settings.agent.toolsActive',
@@ -1583,33 +1869,17 @@ export function AgentsSectionContent({
                               (target) =>
                                 isAssistantToolEnabled(draftAgent, target),
                             )
-                            const approvalMode = tool.toggleTargets.every(
-                              (target) =>
-                                getAssistantToolApprovalMode(
-                                  draftAgent,
-                                  target,
-                                  {
-                                    jsSandboxSettings:
-                                      getJsSandboxSettings(settings),
-                                  },
-                                ) === 'full_access',
-                            )
-                              ? 'full_access'
-                              : 'require_approval'
-                            // When JS isolated execution has any sensitive
-                            // capability enabled in the global settings,
-                            // `getAssistantToolApprovalMode` forces
-                            // require_approval regardless of the saved
-                            // preference. Surface that lock in the UI as a
-                            // read-only badge instead of a stale dropdown.
-                            const approvalLocked =
-                              hasAnyJsSandboxCapEnabled(
-                                getJsSandboxSettings(settings),
-                              ) &&
-                              tool.toggleTargets.some(
-                                (target) => target === jsSandboxFullToolName,
+                            const approvalMode =
+                              group.isBuiltin &&
+                              tool.toggleTargets.every(
+                                (target) =>
+                                  getAssistantToolApprovalMode(
+                                    draftAgent,
+                                    target,
+                                  ) === 'full_access',
                               )
-
+                                ? 'full_access'
+                                : 'require_approval'
                             return (
                               <div
                                 key={tool.fullName}
@@ -1624,30 +1894,21 @@ export function AgentsSectionContent({
                                   </div>
                                 </div>
                                 <div className="yolo-agent-tool-controls">
-                                  {selected && (
+                                  {group.isBuiltin && selected && (
                                     <>
                                       <div className="yolo-agent-tool-select">
-                                        {approvalLocked ? (
-                                          <span className="yolo-agent-tool-forced-approval">
-                                            {t(
-                                              'settings.agent.toolApprovalForced',
-                                              'Approval required',
-                                            )}
-                                          </span>
-                                        ) : (
-                                          <SimpleSelect
-                                            value={approvalMode}
-                                            options={toolApprovalOptions}
-                                            onChange={(value) =>
-                                              setToolApprovalMode(
-                                                tool.toggleTargets,
-                                                value as AssistantToolApprovalMode,
-                                              )
-                                            }
-                                            align="end"
-                                            contentClassName="yolo-agent-tool-select-menu"
-                                          />
-                                        )}
+                                        <SimpleSelect
+                                          value={approvalMode}
+                                          options={toolApprovalOptions}
+                                          onChange={(value) =>
+                                            setToolApprovalMode(
+                                              tool.toggleTargets,
+                                              value as AssistantToolApprovalMode,
+                                            )
+                                          }
+                                          align="end"
+                                          contentClassName="yolo-agent-tool-select-menu"
+                                        />
                                       </div>
                                     </>
                                   )}
@@ -1725,15 +1986,14 @@ export function AgentsSectionContent({
                 {skillRows.length > 0 ? (
                   <div className="yolo-agent-tool-list">
                     {skillRows.map((skill) => {
-                      const disabledByGlobal = skill.globallyDisabled
                       return (
-                        <div key={skill.id} className="yolo-agent-tool-row">
+                        <div key={skill.name} className="yolo-agent-tool-row">
                           <div className="yolo-agent-tool-main">
                             <div className="yolo-agent-tool-name">
-                              <span>{skill.name}</span>
+                              <span>{humanizeSkillName(skill.name)}</span>
                               {skill.enabled &&
                                 estimatedSkillContextTokens.perSkill.has(
-                                  skill.id,
+                                  skill.name,
                                 ) && (
                                   <span className="yolo-agent-skill-tokens">
                                     {t(
@@ -1743,7 +2003,7 @@ export function AgentsSectionContent({
                                       '{count}',
                                       formatTokenCount(
                                         estimatedSkillContextTokens.perSkill.get(
-                                          skill.id,
+                                          skill.name,
                                         ) ?? 0,
                                       ),
                                     )}
@@ -1755,37 +2015,26 @@ export function AgentsSectionContent({
                             </div>
                             <div className="yolo-agent-skill-meta">
                               <span className="yolo-agent-chip">
-                                id: {skill.id}
+                                name: {skill.name}
                               </span>
                               <span className="yolo-agent-chip">
                                 {skill.path}
                               </span>
-                              {disabledByGlobal && (
-                                <span className="yolo-agent-chip">
-                                  {t(
-                                    'settings.agent.skillDisabledGlobally',
-                                    'Disabled globally',
-                                  )}
-                                </span>
-                              )}
                             </div>
                           </div>
                           <div className="yolo-agent-skill-controls">
                             <ObsidianToggle
                               value={skill.enabled}
-                              onChange={(value) => {
-                                if (disabledByGlobal) {
-                                  return
-                                }
-                                setSkillEnabled(skill.id, value)
-                              }}
+                              onChange={(value) =>
+                                setSkillEnabled(skill.name, value)
+                              }
                             />
                             <select
                               value={skill.loadMode}
-                              disabled={!skill.enabled || disabledByGlobal}
+                              disabled={!skill.enabled}
                               onChange={(event) =>
                                 setSkillLoadMode(
-                                  skill.id,
+                                  skill.name,
                                   event.target.value as AssistantSkillLoadMode,
                                 )
                               }

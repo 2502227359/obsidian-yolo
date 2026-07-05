@@ -17,7 +17,6 @@ import {
   readMultipleTFiles,
   readTFileContent,
 } from '../../../utils/obsidian'
-import { resolvePromptVariables } from '../../../utils/prompt/promptVariables'
 
 type WriteAssistDeps = {
   app: App
@@ -167,7 +166,7 @@ export class WriteAssistController {
         model,
         request: rewriteRequestBase,
         signal: controller.signal,
-        stream: streamPreference,
+        deliveryMode: streamPreference ? 'incremental' : 'buffered',
         primaryRequestTimeoutMs:
           settings.continuationOptions.primaryRequestTimeoutMs,
         streamFallbackRecoveryEnabled:
@@ -394,9 +393,7 @@ export class WriteAssistController {
         ? `Instruction:\n${userInstruction}\n\n`
         : ''
 
-      const systemPrompt = resolvePromptVariables(
-        settings.systemPrompt ?? '',
-      ).trim()
+      const systemPrompt = (settings.systemPrompt ?? '').trim()
 
       const activeFileForTitle = this.deps.app.workspace.getActiveFile()
       const fileTitle = activeFileForTitle?.basename?.trim() ?? ''
@@ -542,7 +539,7 @@ export class WriteAssistController {
         model,
         request: baseRequest,
         signal: controller.signal,
-        stream: streamPreference,
+        deliveryMode: streamPreference ? 'incremental' : 'buffered',
         primaryRequestTimeoutMs:
           settings.continuationOptions.primaryRequestTimeoutMs,
         streamFallbackRecoveryEnabled:

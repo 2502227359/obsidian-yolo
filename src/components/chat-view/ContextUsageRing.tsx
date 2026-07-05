@@ -52,7 +52,14 @@ export type ContextUsageRingProps = {
  */
 const ContextUsageRing = forwardRef<HTMLButtonElement, ContextUsageRingProps>(
   function ContextUsageRing(
-    { promptTokens, maxContextTokens, label, className, title, ...rest },
+    {
+      promptTokens,
+      maxContextTokens,
+      label,
+      className,
+      title: _title,
+      ...rest
+    },
     ref,
   ) {
     const { t } = useLanguage()
@@ -86,7 +93,6 @@ const ContextUsageRing = forwardRef<HTMLButtonElement, ContextUsageRingProps>(
         data-tone={tone}
         data-has-max={hasMax ? 'true' : 'false'}
         aria-label={titleLabel}
-        title={title ?? titleLabel}
       >
         <svg
           className="yolo-context-usage-ring__svg"

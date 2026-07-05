@@ -21,8 +21,9 @@ import {
   getLocalFileTools,
 } from '../../../core/mcp/localFileTools'
 import { McpManager } from '../../../core/mcp/mcpManager'
-import { listLiteSkillEntries } from '../../../core/skills/liteSkills'
+import { humanizeSkillName } from '../../../core/skills/liteSkills'
 import { isSkillEnabledForAssistant } from '../../../core/skills/skillPolicy'
+import { useLiteSkillEntries } from '../../../hooks/useLiteSkillEntries'
 import { Assistant } from '../../../types/assistant.types'
 import { McpServerState, McpServerStatus } from '../../../types/mcp.types'
 import { renderAssistantIcon } from '../../../utils/assistant-icon'
@@ -35,7 +36,6 @@ import { AgentToolsModal } from '../modals/AgentToolsModal'
 import { AssistantsModal } from '../modals/AssistantsModal'
 
 import { AgentAutoContextCompactionSection } from './AgentAutoContextCompactionSection'
-import { AgentFocusSyncSection } from './AgentFocusSyncSection'
 import { AgentImageReadingSection } from './AgentImageReadingSection'
 import { NotificationSettingsSection } from './NotificationSettingsSection'
 
@@ -56,9 +56,11 @@ export function AgentSection({ app }: AgentSectionProps) {
   const assistants = settings.assistants || []
   const [mcpManager, setMcpManager] = useState<McpManager | null>(null)
   const [mcpServers, setMcpServers] = useState<McpServerState[]>([])
+  const [mcpManagerLoading, setMcpManagerLoading] = useState(true)
 
   useEffect(() => {
     let isMounted = true
+    setMcpManagerLoading(true)
     void plugin
       .getMcpManager()
       .then((manager) => {
@@ -67,8 +69,12 @@ export function AgentSection({ app }: AgentSectionProps) {
         }
         setMcpManager(manager)
         setMcpServers(manager.getServers())
+        setMcpManagerLoading(false)
       })
       .catch((error: unknown) => {
+        if (isMounted) {
+          setMcpManagerLoading(false)
+        }
         console.error(
           'Failed to initialize MCP manager in Agent section',
           error,
@@ -267,11 +273,11 @@ export function AgentSection({ app }: AgentSectionProps) {
       enabled: webSplitToolEnabled,
     }
 
-    const openSkillIndex = tools.findIndex((tool) => tool.id === 'open_skill')
-    if (openSkillIndex >= 0) {
-      tools.splice(openSkillIndex, 0, fileOpsTool)
-      tools.splice(openSkillIndex + 1, 0, memoryOpsTool)
-      tools.splice(openSkillIndex + 2, 0, webOpsTool)
+    const fsReadIndex = tools.findIndex((tool) => tool.id === 'fs_read')
+    if (fsReadIndex >= 0) {
+      tools.splice(fsReadIndex, 0, fileOpsTool)
+      tools.splice(fsReadIndex + 1, 0, memoryOpsTool)
+      tools.splice(fsReadIndex + 2, 0, webOpsTool)
     } else {
       tools.push(fileOpsTool)
       tools.push(memoryOpsTool)
@@ -281,17 +287,14 @@ export function AgentSection({ app }: AgentSectionProps) {
     return tools
   }, [settings.mcp.builtinToolOptions, t])
 
-  const allSkillEntries = useMemo(
-    () => listLiteSkillEntries(app, { settings }),
-    [app, settings],
-  )
+  const allSkillEntries = useLiteSkillEntries(app, { settings })
   const disabledSkillIds = settings.skills?.disabledSkillIds ?? []
   const disabledSkillSet = useMemo(
     () => new Set(disabledSkillIds),
     [disabledSkillIds],
   )
   const globallyEnabledSkillEntries = useMemo(
-    () => allSkillEntries.filter((skill) => !disabledSkillSet.has(skill.id)),
+    () => allSkillEntries.filter((skill) => !disabledSkillSet.has(skill.name)),
     [allSkillEntries, disabledSkillSet],
   )
 
@@ -312,6 +315,32 @@ export function AgentSection({ app }: AgentSectionProps) {
   )
     .replace('{count}', String(builtinTools.length + mcpTools.length))
     .replace('{enabled}', String(enabledToolsCount))
+
+  const enabledConfiguredMcpServerCount = settings.mcp.servers.filter(
+    (server) => server.enabled,
+  ).length
+  const mcpLoadingCount = mcpManagerLoading
+    ? enabledConfiguredMcpServerCount
+    : mcpServers.filter(
+        (server) => server.status === McpServerStatus.Connecting,
+      ).length
+  const mcpErrorCount = mcpServers.filter(
+    (server) => server.status === McpServerStatus.Error,
+  ).length
+  const mcpToolStatusLabels = [
+    mcpLoadingCount > 0
+      ? t('settings.agent.mcpLoadingStatus', 'Loading {count} MCP...').replace(
+          '{count}',
+          String(mcpLoadingCount),
+        )
+      : null,
+    mcpErrorCount > 0
+      ? t(
+          'settings.agent.mcpErrorStatus',
+          '{count} MCP failed to connect',
+        ).replace('{count}', String(mcpErrorCount))
+      : null,
+  ].filter((label): label is string => Boolean(label))
 
   const mcpCountLabel = t(
     'settings.agent.mcpServerCount',
@@ -344,7 +373,7 @@ export function AgentSection({ app }: AgentSectionProps) {
       <div className="yolo-settings-desc yolo-agent-intro">
         {t(
           'settings.agent.desc',
-          'Manage global capabilities and configure your agents.',
+          'Manage global tool availability. Enabled tools become selectable by agents; actual use must still be enabled in each agent.',
         )}
       </div>
 
@@ -371,7 +400,14 @@ export function AgentSection({ app }: AgentSectionProps) {
                 {t('settings.agent.manageTools', 'Manage tools')}
               </button>
             </div>
-            <div className="yolo-agent-cap-count">{toolsCountLabel}</div>
+            <div className="yolo-agent-cap-count">
+              <span>{toolsCountLabel}</span>
+              {mcpToolStatusLabels.map((label) => (
+                <span key={label} className="yolo-agent-cap-status">
+                  {label}
+                </span>
+              ))}
+            </div>
             <div className="yolo-agent-cap-tags">
               {visibleToolTags.map((tool) => (
                 <span
@@ -413,11 +449,11 @@ export function AgentSection({ app }: AgentSectionProps) {
             <div className="yolo-agent-cap-tags">
               {visibleSkillEntries.map((skill) => (
                 <span
-                  key={skill.id}
+                  key={skill.name}
                   className="yolo-agent-chip"
                   title={skill.name}
                 >
-                  {skill.name}
+                  {humanizeSkillName(skill.name)}
                 </span>
               ))}
               {hiddenSkillEntriesCount > 0 && (
@@ -572,8 +608,8 @@ export function AgentSection({ app }: AgentSectionProps) {
                     allSkillEntries.filter((skill) =>
                       isSkillEnabledForAssistant({
                         assistant,
-                        skillId: skill.id,
-                        disabledSkillIds,
+                        skillName: skill.name,
+                        disabledSkillNames: disabledSkillIds,
                       }),
                     ).length
                   } skills`}
@@ -609,7 +645,6 @@ export function AgentSection({ app }: AgentSectionProps) {
             {t('settings.agent.agentCapabilitiesBlockTitle')}
           </div>
         </div>
-        <AgentFocusSyncSection />
         <div className="yolo-agent-sub-card">
           <div className="yolo-agent-sub-card-head">
             {t('settings.agent.imageReadingBlockTitle')}

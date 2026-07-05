@@ -3,7 +3,10 @@
   Agent-native AI assistant for Obsidian — chat, write, knowledge base, and orchestration, all in one place.
 </p>
 
-<p align="center"><a href="https://github.com/Lapis0x0/obsidian-yolo/stargazers">
+<p align="center"><a href="https://github.com/Lapis0x0/obsidian-yolo/commits/main">
+    <img src="https://img.shields.io/github/last-commit/Lapis0x0/obsidian-yolo/main?style=flat-square&color=6c5ce7" alt="Last Commit">
+  </a>
+  <a href="https://github.com/Lapis0x0/obsidian-yolo/stargazers">
     <img src="https://img.shields.io/github/stars/Lapis0x0/obsidian-yolo?style=flat-square&color=6c5ce7" alt="GitHub Stars">
   </a>
   <a href="https://github.com/Lapis0x0/obsidian-yolo/releases/latest">
@@ -23,13 +26,7 @@
 
 ## What's New
 
-- `1.5.7`: YOLO can now sense what you're reading—focus sync keeps the AI aware of your current file and position, with deep PDF support for vision reading, selection sync, and region screenshots.
-- `1.5.6`: Built-in web search is here—Agents can now browse the internet directly, with multiple search providers and unified web scraping.
-- `1.5.5`: Refreshed knowledge-base foundations with fully upgraded hybrid search and indexing—and smarter, more relevant results.
-- `1.5.4`: Built for long chats and complex tasks: smarter context pruning and compression, multi-model branches, a virtualized chat timeline, and automatic compression to keep agents running smoothly.
-- `1.5.3`: Native multi-window chat plus background Agents—automation that stays out of your way.
-- `1.5.2`: The new memory system is now live, allowing YOLO to more naturally remember your preferences, habits, and long-term context across conversations.
-- `1.5.1`: YOLO introduced an all-new Agent mode, turning AI from a chat assistant into something that can call tools, organize steps, and actively help get real work done.
+- **`1.5`**: Introduces a new Agent runtime that turns AI from Q&A into active collaboration—with full tool calling, MCP, Skills, desktop Bash, subagents, and web search—plus smarter long-session context and memory, refreshed hybrid RAG, focus/PDF awareness, and multi-window chat with background Agents.
 
 ## Highlights
 
@@ -100,17 +97,35 @@ If you use YOLO on mobile, you may still encounter unavailable features, inconsi
 ## Roadmap
 
 - [x] Better and stronger Vault AI search
-- [ ] Background Agent (long-running task automation)
-- [ ] Cron scheduled tasks
-- [ ] Multi-Agent orchestration
-- [ ] Learning Mode
+- [x] Background Agent (long-running task automation)
+- [x] Multi-Agent orchestration (via subagents)
+- [ ] Learning Mode — a dedicated study view
+- [ ] Annotation Mode — real-time AI annotations and suggestions on notes
+- [ ] Built-in assistant — a corner-pinned helper for config/agents, with auto-compaction and scheduled tasks
 - [ ] Better AI whiteboard
+- [ ] Voice input & meeting notes
+
+## Feedback & Issues
+
+Hit a bug, something confusing, or have an idea? Open an issue:
+
+🐛 [Report a bug](https://github.com/Lapis0x0/obsidian-yolo/issues/new?template=bug_report.yml) · ✨ [Request a feature](https://github.com/Lapis0x0/obsidian-yolo/issues/new?template=feature_request.yml)
+
+What helps:
+
+- Bug reports with a clear reproduction (Obsidian version, OS, plugin version, what you did, what happened)
+- "I tried X and got Y" reports — UX papercuts, confusing wording, broken docs, outdated translations
+- Concrete feature ideas tied to a real use case ("when I do A, I want B because C")
+
+Please search existing issues first to avoid duplicates.
 
 ## Contributing
 
 All forms of contribution are welcome — bug reports, documentation improvements, feature enhancements.
 
 **Please open an issue first to discuss feasibility and implementation for major features.**
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full guide: what we welcome, AI-assisted PR policy, size guidelines, and dev setup.
 
 ## Acknowledgments
 

@@ -7,6 +7,7 @@ import {
   ChatMessage,
 } from '../../types/chat'
 import { ChatModel } from '../../types/chat-model.types'
+import type { RequestMessage, RequestTool } from '../../types/llm/request'
 import { LLMProvider, LLMProviderApiType } from '../../types/provider.types'
 import {
   ReasoningLevel,
@@ -24,6 +25,7 @@ import {
   registerLLMDebugTraceForTurn,
   updateLLMDebugTrace,
 } from '../llm/debugCapture'
+import type { ResponseDeliveryMode } from '../llm/responseDeliveryMode'
 import {
   LOCAL_FILE_TOOL_SHORT_NAMES,
   getLocalFileToolServerName,
@@ -50,12 +52,11 @@ type AgentLlmTurnExecutorInput = {
   allowedToolNames?: string[]
   enableToolDisclosure?: boolean
   toolPreferences?: Record<string, AssistantToolPreference>
-  allowedSkillIds?: string[]
-  allowedSkillNames?: string[]
+  allowedSkillPaths?: string[]
   abortSignal?: AbortSignal
   reasoningLevel?: ReasoningLevel
   requestParams?: {
-    stream?: boolean
+    deliveryMode?: ResponseDeliveryMode
     temperature?: number
     top_p?: number
     max_tokens?: number
@@ -63,10 +64,13 @@ type AgentLlmTurnExecutorInput = {
     streamFallbackRecoveryEnabled?: boolean
   }
   contextualInjections?: ContextualInjection[]
+  runtimeModePrompt?: string
+  transientRequestMessages?: RequestMessage[]
   geminiTools?: {
     useWebSearch?: boolean
     useUrlContext?: boolean
   }
+  systemPromptOverride?: string
   onAssistantMessage: (message: ChatAssistantMessage) => void
 }
 
@@ -75,6 +79,20 @@ type AgentLlmTurnExecutorOutput = {
   toolCallRequests: ToolCallRequest[]
   hasAssistantOutput: boolean
   debugTraceId?: string
+  /**
+   * The provider-ready prefix actually sent to the model this turn, plus the
+   * exact tools block. The compaction bypass reuses these byte-for-byte so its
+   * out-of-band summarize request hits the same cache-warm prefix.
+   */
+  requestMessages: RequestMessage[]
+  requestTools: RequestTool[] | undefined
+  /**
+   * The resolved reasoning level actually applied this turn. Replayed by the
+   * compaction bypass so its request carries the same thinking config — without
+   * it, Anthropic's cache key (which includes thinking config) would mismatch
+   * and the cache-warm prefix would not hit.
+   */
+  requestReasoning: ReasoningLevel | undefined
 }
 
 export class AgentLlmTurnExecutor {
@@ -99,39 +117,50 @@ export class AgentLlmTurnExecutor {
     const {
       hasTools,
       hasMemoryTools,
+      hasOnDemandTools,
       requestTools: tools,
-    } = selectAllowedTools({
+    } = await selectAllowedTools({
       availableTools,
       allowedToolNames: this.input.allowedToolNames,
-      allowedSkillIds: this.input.allowedSkillIds,
-      allowedSkillNames: this.input.allowedSkillNames,
       toolPreferences: this.input.toolPreferences,
       apiType: this.input.apiType,
       enableToolDisclosure: this.input.enableToolDisclosure,
       jsSandboxSettings: this.input.mcpManager.getJsSandboxSettings(),
+      settings: this.input.mcpManager.getSettingsSnapshot(),
     })
-    const requestMessages =
+    const baseRequestMessages =
       await this.input.requestContextBuilder.generateRequestMessages({
         messages: this.input.messages,
         hasTools,
         hasMemoryTools,
+        hasOnDemandTools,
         model: this.input.model,
         conversationId: this.input.conversationId,
         compaction: this.input.compaction,
         contextualInjections: this.input.contextualInjections,
+        runtimeModePrompt: this.input.runtimeModePrompt,
+        systemPromptOverride: this.input.systemPromptOverride,
+        // Real LLM request: freeze (or reuse) the per-conversation system prompt.
+        systemPromptSnapshotMode: 'create',
       })
+    const requestMessages =
+      this.input.transientRequestMessages &&
+      this.input.transientRequestMessages.length > 0
+        ? [...baseRequestMessages, ...this.input.transientRequestMessages]
+        : baseRequestMessages
 
     const responseStart = Date.now()
     const model = this.input.model
+    const deliveryMode = this.input.requestParams?.deliveryMode ?? 'incremental'
+    const executionMode =
+      this.input.providerClient.resolveResponseExecutionMode(deliveryMode)
     const assistantMessageId = uuidv4()
     const debugTrace = isLLMDebugCaptureEnabled()
       ? createLLMDebugTrace({
           assistantMessageId,
           model,
           requestKind:
-            this.input.requestParams?.stream === false
-              ? 'non-streaming'
-              : 'streaming',
+            executionMode === 'non-streaming' ? 'non-streaming' : 'streaming',
         })
       : null
     if (debugTrace && this.input.sourceUserMessageId) {
@@ -160,8 +189,9 @@ export class AgentLlmTurnExecutor {
     this.input.onAssistantMessage(assistantMessage)
 
     let turnResult: Awaited<ReturnType<typeof executeSingleTurn>>
+    let requestReasoning: ReasoningLevel | undefined
     try {
-      const resolvedReasoning = resolveRequestReasoningLevel(
+      requestReasoning = resolveRequestReasoningLevel(
         this.input.model,
         this.input.reasoningLevel,
       )
@@ -174,13 +204,13 @@ export class AgentLlmTurnExecutor {
           temperature: this.input.requestParams?.temperature,
           top_p: this.input.requestParams?.top_p,
           max_tokens: this.input.requestParams?.max_tokens,
-          ...(resolvedReasoning !== undefined
-            ? { reasoningLevel: resolvedReasoning }
+          ...(requestReasoning !== undefined
+            ? { reasoningLevel: requestReasoning }
             : {}),
         },
         tools,
         signal: this.input.abortSignal,
-        stream: this.input.requestParams?.stream ?? true,
+        deliveryMode,
         primaryRequestTimeoutMs:
           this.input.requestParams?.primaryRequestTimeoutMs,
         streamFallbackRecoveryEnabled:
@@ -260,11 +290,11 @@ export class AgentLlmTurnExecutor {
       throw error
     }
 
-    if (!this.input.requestParams?.stream) {
+    if (!assistantMessage.content && turnResult.content) {
       assistantMessage.content = turnResult.content
+    }
+    if (!assistantMessage.reasoning && turnResult.reasoning) {
       assistantMessage.reasoning = turnResult.reasoning
-    } else if (!assistantMessage.content && turnResult.content) {
-      assistantMessage.content = turnResult.content
     }
 
     assistantMessage.annotations = turnResult.annotations
@@ -302,6 +332,9 @@ export class AgentLlmTurnExecutor {
       toolCallRequests,
       hasAssistantOutput: assistantMessage.content.trim().length > 0,
       debugTraceId: debugTrace?.id,
+      requestMessages,
+      requestTools: tools,
+      requestReasoning,
     }
   }
 

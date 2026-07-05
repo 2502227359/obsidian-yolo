@@ -9,9 +9,11 @@ import { ReasoningLevel } from '../../types/reasoning'
 import type { ContextualInjection } from '../../utils/chat/contextual-injections'
 import { RequestContextBuilder } from '../../utils/chat/requestContextBuilder'
 import { BaseLLMProvider } from '../llm/base'
+import type { ResponseDeliveryMode } from '../llm/responseDeliveryMode'
 import { McpManager } from '../mcp/mcpManager'
 
 import type { CitationRegistry } from './citationRegistry'
+import type { AutoContextCompactionChatOptions } from './compaction'
 
 export type AgentRunContext = {
   citationRegistry: CitationRegistry
@@ -44,12 +46,10 @@ export type AgentRuntimeRunInput = {
   requestContextBuilder: RequestContextBuilder
   mcpManager: McpManager
   compaction?: ChatConversationCompactionLike | null
-  compactionProviderClient?: BaseLLMProvider<LLMProvider>
-  compactionModel?: ChatModel
   abortSignal?: AbortSignal
   reasoningLevel?: ReasoningLevel
   requestParams?: {
-    stream?: boolean
+    deliveryMode?: ResponseDeliveryMode
     temperature?: number
     top_p?: number
     max_tokens?: number
@@ -66,17 +66,27 @@ export type AgentRuntimeRunInput = {
       disclosureMode?: 'always' | 'on_demand'
     }
   >
+  toolServerPreferences?: Record<
+    string,
+    {
+      approvalMode?: 'full_access' | 'require_approval'
+    }
+  >
   workspaceScope?: {
     enabled: boolean
     include: string[]
     exclude: string[]
   }
-  allowedSkillIds?: string[]
-  allowedSkillNames?: string[]
+  allowedSkillPaths?: string[]
   contextualInjections?: ContextualInjection[]
+  runtimeModePrompt?: string
   geminiTools?: {
     useWebSearch?: boolean
     useUrlContext?: boolean
+  }
+  autoContextCompaction?: {
+    chatOptions: AutoContextCompactionChatOptions
+    maxContextTokens?: number
   }
   /**
    * Optional hook called at every `llm_request` boundary inside the runtime
@@ -93,6 +103,17 @@ export type AgentRuntimeRunInput = {
    * collects fs_search hits across multiple tool calls).
    */
   runContext?: AgentRunContext
+  /** Isolated subagent runs: replace the normal system prompt assembly. */
+  systemPromptOverride?: string
+  /** Conversation whose approval state should be used for tool auto-execution. */
+  toolApprovalConversationId?: string
+  /** Terminal command prefixes rejected before execution or approval. */
+  blockedCommandPrefixes?: string[]
+  /**
+   * When true, auto-execute all allowed tools without per-tool approval.
+   * Dangerous command prefix blocklist and global tool enable gates still apply.
+   */
+  bypassToolApproval?: boolean
 }
 
 export type AgentRuntimeLoopConfig = {
@@ -117,6 +138,7 @@ export type AgentWorkerInbound =
       type: 'tool_result'
       runId: string
       hasPendingTools: boolean
+      forceStopReason?: 'repeated_tool_failure'
     }
   | {
       type: 'abort'
@@ -136,7 +158,11 @@ export type AgentWorkerOutbound =
   | {
       type: 'done'
       runId: string
-      reason: 'completed' | 'max_iterations' | 'aborted'
+      reason:
+        | 'completed'
+        | 'max_iterations'
+        | 'repeated_tool_failure'
+        | 'aborted'
     }
   | {
       type: 'error'

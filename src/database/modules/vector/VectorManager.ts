@@ -5,13 +5,13 @@ import { minimatch } from 'minimatch'
 import { App, TFile } from 'obsidian'
 
 import { IndexProgress } from '../../../components/chat-view/QueryProgress'
-import { ErrorModal } from '../../../components/modals/ErrorModal'
+import { getYoloBaseDir } from '../../../core/paths/yoloPaths'
 import {
-  LLMAPIKeyInvalidException,
-  LLMAPIKeyNotSetException,
-  LLMBaseUrlNotSetException,
-} from '../../../core/llm/exception'
-import { isTransientRagIndexError } from '../../../core/rag/ragIndexErrors'
+  RagIndexFailureKind,
+  RagIndexIncompleteError,
+  classifyRagIndexError,
+  isTransientRagIndexError,
+} from '../../../core/rag/ragIndexErrors'
 import {
   type DesiredChunk,
   type ReconcileScope,
@@ -48,6 +48,13 @@ export type ReconcileConfig = {
   chunkSize: number
   includePatterns: string[]
   excludePatterns: string[]
+  /**
+   * When true, files under the plugin's YOLO base directory (resolved from
+   * `settings.yolo.baseDir`) are excluded from indexing in addition to
+   * `excludePatterns`. Path resolution is dynamic per call; toggling
+   * `yolo.baseDir` updates the filter without any settings migration.
+   */
+  excludeYoloBaseDir?: boolean
   /** When false, PDFs are excluded from the desired set (and existing PDF rows are removed). */
   indexPdf: boolean
   /**
@@ -67,6 +74,23 @@ export type ReconcileOptions = {
   onProgress?: (progress: IndexProgress) => void
 }
 
+/**
+ * Structured outcome of a reconcile pass. Hard failures still throw; this only
+ * carries the soft (non-throwing) per-file failures so the UI layer can decide
+ * how to surface them by trigger.
+ *
+ * - `permanentFailedPaths`: files whose embedding failed permanently (e.g. 400
+ *   bad request). Their successful chunks are kept; they are NOT retried
+ *   automatically → need user intervention.
+ * - `chunkifyFailedPaths`: files that failed to chunkify (e.g. transient I/O).
+ *   Excluded from the diff, old index preserved, mtime not advanced → self-heals
+ *   on the next reconcile.
+ */
+export type ReconcileResult = {
+  permanentFailedPaths: string[]
+  chunkifyFailedPaths: string[]
+}
+
 export class VectorManager {
   private app: App
   private repository: VectorRepository
@@ -74,23 +98,27 @@ export class VectorManager {
   private vacuumCallback: (() => Promise<void>) | null = null
 
   private async requestSave() {
+    if (this.saveCallback) {
+      await this.saveCallback()
+    } else {
+      throw new Error('No save callback set')
+    }
+  }
+
+  /**
+   * Best-effort persist for paths where the caller is about to throw a
+   * higher-priority error (user abort, etc.) and a save failure must NOT
+   * mask it. Save errors are logged and swallowed; on the success path use
+   * {@link requestSave} so dumpDataDir OOM (#408) propagates as failure.
+   */
+  private async tryFlush(reason: string): Promise<void> {
     try {
-      if (this.saveCallback) {
-        await this.saveCallback()
-      } else {
-        throw new Error('No save callback set')
-      }
+      await this.requestSave()
     } catch (error) {
-      new ErrorModal(
-        this.app,
-        'Error: save failed',
-        'Failed to save the vector database changes. Please report this issue to the developer.',
-        error instanceof Error ? error.message : 'Unknown error',
-        {
-          showReportBugButton: true,
-        },
-      ).open()
-      throw error instanceof Error ? error : new Error(String(error))
+      console.warn(
+        `[YOLO] Vector DB save failed (${reason}); preserving caller's error.`,
+        error,
+      )
     }
   }
 
@@ -151,7 +179,7 @@ export class VectorManager {
     embeddingModel: EmbeddingModelClient,
     config: ReconcileConfig,
     options: ReconcileOptions,
-  ): Promise<void> {
+  ): Promise<ReconcileResult> {
     const { signal, scope, truncate, onProgress } = options
 
     if (truncate) {
@@ -217,7 +245,7 @@ export class VectorManager {
     if (filesToChunkify.length === 0 && removedPaths.length === 0) {
       // Nothing to do (everything is stable). Persist any truncate effect.
       if (truncate) await this.requestSave()
-      return
+      return { permanentFailedPaths: [], chunkifyFailedPaths: [] }
     }
 
     const textSplitter = RecursiveCharacterTextSplitter.fromLanguage(
@@ -276,7 +304,7 @@ export class VectorManager {
     const maybeYield = createYieldController(10)
     for (const file of filesToChunkify) {
       if (signal?.aborted) {
-        await this.requestSave()
+        await this.tryFlush('chunkify abort')
         throw new DOMException('Indexing cancelled by user', 'AbortError')
       }
       await maybeYield()
@@ -312,7 +340,7 @@ export class VectorManager {
         completedFilesCount += 1
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') {
-          await this.requestSave()
+          await this.tryFlush('chunkify abort (caught)')
           throw error
         }
         failedFiles.push({
@@ -322,19 +350,18 @@ export class VectorManager {
       }
     }
 
+    // Chunkify failures are soft (self-healing): the files are excluded from the
+    // diff (their old index is preserved and mtime not advanced), so the next
+    // reconcile retries them. We log details for diagnostics and report the
+    // paths up to the caller, but never throw or pop a modal here.
+    const chunkifyFailedPaths = failedFiles.map((f) => f.path)
     if (failedFiles.length > 0) {
-      const errorDetails =
-        `Failed to process ${failedFiles.length} file(s):\n\n` +
-        failedFiles
-          .map(({ path, error }) => `File: ${path}\nError: ${error}`)
-          .join('\n\n')
-      new ErrorModal(
-        this.app,
-        'Error: chunk embedding failed',
-        `Some files failed to process. Please report this issue to the developer if it persists.`,
-        `[Error Log]\n\n${errorDetails}`,
-        { showReportBugButton: true },
-      ).open()
+      const errorDetails = failedFiles
+        .map(({ path, error }) => `File: ${path}\nError: ${error}`)
+        .join('\n\n')
+      console.warn(
+        `[YOLO] Failed to chunkify ${failedFiles.length} file(s) (will retry next reconcile):\n\n${errorDetails}`,
+      )
     }
 
     // 6. Read actual rows over the diff scope and plan.
@@ -381,24 +408,30 @@ export class VectorManager {
         updatedFilesCount,
         removedFilesCount,
       })
-      return
+      return { permanentFailedPaths: [], chunkifyFailedPaths }
     }
 
     // 8. Embed in batches with rate-limit aware retry.
-    await this.embedAndInsertBatches(plan.toEmbed, embeddingModel, {
-      signal,
-      maxConcurrency: config.embeddingConcurrency,
-      onProgress: (snapshot) =>
-        onProgress?.({
-          ...snapshot,
-          totalFiles: filesToChunkify.length,
-          completedFiles: completedFilesCount,
-          folderProgress,
-          newFilesCount,
-          updatedFilesCount,
-          removedFilesCount,
-        }),
-    })
+    const { permanentFailedPaths } = await this.embedAndInsertBatches(
+      plan.toEmbed,
+      embeddingModel,
+      {
+        signal,
+        maxConcurrency: config.embeddingConcurrency,
+        onProgress: (snapshot) =>
+          onProgress?.({
+            ...snapshot,
+            totalFiles: filesToChunkify.length,
+            completedFiles: completedFilesCount,
+            folderProgress,
+            newFilesCount,
+            updatedFilesCount,
+            removedFilesCount,
+          }),
+      },
+    )
+
+    return { permanentFailedPaths, chunkifyFailedPaths }
   }
 
   /** Truncate one model's namespace (used by manual "remove index" actions). */
@@ -427,6 +460,13 @@ export class VectorManager {
       if (config.indexPdf && ext === 'pdf') return true
       return false
     })
+    if (config.excludeYoloBaseDir) {
+      const yoloBaseDir = getYoloBaseDir(config.settings)
+      const prefix = `${yoloBaseDir}/`
+      files = files.filter(
+        (file) => file.path !== yoloBaseDir && !file.path.startsWith(prefix),
+      )
+    }
     files = files.filter(
       (file) =>
         !config.excludePatterns.some((pattern) =>
@@ -563,7 +603,7 @@ export class VectorManager {
         waitingForRateLimit?: boolean
       }) => void
     },
-  ): Promise<void> {
+  ): Promise<{ permanentFailedPaths: string[] }> {
     const { signal, onProgress } = options
     const totalChunks = toEmbed.length
     let completedChunks = 0
@@ -571,6 +611,7 @@ export class VectorManager {
       path: string
       metadata: VectorMetaData
       error: string
+      kind: RagIndexFailureKind
     }[] = []
     const fileBoundaries: Array<{ path: string; endChunk: number }> = []
     let cumulative = 0
@@ -692,11 +733,23 @@ export class VectorManager {
           path: chunk.path,
           metadata: chunk.metadata,
           error: error instanceof Error ? error.message : 'Unknown error',
+          // Classify the original error object (status/code/instanceof), not a
+          // stringified message, so transient vs permanent is reliable.
+          kind: classifyRagIndexError(error),
         })
         return null
       }
     }
 
+    // Set when a whole batch fails to embed and we stop early, leaving later
+    // batches unattempted. Such a run is NOT complete and must never be treated
+    // as success (see the post-loop handling below).
+    let wholeBatchFailed = false
+    // Soft permanent failures (files whose successful chunks are kept, but which
+    // can never index fully and are not retried). Surfaced to the caller via the
+    // return value — never thrown, never popped as a modal.
+    const softPermanentFailedPaths: string[] = []
+    let inFlightError: unknown = null
     try {
       for (
         let batchStart = 0;
@@ -705,7 +758,7 @@ export class VectorManager {
       ) {
         const batch = toEmbed.slice(batchStart, batchStart + currentBatchSize)
         if (signal?.aborted) {
-          await this.requestSave()
+          await this.tryFlush('embed-loop abort')
           throw new DOMException('Indexing cancelled by user', 'AbortError')
         }
         await yieldToMain()
@@ -714,6 +767,11 @@ export class VectorManager {
         let attempt = 0
         while (attempt < 2) {
           attempt += 1
+          // Record where this attempt's failures begin. If the whole attempt
+          // fails and we retry, we discard them (below) so only the FINAL
+          // attempt's failures drive rollback/warning — otherwise a batch that
+          // fails attempt 1 but succeeds attempt 2 would still be rolled back.
+          const failureStart = failedChunks.length
           const results = await Promise.all(batch.map((c) => embedOne(c)))
           validRows = results.filter((r): r is InsertEmbedding => r !== null)
           if (validRows.length > 0) {
@@ -734,6 +792,8 @@ export class VectorManager {
             break
           }
           if (attempt < 2) {
+            // Discard this failed attempt's records before retrying.
+            failedChunks.splice(failureStart)
             currentBatchSize = Math.max(
               MIN_BATCH_SIZE,
               Math.floor(currentBatchSize / 2),
@@ -746,14 +806,19 @@ export class VectorManager {
           if (validRows.length > 0) {
             await this.repository.insertVectors(validRows)
           }
-          await this.requestSave()
+          await this.tryFlush('post-batch abort')
           throw new DOMException('Indexing cancelled by user', 'AbortError')
         }
 
         if (validRows.length === 0 && batch.length > 0) {
-          throw new Error(
-            'All chunks in batch failed to embed. Stopping indexing process.',
-          )
+          // Whole batch failed (e.g. full network outage or invalid API key).
+          // Stop embedding and fall through to the unified failure aggregation
+          // below: if the failures are transient it throws RagIndexIncomplete-
+          // Error (→ retry); if purely permanent/unknown the post-loop guard
+          // throws so the run is recorded as failed rather than silently
+          // succeeding with later batches left unprocessed.
+          wholeBatchFailed = true
+          break
         }
         await this.repository.insertVectors(validRows)
         chunksSinceLastSave += validRows.length
@@ -769,36 +834,123 @@ export class VectorManager {
 
         batchStart += batch.length - currentBatchSize
       }
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        throw error
-      }
-      if (
-        error instanceof LLMAPIKeyNotSetException ||
-        error instanceof LLMAPIKeyInvalidException ||
-        error instanceof LLMBaseUrlNotSetException
-      ) {
-        new ErrorModal(this.app, 'Error', error.message, undefined, {
-          showSettingsButton: true,
-        }).open()
-      } else {
-        const errorDetails =
-          `Failed to process ${failedChunks.length} chunk(s):\n\n` +
-          failedChunks
+
+      // ---- Failure aggregation + classification-based routing ----
+      //
+      // Aggregate per-chunk failures by file. A file is rolled back if it has
+      // ANY transient failure (even mixed transient+permanent): keeping its
+      // successful/reused chunks would stamp the current mtime and let the
+      // transient gap be frozen forever (MAX-mtime skip). Files whose failures
+      // are exclusively permanent/unknown can never index fully, so we keep
+      // their successful chunks (stable mtime, no flapping) and surface a
+      // persistent, actionable warning instead of retrying forever.
+      if (failedChunks.length > 0) {
+        const failuresByPath = new Map<string, RagIndexFailureKind[]>()
+        for (const chunk of failedChunks) {
+          const bucket = failuresByPath.get(chunk.path)
+          if (bucket) bucket.push(chunk.kind)
+          else failuresByPath.set(chunk.path, [chunk.kind])
+        }
+
+        const rollbackPaths: string[] = []
+        const permanentFailedPaths: string[] = []
+        for (const [path, kinds] of failuresByPath) {
+          if (kinds.some((kind) => kind === 'transient')) {
+            rollbackPaths.push(path)
+          } else {
+            permanentFailedPaths.push(path)
+          }
+        }
+
+        if (rollbackPaths.length > 0) {
+          // This run is incomplete and will retry (RagIndexIncompleteError
+          // below). Roll back BOTH transient AND permanent-failed files:
+          // - transient: must be re-embedded;
+          // - permanent: leaving its partial success would stamp the current
+          //   mtime and let the file be silently skipped on the retry, freezing
+          //   the gap. Re-evaluate it next run; a permanent-only file is then
+          //   surfaced (below) once a clean run completes.
+          // Delete each file's ENTIRE row set (incl. reused/bumped chunks from
+          // step 7), so no surviving row carries the current mtime.
+          // (rollbackPaths and permanentFailedPaths are disjoint by construction.)
+          await this.repository.deleteVectorsByPaths(embeddingModel.id, [
+            ...rollbackPaths,
+            ...permanentFailedPaths,
+          ])
+        }
+
+        // Persistent "keep + warn" is valid ONLY for a fully-processed run with
+        // no transient retry in flight. On an early stop (wholeBatchFailed) the
+        // run is incomplete and surfaces via the throw below; on a transient
+        // retry the permanent files were just rolled back for re-evaluation.
+        // Either way, suppress the partial report here to avoid a misleading
+        // "the rest is indexed" message / a frozen gap.
+        if (
+          permanentFailedPaths.length > 0 &&
+          rollbackPaths.length === 0 &&
+          !wholeBatchFailed
+        ) {
+          softPermanentFailedPaths.push(...permanentFailedPaths)
+          const errorDetails = failedChunks
+            .filter(
+              (chunk) =>
+                !failuresByPath
+                  .get(chunk.path)
+                  ?.some((kind) => kind === 'transient'),
+            )
             .map((chunk) => `File: ${chunk.path}\nError: ${chunk.error}`)
             .join('\n\n')
-        new ErrorModal(
-          this.app,
-          'Error: embedding failed',
-          `The indexing process was interrupted because several files couldn't be processed.
-Please report this issue to the developer if it persists.`,
-          `[Error Log]\n\n${errorDetails}`,
-          { showReportBugButton: true },
-        ).open()
+          console.warn(
+            `[YOLO] ${permanentFailedPaths.length} file(s) could not be indexed (kept partial results, will not retry):\n\n${errorDetails}`,
+          )
+        }
+
+        if (rollbackPaths.length > 0) {
+          throw new RagIndexIncompleteError([
+            ...rollbackPaths,
+            ...permanentFailedPaths,
+          ])
+        }
       }
+
+      // Early stop with no transient failures to retry: the cause is
+      // permanent/unknown (e.g. invalid API key) and later batches were never
+      // attempted. Throw so the run is recorded as failed (no false success,
+      // no retry for a permanent cause); the catch below surfaces the details.
+      if (wholeBatchFailed) {
+        throw new Error(
+          'Embedding halted: an entire batch failed to embed and indexing was stopped before completing all chunks.',
+        )
+      }
+    } catch (error) {
+      inFlightError = error
       throw error
     } finally {
-      await this.requestSave()
+      // Always persist whatever made it into the DB, on both the success path
+      // and any throw (AbortError, RagIndexIncompleteError, wholeBatchFailed
+      // halt, etc.) — those errors propagate unchanged to the caller.
+      //
+      // If save() itself throws (e.g. dumpDataDir OOM in #408), surface it
+      // ONLY on the success path — otherwise we would mask the original
+      // failure (user abort, API key error, transient rollback) with a save
+      // error, which is both wrong (the user did not "save-fail") and
+      // mis-classified for retry policy. On failure paths we log it so it's
+      // still diagnosable and the next reconcile will hit it again cleanly.
+      try {
+        await this.requestSave()
+      } catch (saveError) {
+        if (inFlightError !== null) {
+          console.warn(
+            '[YOLO] Vector DB save failed during failure path; preserving original error.',
+            saveError,
+          )
+        } else {
+          // eslint-disable-next-line no-unsafe-finally -- intentional: success path must surface save failure
+          throw saveError
+        }
+      }
     }
+
+    return { permanentFailedPaths: softPermanentFailedPaths }
   }
 }

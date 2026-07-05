@@ -136,9 +136,8 @@ export const estimateContextBreakdown = async ({
   allowedToolNames,
   enableToolDisclosure,
   toolPreferences,
-  allowedSkillIds,
-  allowedSkillNames,
   contextualInjections,
+  runtimeModePrompt,
 }: {
   requestContextBuilder: RequestContextBuilder
   mcpManager: McpManager
@@ -152,9 +151,8 @@ export const estimateContextBreakdown = async ({
   allowedToolNames?: string[]
   enableToolDisclosure?: boolean
   toolPreferences?: Record<string, AssistantToolPreference>
-  allowedSkillIds?: string[]
-  allowedSkillNames?: string[]
   contextualInjections?: ContextualInjection[]
+  runtimeModePrompt?: string
 }): Promise<ContextBreakdown> => {
   const availableTools = enableTools
     ? await mcpManager.listAvailableTools({
@@ -162,26 +160,29 @@ export const estimateContextBreakdown = async ({
         chatModelModalities: model.modalities,
       })
     : []
-  const { hasTools, hasMemoryTools, requestTools } = selectAllowedTools({
-    availableTools,
-    allowedToolNames,
-    allowedSkillIds,
-    allowedSkillNames,
-    toolPreferences,
-    apiType,
-    enableToolDisclosure,
-    jsSandboxSettings: mcpManager.getJsSandboxSettings(),
-  })
+  const { hasTools, hasMemoryTools, hasOnDemandTools, requestTools } =
+    await selectAllowedTools({
+      availableTools,
+      allowedToolNames,
+      toolPreferences,
+      apiType,
+      enableToolDisclosure,
+      jsSandboxSettings: mcpManager.getJsSandboxSettings(),
+    })
 
   const sections = await requestContextBuilder.generateRequestSections({
     messages,
     hasTools,
     hasMemoryTools,
+    hasOnDemandTools,
     model,
     conversationId,
     compaction,
     contextualInjections,
+    runtimeModePrompt,
     requestTools,
+    // Token breakdown only: reuse a frozen snapshot if present, never create one.
+    systemPromptSnapshotMode: 'reuse',
   })
 
   const cacheKey = hashSections(sections)

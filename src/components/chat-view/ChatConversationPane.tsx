@@ -1,23 +1,32 @@
-import { ArrowDown, Bot, MessageCircle } from 'lucide-react'
+import {
+  ArrowDown,
+  Bot,
+  Infinity as InfinityIcon,
+  MessageCircle,
+} from 'lucide-react'
 import type { ReactNode, RefObject } from 'react'
 import type { FollowOutput } from 'react-virtuoso'
 
 import type { ChatTimelineItem } from '../../types/chat-timeline'
 
 import type { ChatMode } from './chat-input/ChatModeSelect'
+import { isAgentChatMode } from './chat-input/ChatModeSelect'
+import type { ChatTimelineRenderVersion } from './ChatTimelineList'
 import { InstallationIncompleteBanner } from './InstallationIncompleteBanner'
 import { SharedConversationSurface } from './SharedConversationSurface'
-import { UpdateBanner } from './UpdateBanner'
 
 type ChatConversationPaneProps = {
   chatMode: ChatMode
+  yoloEnabled: boolean
   groupedChatMessagesLength: number
   isCurrentConversationRunActive: boolean
   isAutoFollowEnabled: boolean
   currentConversationId: string
+  isRestoringConversation?: boolean
   chatTimelineItems: ChatTimelineItem[]
   chatMessagesRef: RefObject<HTMLDivElement>
   renderChatTimelineItem: (timelineItem: ChatTimelineItem) => ReactNode
+  timelineRenderVersion?: ChatTimelineRenderVersion<ChatTimelineItem>
   followOutput: FollowOutput
   onAtBottomStateChange: (atBottom: boolean) => void
   editingAssistantMessageId: string | null
@@ -25,24 +34,39 @@ type ChatConversationPaneProps = {
   hasStreamingMessages: boolean
   scrollToBottomLabel: string
   scrollToBottomWhileStreamingLabel: string
-  emptyStateChatTitle: string
+  emptyStateAskTitle: string
   emptyStateAgentTitle: string
-  emptyStateChatDescription: string
+  emptyStateAgentFullTitle: string
+  emptyStateAskDescription: string
   emptyStateAgentDescription: string
+  emptyStateAgentFullDescription: string
   footerContent: ReactNode
   onTimelineVirtualizationChange?: (isVirtualized: boolean) => void
+  onActiveUserMessageChange?: (messageId: string | null) => void
+  windowNavigationKey?: number
+  windowNavigationTargetMessageId?: string | null
+  messageNavigatorContent?: ReactNode
+  hasEarlierMessages?: boolean
+  hasNewerMessages?: boolean
+  onLoadEarlier?: () => void
+  onLoadNewer?: () => void
+  loadEarlierLabel?: string
+  loadNewerLabel?: string
   bottomSpacerHeight?: number
 }
 
 export function ChatConversationPane({
   chatMode,
+  yoloEnabled,
   groupedChatMessagesLength,
   isCurrentConversationRunActive,
   isAutoFollowEnabled,
   currentConversationId,
+  isRestoringConversation = false,
   chatTimelineItems,
   chatMessagesRef,
   renderChatTimelineItem,
+  timelineRenderVersion,
   followOutput,
   onAtBottomStateChange,
   editingAssistantMessageId,
@@ -50,28 +74,56 @@ export function ChatConversationPane({
   hasStreamingMessages,
   scrollToBottomLabel,
   scrollToBottomWhileStreamingLabel,
-  emptyStateChatTitle,
+  emptyStateAskTitle,
   emptyStateAgentTitle,
-  emptyStateChatDescription,
+  emptyStateAgentFullTitle,
+  emptyStateAskDescription,
   emptyStateAgentDescription,
+  emptyStateAgentFullDescription,
   footerContent,
   onTimelineVirtualizationChange,
+  onActiveUserMessageChange,
+  windowNavigationKey,
+  windowNavigationTargetMessageId,
+  messageNavigatorContent,
+  hasEarlierMessages,
+  hasNewerMessages,
+  onLoadEarlier,
+  onLoadNewer,
+  loadEarlierLabel,
+  loadNewerLabel,
   bottomSpacerHeight,
 }: ChatConversationPaneProps) {
   const showEmptyState =
-    groupedChatMessagesLength === 0 && !isCurrentConversationRunActive
+    groupedChatMessagesLength === 0 &&
+    !isCurrentConversationRunActive &&
+    !isRestoringConversation
   const showScrollToBottomButton =
-    !showEmptyState && groupedChatMessagesLength > 0 && !isAutoFollowEnabled
+    !showEmptyState &&
+    groupedChatMessagesLength > 0 &&
+    (!isAutoFollowEnabled || hasNewerMessages)
+
+  const isYoloAgent = isAgentChatMode(chatMode) && yoloEnabled
+  const emptyStateTitle = isYoloAgent
+    ? emptyStateAgentFullTitle
+    : isAgentChatMode(chatMode)
+      ? emptyStateAgentTitle
+      : emptyStateAskTitle
+  const emptyStateDescription = isYoloAgent
+    ? emptyStateAgentFullDescription
+    : isAgentChatMode(chatMode)
+      ? emptyStateAgentDescription
+      : emptyStateAskDescription
 
   return (
     <>
       <InstallationIncompleteBanner />
-      <UpdateBanner />
       <SharedConversationSurface
         items={chatTimelineItems}
         conversationId={currentConversationId}
         scrollContainerRef={chatMessagesRef}
         renderItem={renderChatTimelineItem}
+        renderVersion={timelineRenderVersion}
         forceRenderItemIds={['bottom-anchor']}
         followOutput={followOutput}
         onAtBottomStateChange={onAtBottomStateChange}
@@ -80,38 +132,50 @@ export function ChatConversationPane({
         }
         containerClassName="yolo-chat-conversation-surface"
         overlaySlot={
-          showEmptyState ? (
-            <div className="yolo-chat-empty-state-overlay">
-              <div className="yolo-chat-empty-state-overlay-inner">
-                <div className="yolo-chat-empty-state">
-                  <div
-                    key={chatMode}
-                    className="yolo-chat-empty-state-icon"
-                    data-mode={chatMode}
-                  >
-                    {chatMode === 'agent' ? (
-                      <Bot size={18} strokeWidth={2} />
-                    ) : (
-                      <MessageCircle size={18} strokeWidth={2} />
-                    )}
-                  </div>
-                  <div className="yolo-chat-empty-state-title">
-                    {chatMode === 'agent'
-                      ? emptyStateAgentTitle
-                      : emptyStateChatTitle}
-                  </div>
-                  <div className="yolo-chat-empty-state-description">
-                    {chatMode === 'agent'
-                      ? emptyStateAgentDescription
-                      : emptyStateChatDescription}
+          showEmptyState || messageNavigatorContent ? (
+            <>
+              {showEmptyState ? (
+                <div className="yolo-chat-empty-state-overlay">
+                  <div className="yolo-chat-empty-state-overlay-inner">
+                    <div className="yolo-chat-empty-state">
+                      <div
+                        key={`${chatMode}-${isYoloAgent ? 'yolo' : 'std'}`}
+                        className="yolo-chat-empty-state-icon"
+                        data-mode={isYoloAgent ? 'agent-full' : chatMode}
+                      >
+                        {isYoloAgent ? (
+                          <InfinityIcon size={18} strokeWidth={2} />
+                        ) : isAgentChatMode(chatMode) ? (
+                          <Bot size={18} strokeWidth={2} />
+                        ) : (
+                          <MessageCircle size={18} strokeWidth={2} />
+                        )}
+                      </div>
+                      <div className="yolo-chat-empty-state-title">
+                        {emptyStateTitle}
+                      </div>
+                      <div className="yolo-chat-empty-state-description">
+                        {emptyStateDescription}
+                      </div>
+                    </div>
                   </div>
                 </div>
-              </div>
-            </div>
+              ) : null}
+              {messageNavigatorContent}
+            </>
           ) : undefined
         }
         scrollContainerClassName="yolo-chat-messages"
         onVirtualizationChange={onTimelineVirtualizationChange}
+        onActiveUserMessageChange={onActiveUserMessageChange}
+        windowNavigationKey={windowNavigationKey}
+        windowNavigationTargetMessageId={windowNavigationTargetMessageId}
+        hasEarlierMessages={hasEarlierMessages}
+        hasNewerMessages={hasNewerMessages}
+        onLoadEarlier={onLoadEarlier}
+        onLoadNewer={onLoadNewer}
+        loadEarlierLabel={loadEarlierLabel}
+        loadNewerLabel={loadNewerLabel}
         bottomSpacerHeight={bottomSpacerHeight}
       />
       <div className="yolo-chat-footer">
@@ -122,11 +186,6 @@ export function ChatConversationPane({
               className="yolo-chat-scroll-to-bottom-button"
               onClick={onForceScrollToBottom}
               aria-label={
-                hasStreamingMessages
-                  ? scrollToBottomWhileStreamingLabel
-                  : scrollToBottomLabel
-              }
-              title={
                 hasStreamingMessages
                   ? scrollToBottomWhileStreamingLabel
                   : scrollToBottomLabel

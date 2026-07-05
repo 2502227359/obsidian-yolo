@@ -84,6 +84,7 @@ const createMockMcpManager = (tools: unknown[] = []): McpManager =>
   ({
     listAvailableTools: jest.fn().mockResolvedValue(tools),
     getJsSandboxSettings: jest.fn(() => ({})),
+    getSettingsSnapshot: jest.fn(() => ({})),
   }) as unknown as McpManager
 
 describe('AgentLlmTurnExecutor', () => {
@@ -120,7 +121,7 @@ describe('AgentLlmTurnExecutor', () => {
       enableTools: false,
       includeBuiltinTools: false,
       requestParams: {
-        stream: true,
+        deliveryMode: 'incremental',
         primaryRequestTimeoutMs: 20000,
         streamFallbackRecoveryEnabled: false,
       },
@@ -228,7 +229,7 @@ describe('AgentLlmTurnExecutor', () => {
       enableTools: true,
       includeBuiltinTools: true,
       requestParams: {
-        stream: true,
+        deliveryMode: 'incremental',
       },
       onAssistantMessage: (message) => {
         observedAssistantMessages.push({
@@ -296,7 +297,7 @@ describe('AgentLlmTurnExecutor', () => {
       enableTools: false,
       includeBuiltinTools: false,
       requestParams: {
-        stream: true,
+        deliveryMode: 'incremental',
       },
       onAssistantMessage: (message) => {
         observedAssistantMessages.push({
@@ -354,7 +355,7 @@ describe('AgentLlmTurnExecutor', () => {
       enableTools: false,
       includeBuiltinTools: false,
       requestParams: {
-        stream: true,
+        deliveryMode: 'incremental',
       },
       onAssistantMessage: (message) => {
         observedAssistantMessages.push({
@@ -406,7 +407,7 @@ describe('AgentLlmTurnExecutor', () => {
       includeBuiltinTools: false,
       abortSignal: abortController.signal,
       requestParams: {
-        stream: true,
+        deliveryMode: 'incremental',
       },
       onAssistantMessage: (message) => {
         observedAssistantMessages.push({
@@ -476,7 +477,7 @@ describe('AgentLlmTurnExecutor', () => {
       enableTools: false,
       includeBuiltinTools: false,
       requestParams: {
-        stream: true,
+        deliveryMode: 'incremental',
       },
       onAssistantMessage: () => {},
     })
@@ -526,7 +527,7 @@ describe('AgentLlmTurnExecutor', () => {
       enableTools: true,
       includeBuiltinTools: true,
       requestParams: {
-        stream: false,
+        deliveryMode: 'buffered',
       },
       onAssistantMessage: () => {},
     })
@@ -581,7 +582,7 @@ describe('AgentLlmTurnExecutor', () => {
       enableTools: true,
       includeBuiltinTools: true,
       requestParams: {
-        stream: false,
+        deliveryMode: 'buffered',
       },
       onAssistantMessage: () => {},
     })

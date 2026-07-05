@@ -4,25 +4,313 @@ jest.mock('../../contexts/language-context', () => ({
   }),
 }))
 
+jest.mock('clsx', () => ({
+  __esModule: true,
+  default: (...args: unknown[]) => args.filter(Boolean).join(' '),
+}))
+
 jest.mock('../../contexts/plugin-context', () => ({
   usePlugin: () => ({}),
 }))
 
+const mockedObsidianCodeBlock = jest.fn((_: unknown) => null)
 jest.mock('./ObsidianMarkdown', () => ({
-  ObsidianCodeBlock: () => null,
+  ObsidianCodeBlock: (props: unknown) => mockedObsidianCodeBlock(props),
 }))
 
-jest.mock('./tool-cards/ExternalAgentToolCard', () => ({
-  ExternalAgentToolCard: () => null,
+const mockedLiveTaskCard = jest.fn((_: unknown) => null)
+jest.mock('./tool-cards/LiveTaskCard', () => ({
+  LiveTaskCard: (props: unknown) => mockedLiveTaskCard(props),
 }))
 
+const mockedSubagentCard = jest.fn((_: unknown) => null)
+jest.mock('./tool-cards/SubagentCard', () => ({
+  SubagentCard: (props: unknown) => mockedSubagentCard(props),
+}))
+
+import * as React from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+
+import type { ChatTerminalCommandResultMessage } from '../../types/chat'
 import {
+  type ToolCallResponse,
   ToolCallResponseStatus,
   createCompleteToolCallArguments,
 } from '../../types/tool-call.types'
 
 import { getToolHeadlineParts, getToolHeadlineText } from './toolHeadline'
-import { type ToolLabels, getHeadlineDisplayInfo } from './ToolMessage'
+import type { ToolLabels } from './ToolMessage'
+import ToolMessage, {
+  areToolCallItemPropsEqual,
+  getHeadlineDisplayInfo,
+  getToolResultDisplayText,
+} from './ToolMessage'
+
+describe('ToolMessage rendering', () => {
+  beforeEach(() => {
+    mockedObsidianCodeBlock.mockClear()
+    mockedLiveTaskCard.mockClear()
+    mockedSubagentCard.mockClear()
+  })
+
+  it('hydrates original terminal_command card from persisted result output', () => {
+    const terminalResult: ChatTerminalCommandResultMessage = {
+      role: 'terminal_command_result',
+      id: 'result-1',
+      taskId: 'task-1',
+      source: {
+        type: 'llm_tool_call',
+        assistantMessageId: 'assistant-1',
+        toolCallId: 'tool-1',
+      },
+      title: 'for i in $(seq 1 8); do echo $i; sleep 1; done',
+      status: 'completed',
+      exitCode: 0,
+      stdout: '1\n2\n3\n4\n5\n6\n7\n8\n',
+      stderr: '',
+      durationMs: 8000,
+      delegateAssistantMessageId: 'assistant-1',
+      delegateToolCallId: 'tool-1',
+    }
+
+    renderToStaticMarkup(
+      React.createElement(ToolMessage, {
+        message: {
+          role: 'tool',
+          id: 'tool-message-1',
+          toolCalls: [
+            {
+              request: {
+                id: 'tool-1',
+                name: 'yolo_local__terminal_command',
+                arguments: createCompleteToolCallArguments({
+                  value: {
+                    command: 'for i in $(seq 1 8); do echo $i; sleep 1; done',
+                    background: true,
+                  },
+                }),
+              },
+              response: {
+                status: ToolCallResponseStatus.PendingApproval,
+              },
+            },
+          ],
+        },
+        conversationId: 'conversation-1',
+        terminalCommandResultsByToolCallId: new Map([
+          ['tool-1', terminalResult],
+        ]),
+        onMessageUpdate: () => {},
+      }),
+    )
+
+    expect(mockedLiveTaskCard).toHaveBeenCalledWith(
+      expect.objectContaining({
+        initialStdout: terminalResult.stdout,
+        initialStderr: terminalResult.stderr,
+        response: expect.objectContaining({
+          status: ToolCallResponseStatus.Success,
+        }),
+      }),
+    )
+  })
+
+  it('renders approval actions for pending delegate_subagent calls', () => {
+    const markup = renderToStaticMarkup(
+      React.createElement(ToolMessage, {
+        message: {
+          role: 'tool',
+          id: 'tool-message-1',
+          toolCalls: [
+            {
+              request: {
+                id: 'tool-1',
+                name: 'yolo_local__delegate_subagent',
+                arguments: createCompleteToolCallArguments({
+                  value: {
+                    description: 'Count vault files',
+                    prompt: 'Count files in the vault.',
+                  },
+                }),
+              },
+              response: {
+                status: ToolCallResponseStatus.PendingApproval,
+              },
+            },
+          ],
+        },
+        conversationId: 'conversation-1',
+        onMessageUpdate: () => {},
+      }),
+    )
+
+    expect(mockedSubagentCard).not.toHaveBeenCalled()
+    expect(markup).toContain('Allow')
+    expect(markup).toContain('Reject')
+  })
+
+  it('does not render hidden parameters or result content while collapsed', () => {
+    renderToStaticMarkup(
+      React.createElement(ToolMessage, {
+        message: {
+          role: 'tool',
+          id: 'tool-message-1',
+          toolCalls: [
+            {
+              request: {
+                id: 'tool-1',
+                name: 'yolo_local__fs_read',
+                arguments: createCompleteToolCallArguments({
+                  value: {
+                    paths: ['docs/large.md'],
+                    operation: { type: 'lines', startLine: 1 },
+                    padding: 'x'.repeat(100_000),
+                  },
+                }),
+              },
+              response: {
+                status: ToolCallResponseStatus.Success,
+                data: {
+                  type: 'text',
+                  text: 'x'.repeat(100_000),
+                  metadata: {
+                    fsReadOperation: {
+                      type: 'lines',
+                      startLine: 1,
+                      endLine: 10,
+                      isPdf: false,
+                    },
+                  },
+                },
+              },
+            },
+          ],
+        },
+        conversationId: 'conversation-1',
+        onMessageUpdate: () => {},
+      }),
+    )
+
+    expect(mockedObsidianCodeBlock).not.toHaveBeenCalled()
+  })
+
+  it('does not hydrate persisted terminal output while collapsed', () => {
+    const terminalResult: ChatTerminalCommandResultMessage = {
+      role: 'terminal_command_result',
+      id: 'result-1',
+      taskId: 'task-1',
+      source: {
+        type: 'llm_tool_call',
+        assistantMessageId: 'assistant-1',
+        toolCallId: 'tool-1',
+      },
+      title: 'npm test',
+      status: 'completed',
+      exitCode: 0,
+      stdout: 'x'.repeat(100_000),
+      stderr: '',
+      durationMs: 1000,
+      delegateAssistantMessageId: 'assistant-1',
+      delegateToolCallId: 'tool-1',
+    }
+
+    renderToStaticMarkup(
+      React.createElement(ToolMessage, {
+        message: {
+          role: 'tool',
+          id: 'tool-message-1',
+          toolCalls: [
+            {
+              request: {
+                id: 'tool-1',
+                name: 'yolo_local__terminal_command',
+                arguments: createCompleteToolCallArguments({
+                  value: { command: 'npm test', background: true },
+                }),
+              },
+              response: {
+                status: ToolCallResponseStatus.Success,
+                data: { type: 'text', text: '' },
+              },
+            },
+          ],
+        },
+        conversationId: 'conversation-1',
+        terminalCommandResultsByToolCallId: new Map([
+          ['tool-1', terminalResult],
+        ]),
+        onMessageUpdate: () => {},
+      }),
+    )
+
+    expect(mockedLiveTaskCard).not.toHaveBeenCalled()
+  })
+
+  it('keeps unchanged tool call item props memo-equivalent', () => {
+    const request = {
+      id: 'tool-1',
+      name: 'yolo_local__fs_read',
+      arguments: createCompleteToolCallArguments({
+        value: { paths: ['docs/plan.md'] },
+      }),
+    }
+    const response: ToolCallResponse = {
+      status: ToolCallResponseStatus.Success,
+      data: { type: 'text' as const, text: 'ok' },
+    }
+    const onResponseUpdate = jest.fn()
+    const props = {
+      request,
+      response,
+      conversationId: 'conversation-1',
+      toolMessageId: 'tool-message-1',
+      showCompactionPendingHint: false,
+      showRunningFooter: true,
+      onResponseUpdate,
+    }
+
+    expect(areToolCallItemPropsEqual(props, { ...props })).toBe(true)
+    expect(
+      areToolCallItemPropsEqual(props, {
+        ...props,
+        response: {
+          status: ToolCallResponseStatus.Error,
+          error: 'failed',
+        } satisfies ToolCallResponse,
+      }),
+    ).toBe(false)
+  })
+})
+
+describe('getToolResultDisplayText', () => {
+  it('returns text unchanged when it fits within the display budget', () => {
+    const text = 'small fs_read output'
+    expect(
+      getToolResultDisplayText({
+        response: {
+          status: ToolCallResponseStatus.Success,
+          data: { type: 'text', text },
+        },
+      }),
+    ).toBe(text)
+  })
+
+  it('truncates oversized text regardless of the tool name', () => {
+    const text = 'a'.repeat(20_000)
+    const displayed = getToolResultDisplayText({
+      response: {
+        status: ToolCallResponseStatus.Success,
+        data: { type: 'text', text },
+      },
+    })
+
+    expect(displayed.startsWith('a'.repeat(12_000))).toBe(true)
+    expect(displayed).toContain(
+      '[Display shortened by 8000 characters. The assistant received the full tool result.]',
+    )
+    expect(displayed.length).toBeLessThan(text.length)
+  })
+})
 
 describe('ToolMessage headline helpers', () => {
   const labels: ToolLabels = {
@@ -37,17 +325,16 @@ describe('ToolMessage headline helpers', () => {
     },
     unknownStatus: 'Unknown',
     displayNames: {
-      fs_create_file: 'Create file',
-      fs_delete_file: 'Delete file',
+      fs_write: 'Write file',
+      fs_delete: 'Delete',
       fs_create_dir: 'Create folder',
-      fs_delete_dir: 'Delete folder',
       fs_move: 'Move path',
+      terminal_command: 'Terminal command',
     },
     writeActionLabels: {
-      create_file: 'Create file',
-      delete_file: 'Delete file',
+      write: 'Write file',
+      delete: 'Delete',
       create_dir: 'Create folder',
-      delete_dir: 'Delete folder',
       move: 'Move path',
     },
     readFull: '全文',
@@ -71,6 +358,12 @@ describe('ToolMessage headline helpers', () => {
     todoWriteCreated: (count: number) => `Planned ${count} tasks`,
     todoWriteProgress: (done: number, total: number) =>
       `Progress ${done}/${total}`,
+    terminalCommandSessionPoll: (sessionId: number) =>
+      `Session ${sessionId} · Poll`,
+    terminalCommandSessionKill: (sessionId: number) =>
+      `Session ${sessionId} · Kill`,
+    terminalCommandSessionInput: (sessionId: number, inputPreview: string) =>
+      `Session ${sessionId} · Input: ${inputPreview}`,
   }
 
   it('appends edit deltas after the path for successful edit calls', () => {
@@ -164,11 +457,74 @@ describe('ToolMessage headline helpers', () => {
               requestedOperation: { type: 'full', modality: 'text' },
               results: [],
             }),
+            metadata: {
+              fsReadOperation: { type: 'full', isPdf: false },
+            },
           },
         },
         labels,
       }).summaryText,
     ).toBe('docs/plan.md | 全文')
+  })
+
+  it('shows concrete paths for multi-path fs_read headlines', () => {
+    expect(
+      getHeadlineDisplayInfo({
+        request: {
+          name: 'yolo_local__fs_read',
+          arguments: createCompleteToolCallArguments({
+            value: {
+              paths: ['docs/one.md', 'docs/two.md'],
+              operation: { type: 'full' },
+            },
+          }),
+        },
+        response: {
+          status: ToolCallResponseStatus.Success,
+          data: {
+            type: 'text',
+            text: '',
+            metadata: {
+              fsReadOperation: { type: 'full', isPdf: false },
+            },
+          },
+        },
+        labels,
+      }).summaryText,
+    ).toBe('docs/one.md, docs/two.md | 全文')
+  })
+
+  it('omits extra paths only when fs_read has five or more paths', () => {
+    expect(
+      getHeadlineDisplayInfo({
+        request: {
+          name: 'yolo_local__fs_read',
+          arguments: createCompleteToolCallArguments({
+            value: {
+              paths: [
+                'docs/one.md',
+                'docs/two.md',
+                'docs/three.md',
+                'docs/four.md',
+                'docs/five.md',
+              ],
+              operation: { type: 'full' },
+            },
+          }),
+        },
+        response: {
+          status: ToolCallResponseStatus.Success,
+          data: {
+            type: 'text',
+            text: '',
+            metadata: {
+              fsReadOperation: { type: 'full', isPdf: false },
+            },
+          },
+        },
+        labels,
+      }).summaryText,
+    ).toBe('docs/one.md, docs/two.md, docs/three.md, docs/four.md +1 | 全文')
   })
 
   it('adds line-range mode to successful fs_read headlines (markdown)', () => {
@@ -204,6 +560,14 @@ describe('ToolMessage headline helpers', () => {
                 },
               ],
             }),
+            metadata: {
+              fsReadOperation: {
+                type: 'lines',
+                startLine: 12,
+                endLine: 61,
+                isPdf: false,
+              },
+            },
           },
         },
         labels,
@@ -244,11 +608,57 @@ describe('ToolMessage headline helpers', () => {
                 },
               ],
             }),
+            metadata: {
+              fsReadOperation: {
+                type: 'lines',
+                startLine: 1,
+                endLine: 1,
+                isPdf: true,
+              },
+            },
           },
         },
         labels,
       }).summaryText,
     ).toBe('docs/paper.pdf | 1-1页')
+  })
+
+  it('does not parse fs_read response text for legacy headlines without metadata', () => {
+    const parseSpy = jest.spyOn(JSON, 'parse')
+
+    expect(
+      getHeadlineDisplayInfo({
+        request: {
+          name: 'yolo_local__fs_read',
+          arguments: createCompleteToolCallArguments({
+            value: {
+              paths: ['docs/large.md'],
+              operation: { type: 'lines', startLine: 1 },
+            },
+          }),
+        },
+        response: {
+          status: ToolCallResponseStatus.Success,
+          data: {
+            type: 'text',
+            text: JSON.stringify({
+              requestedOperation: { type: 'lines', modality: 'text' },
+              results: [
+                {
+                  path: 'docs/large.md',
+                  ok: true,
+                  returnedRange: { startLine: 1, endLine: 1000 },
+                },
+              ],
+            }),
+          },
+        },
+        labels,
+      }).summaryText,
+    ).toBe('docs/large.md')
+    expect(parseSpy).not.toHaveBeenCalled()
+
+    parseSpy.mockRestore()
   })
 
   it('omits range while fs_read response is pending', () => {
@@ -268,11 +678,11 @@ describe('ToolMessage headline helpers', () => {
     ).toBe('docs/plan.md')
   })
 
-  it('uses file path as summary for create-file headlines', () => {
+  it('uses file path as summary for write headlines', () => {
     expect(
       getHeadlineDisplayInfo({
         request: {
-          name: 'yolo_local__fs_create_file',
+          name: 'yolo_local__fs_write',
           arguments: createCompleteToolCallArguments({
             value: {
               path: 'docs/new-note.md',
@@ -283,8 +693,27 @@ describe('ToolMessage headline helpers', () => {
         labels,
       }),
     ).toEqual({
-      displayName: 'Create file',
+      displayName: 'Write file',
       summaryText: 'docs/new-note.md',
+    })
+  })
+
+  it('uses file path as summary for delete headlines', () => {
+    expect(
+      getHeadlineDisplayInfo({
+        request: {
+          name: 'yolo_local__fs_delete',
+          arguments: createCompleteToolCallArguments({
+            value: {
+              path: 'docs/old-note.md',
+            },
+          }),
+        },
+        labels,
+      }),
+    ).toEqual({
+      displayName: 'Delete',
+      summaryText: 'docs/old-note.md',
     })
   })
 
@@ -327,72 +756,103 @@ describe('ToolMessage headline helpers', () => {
     })
   })
 
-  it('summarizes batch create-file headlines by shared parent directory', () => {
+  it('uses shell command as summary for terminal_command headlines', () => {
     expect(
       getHeadlineDisplayInfo({
         request: {
-          name: 'yolo_local__fs_create_file',
+          name: 'yolo_local__terminal_command',
           arguments: createCompleteToolCallArguments({
             value: {
-              items: [
-                { path: 'docs/a.md', content: 'A' },
-                { path: 'docs/b.md', content: 'B' },
-              ],
+              command: 'git status',
             },
           }),
         },
         labels,
       }),
     ).toEqual({
-      displayName: 'Create file',
-      summaryText: '在 docs 下创建 2 个文件',
+      displayName: 'Terminal command',
+      summaryText: 'git status',
     })
   })
 
-  it('summarizes batch move headlines by target directory', () => {
+  it('uses basename plus arguments for long single terminal_command headlines', () => {
     expect(
       getHeadlineDisplayInfo({
         request: {
-          name: 'yolo_local__fs_move',
+          name: 'yolo_local__terminal_command',
           arguments: createCompleteToolCallArguments({
             value: {
-              items: [
-                { oldPath: 'docs/a.md', newPath: 'docs/a-1.md' },
-                { oldPath: 'docs/b.md', newPath: 'docs/b-1.md' },
-                { oldPath: 'docs/c.md', newPath: 'docs/c-1.md' },
-              ],
+              command:
+                '/Applications/Obsidian.app/Contents/MacOS/obsidian-cli plugin:reload id=yolo',
             },
           }),
         },
         labels,
       }),
     ).toEqual({
-      displayName: 'Move path',
-      summaryText: '移动 3 项到 docs',
+      displayName: 'Terminal command',
+      summaryText: 'obsidian-cli plugin:reload id=yolo',
     })
   })
 
-  it('summarizes batch delete-file headlines by shared parent directory', () => {
+  it('uses command-name summary for long streaming terminal_command headlines', () => {
     expect(
       getHeadlineDisplayInfo({
         request: {
-          name: 'yolo_local__fs_delete_file',
+          name: 'yolo_local__terminal_command',
           arguments: createCompleteToolCallArguments({
             value: {
-              items: [
-                { path: 'docs/a.md' },
-                { path: 'docs/b.md' },
-                { path: 'docs/c.md' },
-              ],
+              command:
+                'for i in $(seq 1 15); do echo "[$i] $(date +%H:%M:%S)"; sleep 1; done && echo "=== done ===" && pwd && ls -la src | head -8',
+              background: true,
             },
           }),
         },
         labels,
       }),
     ).toEqual({
-      displayName: 'Delete file',
-      summaryText: '删除 docs 下 3 个文件',
+      displayName: 'Terminal command',
+      summaryText:
+        'Long bash command with streaming output seq, echo, date, sleep, pwd +2',
     })
+  })
+
+  it('uses session poll/kill/input summaries for terminal_command follow-ups', () => {
+    expect(
+      getHeadlineDisplayInfo({
+        request: {
+          name: 'yolo_local__terminal_command',
+          arguments: createCompleteToolCallArguments({
+            value: { session_id: 3 },
+          }),
+        },
+        labels,
+      }).summaryText,
+    ).toBe('Session 3 · Poll')
+
+    expect(
+      getHeadlineDisplayInfo({
+        request: {
+          name: 'yolo_local__terminal_command',
+          arguments: createCompleteToolCallArguments({
+            value: { session_id: 3, kill: true },
+          }),
+        },
+        labels,
+      }).summaryText,
+    ).toBe('Session 3 · Kill')
+
+    expect(
+      getHeadlineDisplayInfo({
+        request: {
+          name: 'yolo_local__terminal_command',
+          arguments: createCompleteToolCallArguments({
+            value: { session_id: 3, input: 'y\n' },
+          }),
+        },
+        labels,
+      }).summaryText,
+    ).toBe('Session 3 · Input: y')
   })
 
   it('uses content (not legacy activeForm) for in_progress todo_write summary', () => {
@@ -426,27 +886,5 @@ describe('ToolMessage headline helpers', () => {
         labels,
       }).summaryText,
     ).toBe('完成第二步')
-  })
-
-  it('falls back to generic batch summary when create-file paths are distributed', () => {
-    expect(
-      getHeadlineDisplayInfo({
-        request: {
-          name: 'yolo_local__fs_create_file',
-          arguments: createCompleteToolCallArguments({
-            value: {
-              items: [
-                { path: 'docs/a.md', content: 'A' },
-                { path: 'notes/b.md', content: 'B' },
-              ],
-            },
-          }),
-        },
-        labels,
-      }),
-    ).toEqual({
-      displayName: 'Create file',
-      summaryText: '创建 2 个文件',
-    })
   })
 })

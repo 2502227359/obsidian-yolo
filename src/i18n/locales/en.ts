@@ -66,6 +66,7 @@ export const en: TranslationKeys = {
     chatList: {
       searchPlaceholder: 'Search conversations',
       empty: 'No conversations',
+      current: 'Current',
       retryTitle: 'Retry title',
       archived: 'Archived',
       hideArchived: 'Hide archived',
@@ -152,15 +153,17 @@ export const en: TranslationKeys = {
       name: 'Support the project',
       desc: 'If you find this plugin valuable, consider supporting its development!',
       buyMeACoffee: 'Buy me a coffee',
+      reportBug: 'Report Bug',
+      featureRequest: 'Feature Request',
     },
     defaults: {
       title: 'Default model policies & prompts',
       defaultChatModel: 'Default chat model',
       defaultChatModelDesc:
         'Choose the model you want to use for sidebar chat.',
-      chatTitleModel: 'Conversation title and summary model',
+      chatTitleModel: 'Conversation title model',
       chatTitleModelDesc:
-        'Choose the model used for automatic conversation naming and compact summaries.',
+        'Choose the model used for automatic conversation naming.',
       streamFallbackRecovery: 'Enable automatic recovery',
       streamFallbackRecoveryDesc:
         'When the streaming primary request times out or fails, retry once with a non-streaming fallback.',
@@ -169,7 +172,7 @@ export const en: TranslationKeys = {
         'How long to wait before the streaming primary request is treated as timed out. This timeout always applies; if automatic recovery is enabled, a non-streaming fallback is attempted afterward. Default: 60 seconds.',
       globalSystemPrompt: 'Global system prompt',
       globalSystemPromptDesc:
-        'This prompt is added to the beginning of every chat conversation. Supported variables: date {{current_date}}, date + current hour {{current_hour}}, date + current hour and minute {{current_minute}}, weekday {{current_weekday}}.',
+        'This prompt is added to the beginning of every chat conversation.',
       continuationSystemPrompt: 'Default continuation system prompt',
       continuationSystemPromptDesc:
         'Used as the system message when generating continuation text; leave empty to fall back to the built-in default.',
@@ -287,7 +290,7 @@ export const en: TranslationKeys = {
       description: 'Description',
       systemPrompt: 'System prompt',
       systemPromptDesc:
-        'This prompt will be added to the beginning of every chat. Supports {{current_date}}, {{current_hour}}, {{current_minute}}, and {{current_weekday}}.',
+        'This prompt will be added to the beginning of every chat.',
       systemPromptPlaceholder:
         "Enter system prompt to define assistant's behavior and capabilities",
       namePlaceholder: 'Enter assistant name',
@@ -306,12 +309,14 @@ export const en: TranslationKeys = {
     },
     agent: {
       title: 'Agent',
-      desc: 'Manage global capabilities and configure your agents.',
+      desc: 'Manage global tool availability. Enabled tools become selectable by agents; actual use must still be enabled in each agent.',
       globalCapabilities: 'Global capabilities',
       mcpServerCount: '{count} custom tool servers (MCP) connected',
       tools: 'Tools',
       toolsCount: '{count} tools',
       toolsCountWithEnabled: '{count} tools (enabled {enabled})',
+      mcpLoadingStatus: 'Loading {count} MCP…',
+      mcpErrorStatus: '{count} MCP failed to connect',
       skills: 'Skills',
       skillsCount: '{count} skills',
       skillsCountWithEnabled: '{count} skills (enabled {enabled})',
@@ -430,7 +435,11 @@ export const en: TranslationKeys = {
       builtinFsSearchLabel: 'Search Vault',
       builtinFsSearchDesc: 'Search vault files and content',
       builtinFsReadLabel: 'Read',
-      builtinFsReadDesc: 'Read vault files',
+      builtinFsReadDesc:
+        'Read vault files, skills, or open web pages (browser://)',
+      builtinContextPruneToolResultsLabel: 'Prune Tool Results',
+      builtinContextPruneToolResultsDesc:
+        'Exclude past tool results from future context. Note: this tool may break the prompt cache and increase request cost.',
       builtinContextCompactLabel: 'Compact Context',
       builtinContextCompactDesc: 'Compress earlier conversation into a summary',
       builtinToolSearchLabel: 'Load Tool',
@@ -444,7 +453,7 @@ export const en: TranslationKeys = {
       fsEditReviewToggleDesc:
         'When enabled, agent fs_edit changes open inline/apply review before writing the file.',
       builtinFsFileOpsLabel: 'File Operation Toolset',
-      builtinFsFileOpsDesc: 'Create, delete, and move files and folders',
+      builtinFsFileOpsDesc: 'Write, delete, and move files and folders',
       builtinMemoryOpsLabel: 'Memory Toolset',
       builtinMemoryOpsDesc: 'Add, update, and delete memory',
       builtinMemoryAddLabel: 'Add Memory',
@@ -466,9 +475,12 @@ export const en: TranslationKeys = {
       builtinWebOpsDesc: 'Web search and page scraping',
       builtinJsEvalLabel: 'JavaScript Execution',
       builtinJsEvalDesc: 'Run JavaScript in an isolated environment.',
-      builtinDelegateExternalAgentLabel: 'Delegate to External Agent',
-      builtinDelegateExternalAgentDesc:
-        'Delegate complex tasks to a CLI agent installed locally (Codex / Claude Code).',
+      builtinTerminalCommandLabel: 'Terminal Commands',
+      builtinTerminalCommandDesc:
+        'Run commands in the local terminal. Desktop-only.',
+      builtinDelegateSubagentLabel: 'Delegate Subagent',
+      builtinDelegateSubagentDesc:
+        'Dispatch an isolated temporary subagent to complete a self-contained task asynchronously.',
       builtinTodoWriteLabel: 'Task List',
       builtinTodoWriteDesc:
         'Let the agent plan and track multi-step task progress autonomously. Agent mode only.',
@@ -504,8 +516,7 @@ export const en: TranslationKeys = {
       editorIconDesc: 'Pick an icon for this agent',
       editorChooseIcon: 'Choose icon',
       editorSystemPrompt: 'System prompt',
-      editorSystemPromptDesc:
-        'Primary behavior instruction for this agent. Supported variables: date {{current_date}}, date + current hour {{current_hour}}, date + current hour and minute {{current_minute}}, weekday {{current_weekday}}.',
+      editorSystemPromptDesc: 'Primary behavior instruction for this agent.',
       editorSystemPromptExpand: 'Expand editor',
       editorSystemPromptCollapse: 'Close expanded editor',
       editorEnableProjectInstructions: 'Load project instruction files',
@@ -519,8 +530,10 @@ export const en: TranslationKeys = {
       toolApproval: 'Approval',
       toolApprovalFullAccess: 'Full access',
       toolApprovalRequire: 'Require approval',
-      toolApprovalForced: 'Approval required',
+      toolDisclosureAuto: 'Auto',
+      toolDisclosureAutoSelect: 'Auto select',
       toolDisclosureAlways: 'In context',
+      toolDisclosureMixed: 'Mixed',
       toolDisclosureOnDemand: 'On demand',
       editorEnabled: 'Enabled',
       editorDisabled: 'Disabled',
@@ -555,7 +568,10 @@ export const en: TranslationKeys = {
       agentCapabilitiesBlockTitle: 'Agent capabilities',
       focusSyncTitle: 'Focus sync',
       focusSyncDesc:
-        'When enabled, the AI can sense which file you are reading and where you are in it.',
+        'When enabled, the AI can sense where you are in the note, PDF, or web page you are viewing. Full web page content is read via fs_read with a browser:// path.',
+      timeContextTitle: 'Current time awareness',
+      timeContextDesc:
+        'Lets the model know the current time when each message is sent.',
       imageReadingBlockTitle: 'Image reading',
       imageReadingEnabled: 'Image reading',
       imageReadingEnabledDesc:
@@ -572,7 +588,7 @@ export const en: TranslationKeys = {
       autoContextCompactionBlockTitle: 'Context compaction',
       autoContextCompaction: 'Automatic context compaction',
       autoContextCompactionDesc:
-        "When the last assistant reply's prompt token usage crosses the threshold, compact older history before your next message is sent (not during the reply).",
+        'When the context reaches the threshold, remind the Agent to run the context compaction command.',
       autoContextCompactionThresholdMode: 'Compaction threshold mode',
       autoContextCompactionModeTokens: 'Absolute prompt tokens',
       autoContextCompactionModeRatio: 'Fraction of context window',
@@ -592,14 +608,24 @@ export const en: TranslationKeys = {
         'Enabling network requests lets scripts contact browser-accessible addresses and use a separate YOLO host request helper when browser cross-origin limits block a response. Only enable this for an agent you trust. Continue?',
       jsSandboxAllowVaultRead: 'Allow Vault Read',
       jsSandboxAllowVaultReadDesc:
-        'Let scripts read any vault file by path. This capability is not constrained by the agent directory scope. Risk: scripts could pass note contents to external services.',
+        'Let scripts list vault paths and read any vault file by path. This capability is not constrained by the agent directory scope. Risk: scripts could pass note contents to external services.',
       jsSandboxAllowVaultReadConfirm:
-        "Enabling vault read lets AI-generated scripts read any file in the vault by path. This data passes through the LLM context. Only enable if you trust this agent's scripts. Continue?",
+        "Enabling vault read lets AI-generated scripts list vault paths and read any file in the vault by path. This data passes through the LLM context. Only enable if you trust this agent's scripts. Continue?",
+      jsSandboxAllowBrowserRead: 'Allow Open Web Page Read',
+      jsSandboxAllowBrowserReadDesc:
+        'Let scripts read the full HTML of web pages already open in Obsidian by page ID. This can include logged-in or private page content.',
+      jsSandboxAllowBrowserReadRisk:
+        'Risk: scripts can read the full page DOM from pages you have opened in Obsidian, including hidden fields, embedded state, and private or logged-in content. Only enable for agents you fully trust.',
+      jsSandboxAllowBrowserReadConfirm:
+        'Enabling open web page read lets AI-generated scripts read full HTML from web pages already open in Obsidian by page ID. This content passes through the LLM context. Continue?',
+      jsSandboxBrowserReadMaxKb: 'Max page HTML size (KB)',
+      jsSandboxBrowserReadMaxKbDesc:
+        'Per-call full HTML limit. Larger pages are refused instead of shortened. Range 1–1048576 KB. Leave blank to use the default.',
       jsSandboxAllowDbQuery: 'Allow Knowledge Base Query',
       jsSandboxAllowDbQueryDesc:
-        'Let scripts query the vector database (semantic search, keyword search, path lookup). This capability is not constrained by the agent directory scope.',
+        'Let scripts query indexed vault content with semantic search and read Markdown/text content by known path. This capability is not constrained by the agent directory scope.',
       jsSandboxAllowDbQueryConfirm:
-        'Enabling knowledge base query lets AI-generated scripts search your vault index and retrieve file contents. Continue?',
+        'Enabling knowledge base query lets AI-generated scripts search indexed content and read Markdown/text content by known path. Continue?',
       jsSandboxAllowExternalScripts: 'Allow External Scripts',
       jsSandboxAllowExternalScriptsDesc:
         'Allow scripts to load and run remote JavaScript, and open the broader browser capabilities needed by those scripts.',
@@ -608,7 +634,6 @@ export const en: TranslationKeys = {
       jsSandboxAllowExternalScriptsConfirm:
         'Enabling external scripts lets the agent load and run remote JavaScript inside Obsidian. This is powerful and risky: only continue if you fully trust this agent and the code source.',
       jsSandboxConfirmEnableTitle: 'Enable extension capability',
-      jsExecApprovalForced: 'Forced approval when enabled',
       jsSandboxTimeoutMs: 'Execution timeout (ms)',
       jsSandboxTimeoutMsDesc:
         'Maximum runtime for a single script call. Range {min}–{max}.',
@@ -618,12 +643,42 @@ export const en: TranslationKeys = {
       jsSandboxVaultReadMaxKb: 'Max read size (KB)',
       jsSandboxVaultReadMaxKbDesc:
         'Per-call read limit. Larger text is shortened with a notice; larger binary files are refused. Range {min}–{max} KB.',
-      jsSandboxDbMaxLimit: 'Max rows per query',
+      jsSandboxDbMaxLimit: 'Max semantic rows',
       jsSandboxDbMaxLimitDesc:
-        'Upper bound on knowledge base results returned per query. Range 1–100.',
+        'Upper bound on semantic search results. Path reads are not affected. Range 1–100.',
     },
     jsSandbox: {
       openSettings: 'Configure JavaScript execution',
+    },
+    terminalCommand: {
+      openSettings: 'Configure terminal command',
+      blockedPrefixes: 'Blocked command prefixes',
+      blockedPrefixesDesc:
+        'Commands matching these prefixes will be rejected before execution.',
+      matchingRule:
+        'Prefix matching uses the first command token: rm blocks rm -rf /, but not npm run build.',
+      addPrefixPlaceholder: 'Command prefix, e.g. rm',
+      resetDefaults: 'Reset to defaults',
+    },
+    subagent: {
+      openSettings: 'Configure subagent models',
+      modelPool: 'Subagent model pool',
+      modelPoolDesc:
+        'The parent agent can dispatch subagents only with models in this pool.',
+      preferredModelRule:
+        'If the parent agent does not pass modelId explicitly, the preferred model is used.',
+      addModelsTitle: 'Add subagent models',
+      addModelsDesc:
+        'Select registered chat models to add to the subagent model pool.',
+      addModelPlaceholder: 'Select a model',
+      addModel: 'Add model',
+      addSelectedModels: 'Add selected models',
+      searchModels: 'Search models...',
+      setPreferredModel: 'Set as preferred model',
+      defaultModel: 'Default',
+      setDefaultModel: 'Set default',
+      emptyModelPool: 'No subagent models selected.',
+      poolCount: '{count} models',
     },
     webSearch: {
       modalTitle: 'Web search settings',
@@ -672,6 +727,9 @@ export const en: TranslationKeys = {
       fieldDepth: 'Depth',
       fieldSearchUrl: 'Search URL',
       fieldScrapeUrl: 'Scrape URL',
+      fieldUseProviderScrapeApi: 'Use provider scrape API',
+      fieldUseProviderScrapeApiDesc:
+        'When enabled, web_scrape uses this provider\u2019s extract API. When disabled, web_scrape uses the built-in generic scraper (static HTML, no extra API usage).',
       fieldBaseUrl: 'Base URL',
       fieldLanguage: 'Language',
       fieldEngines: 'Engines (comma-separated)',
@@ -752,19 +810,26 @@ export const en: TranslationKeys = {
       baseUrlDesc:
         'API endpoint for third-party services, e.g.: https://api.example.com/v1 or https://your-proxy.com/openai (Leave empty to use default)',
       baseUrlPlaceholder: 'https://api.example.com/v1',
+      apiUrlPreviewLabel: 'Preview:',
       noStainlessHeaders: 'No stainless headers',
       noStainlessHeadersDesc:
         'Enable this if you encounter cross-origin errors related to stainless headers.',
       useObsidianRequestUrl: 'Use Obsidian requestUrl',
       useObsidianRequestUrlDesc:
         'Use Obsidian requestUrl to bypass cross-origin restrictions. Streaming responses are buffered.',
-      requestTransportMode: 'Request transport mode',
+      requestTransportMode: 'Network request method',
       requestTransportModeDesc:
-        'Auto on desktop tries Node fetch first, then browser fetch on CORS/network errors; on mobile tries browser fetch then Obsidian requestUrl. Obsidian mode buffers streaming responses; Node mode uses desktop Node fetch for real streaming.',
+        'Choose how this provider sends network requests on this device. Desktop direct connection is recommended on desktop. On mobile, switch to Obsidian built-in request if browser requests have streaming or network issues.',
       requestTransportModeAuto: 'Auto (recommended)',
-      requestTransportModeBrowser: 'Browser fetch only',
-      requestTransportModeObsidian: 'Obsidian requestUrl only',
-      requestTransportModeNode: 'Desktop Node fetch only',
+      requestTransportModeBrowser: 'Browser request',
+      requestTransportModeObsidian: 'Obsidian built-in request',
+      requestTransportModeNode: 'Desktop direct connection (recommended)',
+      responseStreamingMode: 'Response streaming mode',
+      responseStreamingModeDesc:
+        'Control whether this provider uses streaming or non-streaming responses.',
+      responseStreamingModeAuto: 'Auto (default)',
+      responseStreamingModeStreaming: 'Streaming',
+      responseStreamingModeNonStreaming: 'Non-streaming',
       promptCaching: 'Prompt caching',
       promptCachingDesc:
         'Enable Anthropic ephemeral prompt caching. Reuses system prompt, tools, and conversation history across turns to cut input tokens. Cache writes carry a 25% premium; reads cost ~10% of normal input. Available whenever the provider API type is Anthropic; upstream must actually honor the cache_control field.',
@@ -830,8 +895,43 @@ export const en: TranslationKeys = {
       modelIdPlaceholder: 'Example: gpt-4o-mini',
       modelName: 'Display name',
       modelNamePlaceholder: 'Enter a display name',
+      connectivityTest: {
+        button: 'Connectivity Test',
+        title: 'Connectivity Test',
+        testAll: 'Test All',
+        retest: 'Retest',
+        stop: 'Stop',
+        test: 'Test',
+        passed: 'Passed',
+        statusTesting: 'Testing',
+        statusOk: 'OK',
+        statusFail: 'Failed',
+        statusTimeout: 'Timeout',
+        statusIdle: 'Pending',
+        normalCount: 'OK',
+        abnormalCount: 'failing',
+        notTested: 'Not tested yet',
+        noResponse: 'No response',
+        firstToken: 'First token',
+        dims: 'dims',
+        noModels: 'No models configured under this provider',
+        deleteModel: 'Delete model',
+        deleteChatModelBlocked:
+          'Cannot delete the model currently selected as chat or title model',
+        deleteEmbeddingModelBlocked:
+          'Cannot delete the currently selected embedding model',
+        deleteEmbeddingModelInProgress: 'Deleting embedding model…',
+      },
       availableModelsAuto: 'Available models (auto-fetched)',
       searchModels: 'Search models...',
+      modeSingle: 'Single',
+      modeBatch: 'Batch',
+      batchSelectAll: 'Select all',
+      batchSelected: 'Selected',
+      batchAlreadyAdded: 'Added',
+      batchAdd: 'Add selected',
+      batchHint:
+        'Batch-added models use default settings; fine-tune each one afterwards.',
       fetchModelsFailed: 'Failed to fetch models',
       embeddingModelsFirst: 'Embedding models are listed first',
       reasoningType: 'Model type',
@@ -915,6 +1015,7 @@ export const en: TranslationKeys = {
       desc: 'Manage knowledge base indexing. RAG is invoked automatically when the Agent uses the Search tool in Hybrid or RAG mode.',
       enableRag: 'Enable knowledge base indexing',
       enableRagDesc: 'Build indexes for documents within the selected scope.',
+      partialFailureSummary: 'Done · {{count}} file(s) could not be indexed',
       embeddingModel: 'Embedding model',
       embeddingModelDesc: 'Choose the model you want to use for embeddings',
       chunkSize: 'Chunk size',
@@ -1291,6 +1392,11 @@ export const en: TranslationKeys = {
     },
     etc: {
       title: 'Other',
+      pluginAutoUpdate: 'Auto-download updates',
+      pluginAutoUpdateDesc:
+        'When enabled, new versions are downloaded automatically in the background when detected.',
+      pluginAutoUpdateDescUnavailable:
+        'One-click install is only available on desktop with a writable plugin folder. On this device, update via Community plugins or GitHub.',
       exportConfig: 'Export settings',
       exportConfigDesc:
         'Export current plugin settings to a JSON file for use in other vaults.',
@@ -1365,6 +1471,16 @@ export const en: TranslationKeys = {
         'Only affects Apply in the sidebar Chat. Choose whether edits open inline review first or write directly to the file. Turning review off skips the second confirmation step.',
       chatApplyModeReviewRequired: 'Review before apply',
       chatApplyModeDirectApply: 'Write directly to file',
+      persistSelectionHighlight: 'Keep selection block highlight',
+      persistSelectionHighlightDesc:
+        'Keep showing the block highlight for selected editor content while interacting with sidebar Chat or Quick Ask.',
+      chatExportSubsectionTitle: 'Chat export',
+      chatExportIncludeThinking: 'Export thinking process',
+      chatExportIncludeThinkingDesc:
+        'Include assistant reasoning blocks in exported chat markdown.',
+      chatExportIncludeToolCalls: 'Export tool calls',
+      chatExportIncludeToolCallsDesc:
+        'Include tool call arguments and results in exported chat markdown.',
       notifications: 'Notifications',
       notificationsDesc:
         'Configure alerts for Agent runs. System notifications automatically degrade when the environment does not support them.',
@@ -1443,6 +1559,13 @@ export const en: TranslationKeys = {
     newChat: 'New chat',
     untitledConversation: 'New chat',
     continueResponse: 'Continue response',
+    loadEarlierMessages: 'Loading earlier messages',
+    loadNewerMessages: 'Loading newer messages',
+    messageNavigator: {
+      title: 'Message navigator',
+      itemAriaLabel: 'Jump to message {index}: {label}',
+      emptyMessage: 'Empty message',
+    },
     stopGeneration: 'Stop generation',
     queueMessage: {
       tooltip: 'Queue this message — it will be sent after the current step',
@@ -1476,8 +1599,14 @@ export const en: TranslationKeys = {
     selectModel: 'Select model',
     uploadImage: 'Upload image',
     uploadFile: 'Add file',
+    dropFilesHint: 'Drop to add files',
     imageUnsupportedByModel:
       'This model has not declared image support. Enable the "Vision" input modality in the model settings to attach images.',
+    unsupportedFileType: 'Unsupported file type: {names}',
+    processImagesFailed: 'Failed to process uploaded images',
+    readPdfFailed: 'Failed to read PDF "{name}": {error}',
+    readOfficeFailed: 'Failed to read Office document "{name}": {error}',
+    readTextAttachmentFailed: 'Failed to read text file "{name}": {error}',
     addContext: 'Add context',
     applyChanges: 'Apply changes',
     copyMessage: 'Copy message',
@@ -1520,12 +1649,18 @@ export const en: TranslationKeys = {
       createSnippetsFile: 'Click to create snippets.md',
     },
     emptyState: {
+      askTitle: 'Think first, then write',
+      askDescription:
+        'Great for questions, polishing, and rewriting with focus on expression.',
       chatTitle: 'Think first, then write',
       chatDescription:
         'Great for questions, polishing, and rewriting with focus on expression.',
       agentTitle: 'Let AI execute',
       agentDescription:
         'Enable tools to handle search, read/write operations, and multi-step tasks.',
+      agentFullTitle: 'Let AI execute · YOLO Mode',
+      agentFullDescription:
+        'Auto-approve tool calls for search, read/write operations, and multi-step tasks.',
     },
     compaction: {
       pendingTitle: 'Compacting context',
@@ -1657,6 +1792,23 @@ export const en: TranslationKeys = {
     },
     errorCard: {
       title: 'This response failed to generate',
+      responseFormat: {
+        responseNotObject:
+          'The model service returned a response that is not an object (actual: {{actual}}).',
+        missingChoices:
+          'The model service returned a response that cannot be parsed: missing choices array.',
+        invalidChoices:
+          'The model service returned a response that cannot be parsed: choices is not an array (actual: {{actual}}).',
+        stage: 'Stage: {{stage}}',
+        expected: 'Expected field: {{field}}',
+        expectedChoicesArray: 'choices array',
+        responseFields: 'Response fields: {{fields}}',
+        upstreamError: 'Upstream error: {{message}}',
+        errorType: 'Error type: {{type}}',
+        errorCode: 'Error code: {{code}}',
+        upstreamMessage: 'Upstream message: {{message}}',
+        responsePreview: 'Response preview: {{preview}}',
+      },
     },
     customRewritePromptPlaceholder:
       'Describe how to rewrite the selected text, for example: "make it concise and active voice; keep markdown structure"; press Shift+Enter to confirm, Enter for a new line, and Escape to close.',
@@ -1683,11 +1835,14 @@ export const en: TranslationKeys = {
         open_skill: 'Open skill',
       },
       writeAction: {
+        write: 'Write file',
+        delete: 'Delete',
+        create_dir: 'Create folder',
+        move: 'Move path',
+        // Legacy keys kept for rendering historical conversations.
         create_file: 'Create file',
         delete_file: 'Delete file',
-        create_dir: 'Create folder',
         delete_dir: 'Delete folder',
-        move: 'Move path',
       },
       readMode: {
         full: 'Full',
@@ -1718,24 +1873,43 @@ export const en: TranslationKeys = {
         created: 'Planned {count} tasks',
         progress: 'Progress {done}/{total}',
       },
+      terminalCommand: {
+        sessionPoll: 'Session {id} · Poll',
+        sessionKill: 'Session {id} · Kill',
+        sessionInput: 'Session {id} · Input: {preview}',
+      },
     },
-    externalAgent: {
+    liveTask: {
       statusRunning: 'Running',
       statusDone: 'Done',
       statusAborted: 'Aborted',
       statusError: 'Error',
       progress: 'Progress',
       output: 'Output',
+      activity: 'Activity',
       abortedBeforeOutput: 'Aborted before any output was collected.',
+      noActivity: 'No activity yet.',
+      progressTruncated: 'Progress truncated.',
+      truncated: 'Output truncated.',
     },
-    externalAgentResult: {
+    subagent: {
+      openDetails: 'View subagent details',
+      planningNextMoves: 'Planning next moves',
+      noActivity: 'No activity yet.',
       statusCompleted: 'Completed',
+      statusAborted: 'Aborted',
       statusFailed: 'Failed',
-      statusCancelled: 'Cancelled',
-      statusTimedOut: 'Timed out',
-      statusKilledByShutdown: 'Stopped',
-      showOutput: 'Show output',
-      jumpToDelegate: 'Jump to original delegate message',
+      toolUseCount: '{count} tools',
+      tokenCount: '{count} tokens',
+      approval: {
+        heading: 'Awaiting approval',
+        headingMulti: 'Awaiting approval · {count}',
+        approve: 'Approve',
+        reject: 'Reject',
+        approveAll: 'Approve all',
+        rejectAll: 'Reject all',
+        viewDetails: 'View parameters',
+      },
     },
     conversationSettings: {
       openAria: 'Conversation settings',
@@ -1765,6 +1939,8 @@ export const en: TranslationKeys = {
     rebuildingIndex: 'Rebuilding vault index…',
     rebuildComplete: 'Rebuilding vault index complete.',
     rebuildFailed: 'Rebuilding vault index failed.',
+    indexedWithSkipped:
+      'Index complete · {{count}} file(s) could not be indexed.',
     continueComplete: 'Resumed index completed.',
     continueFailed: 'Resumed index failed.',
     openYoloNewChatFailed:
@@ -1897,12 +2073,18 @@ export const en: TranslationKeys = {
   },
 
   chatMode: {
+    ask: 'Ask',
+    askDesc: 'Ask, refine, create',
     chat: 'Chat',
     chatDesc: 'Ask, refine, create',
     rewrite: 'Rewrite',
     rewriteDesc: 'Only modify the current selection',
     agent: 'Agent',
     agentDesc: 'Tools for complex tasks',
+    agentFull: 'Agent (YOLO)',
+    agentFullDesc: 'Auto-approve tool calls for complex tasks',
+    yolo: 'YOLO',
+    yoloDesc: 'Auto-approve tool calls for complex tasks',
     warning: {
       title: 'Please confirm before enabling Agent mode',
       description:
@@ -1917,10 +2099,27 @@ export const en: TranslationKeys = {
       cancel: 'Cancel',
       confirm: 'Continue and Enable Agent',
     },
+    fullAccessWarning: {
+      title: 'Please confirm before enabling YOLO Mode',
+      description:
+        'YOLO Mode auto-approves all tool calls, including file edits and terminal commands. Review the risks before continuing:',
+      permission:
+        'Tools run without per-call approval. Dangerous command prefixes are still blocked.',
+      cost: 'Autonomous runs may consume significant model resources and incur higher costs.',
+      backup:
+        'Back up important content in advance to avoid unintended changes.',
+      checkbox:
+        'I understand the risks above and accept responsibility for proceeding',
+      cancel: 'Cancel',
+      confirm: 'Continue with YOLO Mode',
+    },
   },
 
   reasoning: {
     selectReasoning: 'Select reasoning',
+    effort: 'Effort',
+    faster: 'Faster',
+    smarter: 'Smarter',
     off: 'Off',
     on: 'On',
     auto: 'Auto',
@@ -1939,17 +2138,21 @@ export const en: TranslationKeys = {
   configTransfer: {
     export: {
       title: 'Export settings',
-      description: 'Select the settings to export',
+      description:
+        'Select the settings to export. The file will be saved to {path}',
       selectAll: 'Select all',
       selectNone: 'Select none',
       sensitive: 'Contains credentials',
       redactedOption:
         'Redact credentials (replace API keys / passwords / headers / env vars with random strings)',
+      confirmUnredactedTitle: 'Confirm export',
+      confirmUnredacted:
+        'This unredacted export will save API keys / passwords / headers / env vars and other sensitive data to a file in the current vault. Continue?',
       submit: 'Export',
       cancel: 'Cancel',
       noticeAtLeastOne: 'Please select at least one item',
       noticeReadFailed: 'Failed to read current settings',
-      noticeSuccess: 'Settings exported as {fileName}',
+      noticeSuccess: 'Settings exported to {path}',
       noticeFailed: 'Failed to export settings — check console for details',
     },
     import: {
@@ -1993,8 +2196,6 @@ export const en: TranslationKeys = {
         'Invalid settings version in the export file — it may be corrupted.',
       errorFileFromNewerVersion:
         'This file was exported by a newer plugin version ({fileVersion}); current plugin schema is {currentVersion}. Please upgrade this plugin before importing.',
-      errorFileFromOlderVersion:
-        'This file was exported by an older plugin version ({fileVersion}); current plugin schema is {currentVersion}. Please upgrade YOLO on the source vault and re-export.',
       errorEmptyKeys: 'The export file contains no settings to import.',
       errorMissingData:
         'The data field is missing or invalid in the export file.',
@@ -2008,11 +2209,9 @@ export const en: TranslationKeys = {
         'Target vault settings are missing the version field — cannot check compatibility.',
       errorVaultFromNewerVersion:
         'Target vault uses a newer plugin version ({vaultVersion}); current is {currentVersion}. Please upgrade this plugin before importing.',
-      errorVaultFromOlderVersion:
-        'Target vault uses an older plugin version ({vaultVersion}); current is {currentVersion}. Please upgrade YOLO in the target vault before importing.',
       errorVaultEmpty: 'Target vault contains no exportable settings.',
       errorApplyVersionMismatch:
-        'Import data version ({importVersion}) does not match current plugin schema ({currentVersion}).',
+        'Import data version ({importVersion}) is newer than the current plugin schema ({currentVersion}).',
       errorApplySchema:
         'The imported settings failed validation — fields may be missing or malformed.',
     },
@@ -2041,13 +2240,39 @@ export const en: TranslationKeys = {
 
   update: {
     newVersionAvailable: 'New version {version} is available',
+    toastTitle: 'YOLO · New version',
     currentVersion: 'Current',
     viewDetails: 'Check for updates',
+    goUpdate: 'Update',
     dismiss: 'Dismiss',
+    languageEnglish: 'EN',
+    languageChinese: '中文',
+    viewHistory: 'View update history',
+    skipVersion: "Don't remind me for this version",
+    historyTitle: 'Release history',
+    historyLoading: 'Loading release history...',
+    historyError: 'Failed to load release history. Please try again later.',
+    historyEmpty: 'No release history found.',
+    historyPage: 'Page {{current}}',
+    historyPrev: 'Previous',
+    historyNext: 'Next',
     installationIncompleteTitle: 'Plugin installation incomplete',
     installationIncompleteMeta:
-      'main.js {bakedVersion} · manifest {manifestVersion}',
+      'main.js {mainVersion} · manifest {manifestVersion} · styles {stylesVersion}',
+    installationIncompleteSuspects: 'Files to repair: {files}',
     installationIncompleteNotes:
-      'This usually means main.js did not finish downloading during an update. Back up data.json, remove the plugin, and reinstall.',
+      'Plugin files may not have downloaded completely. A repair download will start automatically; you can also retry below.',
+    tryRepair: 'Try repair',
+    repairing: 'Repairing {{progress}}%',
+    repairAndReload: 'Repair and reload',
+    downloadUpdate: 'Download update',
+    downloading: 'Downloading {{progress}}%',
+    installAndReload: 'Install and reload',
+    applying: 'Installing…',
+    downloadFailed: 'Download failed',
+    installFailed: 'Install failed',
+    viewOnGitHub: 'View on GitHub',
+    updateInCommunityPlugins: 'Update in community plugins',
+    manualInstallOnGitHub: "Can't update? Install manually from GitHub",
   },
 }

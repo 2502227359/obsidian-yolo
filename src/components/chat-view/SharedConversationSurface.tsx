@@ -6,6 +6,7 @@ import type { ChatTimelineItem } from '../../types/chat-timeline'
 import {
   ChatTimelineList,
   type ChatTimelineRenderContext,
+  type ChatTimelineRenderVersion,
 } from './ChatTimelineList'
 
 type SharedConversationSurfaceProps<TItem extends ChatTimelineItem> = {
@@ -18,6 +19,7 @@ type SharedConversationSurfaceProps<TItem extends ChatTimelineItem> = {
     index: number,
     context?: ChatTimelineRenderContext,
   ) => ReactNode
+  renderVersion?: ChatTimelineRenderVersion<TItem>
   followOutput?: FollowOutput
   onAtBottomStateChange?: (atBottom: boolean) => void
   virtualizationThreshold?: number
@@ -25,11 +27,20 @@ type SharedConversationSurfaceProps<TItem extends ChatTimelineItem> = {
   overscanPx?: number
   atBottomThreshold?: number
   onVirtualizationChange?: (isVirtualized: boolean) => void
+  onActiveUserMessageChange?: (messageId: string | null) => void
+  windowNavigationKey?: number
+  windowNavigationTargetMessageId?: string | null
   onRenderStateChange?: (state: {
     visibleStartIndex: number
     visibleEndIndex: number
     heightByItemId: Record<string, number>
   }) => void
+  hasEarlierMessages?: boolean
+  hasNewerMessages?: boolean
+  onLoadEarlier?: () => void
+  onLoadNewer?: () => void
+  loadEarlierLabel?: string
+  loadNewerLabel?: string
   scrollContainerClassName?: string
   scrollContainerStyle?: CSSProperties
   containerClassName?: string
@@ -46,6 +57,7 @@ export function SharedConversationSurface<TItem extends ChatTimelineItem>({
   scrollContainerRef,
   onScrollContainerChange,
   renderItem,
+  renderVersion,
   followOutput,
   onAtBottomStateChange,
   virtualizationThreshold,
@@ -53,7 +65,16 @@ export function SharedConversationSurface<TItem extends ChatTimelineItem>({
   overscanPx,
   atBottomThreshold,
   onVirtualizationChange,
+  onActiveUserMessageChange,
+  windowNavigationKey,
+  windowNavigationTargetMessageId,
   onRenderStateChange,
+  hasEarlierMessages,
+  hasNewerMessages,
+  onLoadEarlier,
+  onLoadNewer,
+  loadEarlierLabel,
+  loadNewerLabel,
   scrollContainerClassName,
   scrollContainerStyle,
   containerClassName,
@@ -70,6 +91,7 @@ export function SharedConversationSurface<TItem extends ChatTimelineItem>({
       scrollContainerRef={scrollContainerRef}
       onScrollContainerChange={onScrollContainerChange}
       renderItem={renderItem}
+      renderVersion={renderVersion}
       followOutput={followOutput}
       onAtBottomStateChange={onAtBottomStateChange}
       virtualizationThreshold={virtualizationThreshold}
@@ -77,7 +99,16 @@ export function SharedConversationSurface<TItem extends ChatTimelineItem>({
       overscanPx={overscanPx}
       atBottomThreshold={atBottomThreshold}
       onVirtualizationChange={onVirtualizationChange}
+      onActiveUserMessageChange={onActiveUserMessageChange}
+      windowNavigationKey={windowNavigationKey}
+      windowNavigationTargetMessageId={windowNavigationTargetMessageId}
       onRenderStateChange={onRenderStateChange}
+      hasEarlierMessages={hasEarlierMessages}
+      hasNewerMessages={hasNewerMessages}
+      onLoadEarlier={onLoadEarlier}
+      onLoadNewer={onLoadNewer}
+      loadEarlierLabel={loadEarlierLabel}
+      loadNewerLabel={loadNewerLabel}
       scrollContainerClassName={scrollContainerClassName}
       scrollContainerStyle={scrollContainerStyle}
       bottomSpacerHeight={bottomSpacerHeight}

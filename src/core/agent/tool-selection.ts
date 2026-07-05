@@ -1,7 +1,9 @@
+import type { YoloSettings } from '../../settings/schema/setting.types'
 import type { AssistantToolPreference } from '../../types/assistant.types'
 import type { RequestTool } from '../../types/llm/request'
 import type { McpTool } from '../../types/mcp.types'
 import type { LLMProviderApiType } from '../../types/provider.types'
+import { estimateJsonTokens } from '../../utils/llm/contextTokenEstimate'
 import { type JsSandboxSettings } from '../mcp/jsSandboxSettings'
 import { JS_SANDBOX_TOOL_NAME, getJsSandboxTool } from '../mcp/jsSandboxTool'
 import {
@@ -14,7 +16,14 @@ import {
 import { McpManager } from '../mcp/mcpManager'
 import { parseToolName } from '../mcp/tool-name-utils'
 
-import { getAssistantToolDisclosureMode } from './tool-preferences'
+import {
+  formatSubagentModelOption,
+  resolveSubagentModelConfig,
+} from './subagent/model-config'
+import {
+  buildServerToolTokenBudgets,
+  getAssistantToolDisclosureMode,
+} from './tool-preferences'
 import { buildToolStub } from './tool-stub'
 
 const LOCAL_MEMORY_TOOL_NAMES = new Set([
@@ -23,18 +32,6 @@ const LOCAL_MEMORY_TOOL_NAMES = new Set([
   'memory_update',
   'memory_delete',
 ])
-
-const isOpenSkillToolName = (toolName: string): boolean => {
-  try {
-    const parsed = parseToolName(toolName)
-    return (
-      parsed.serverName === getLocalFileToolServerName() &&
-      parsed.toolName === 'open_skill'
-    )
-  } catch {
-    return toolName === 'open_skill'
-  }
-}
 
 export const isLoadToolSchemasToolName = (toolName: string): boolean => {
   try {
@@ -100,27 +97,33 @@ export const isMemoryToolAvailable = (toolName: string): boolean => {
 const isToolAllowed = ({
   toolName,
   allowedToolNames,
-  allowedSkillIds,
-  allowedSkillNames,
 }: {
   toolName: string
   allowedToolNames?: ReadonlySet<string>
-  allowedSkillIds?: ReadonlySet<string>
-  allowedSkillNames?: ReadonlySet<string>
 }): boolean => {
-  if (isOpenSkillToolName(toolName)) {
-    const hasAllowedSkills =
-      (allowedSkillIds?.size ?? 0) > 0 || (allowedSkillNames?.size ?? 0) > 0
-    if (!hasAllowedSkills) {
-      return false
-    }
-  }
-
   if (!allowedToolNames) {
     return true
   }
 
   return allowedToolNames.has(toolName)
+}
+
+const groupToolsByServer = (
+  tools: readonly McpTool[],
+): Map<string, McpTool[]> => {
+  const serverTools = new Map<string, McpTool[]>()
+  for (const tool of tools) {
+    let serverName: string
+    try {
+      serverName = parseToolName(tool.name).serverName
+    } catch {
+      continue
+    }
+    const bucket = serverTools.get(serverName) ?? []
+    bucket.push(tool)
+    serverTools.set(serverName, bucket)
+  }
+  return serverTools
 }
 
 export const buildRequestTools = (
@@ -147,7 +150,7 @@ export const buildRequestTools = (
  * Rewrite tools whose schema depends on global settings. Currently only
  * `js_eval`, whose description and `timeoutMs` input bound both name the
  * exact `settings.jsSandbox` values in effect (network / vault read / $db /
- * external scripts + per-call timeout cap).
+ * external scripts / browser page reads + per-call timeout cap).
  *
  * The tool list from `listAvailableTools` is cached and settings-agnostic —
  * this is the single bridge that rebuilds the live tool spec. Every consumer
@@ -157,62 +160,102 @@ export const buildRequestTools = (
  */
 export function applyDynamicToolDescriptions(
   tools: McpTool[],
-  ctx: { jsSandboxSettings: JsSandboxSettings },
+  ctx: {
+    jsSandboxSettings: JsSandboxSettings
+    settings?: YoloSettings
+  },
 ): McpTool[] {
   const jsSandboxFqn = `${getLocalFileToolServerName()}${McpManager.TOOL_NAME_DELIMITER}${JS_SANDBOX_TOOL_NAME}`
+  const delegateSubagentFqn = `${getLocalFileToolServerName()}${McpManager.TOOL_NAME_DELIMITER}delegate_subagent`
   return tools.map((tool) => {
-    if (tool.name !== jsSandboxFqn) return tool
-    const live = getJsSandboxTool(ctx.jsSandboxSettings)
-    return {
-      ...tool,
-      description: live.description,
-      inputSchema: live.inputSchema,
+    if (tool.name === jsSandboxFqn) {
+      const live = getJsSandboxTool(ctx.jsSandboxSettings)
+      return {
+        ...tool,
+        description: live.description,
+        inputSchema: live.inputSchema,
+      }
     }
+
+    if (tool.name === delegateSubagentFqn && ctx.settings) {
+      return applySubagentModelSchema(tool, ctx.settings)
+    }
+
+    return tool
   })
 }
 
-export const selectAllowedTools = ({
+function applySubagentModelSchema(
+  tool: McpTool,
+  settings: YoloSettings,
+): McpTool {
+  const config = resolveSubagentModelConfig(settings)
+  const allowedLines = config.allowedModelIds
+    .map((modelId) => `- ${formatSubagentModelOption(settings, modelId)}`)
+    .join('\n')
+  const preferredLine = config.preferredModelId
+    ? formatSubagentModelOption(settings, config.preferredModelId)
+    : 'none'
+  const modelDescription =
+    config.allowedModelIds.length > 0
+      ? `Optional modelId for this sub-agent. Allowed modelIds:\n${allowedLines}\nRecommended default: ${preferredLine}. If the user did not explicitly request a model, omit this field and the host will use the recommended default.`
+      : 'Optional modelId for this sub-agent. No registered chat models are currently configured for sub-agents.'
+
+  return {
+    ...tool,
+    description:
+      `${tool.description}\n\nSub-agent model policy: allowed modelIds are configured by the user. ` +
+      `Recommended default: ${preferredLine}. If the user explicitly asks for a sub-agent model, set modelId to one of the allowed modelIds; otherwise omit modelId.`,
+    inputSchema: {
+      ...tool.inputSchema,
+      properties: {
+        ...(tool.inputSchema.properties ?? {}),
+        modelId: {
+          type: 'string',
+          enum: config.allowedModelIds,
+          description: modelDescription,
+        },
+      },
+    },
+  }
+}
+
+export const selectAllowedTools = async ({
   availableTools,
   allowedToolNames,
-  allowedSkillIds,
-  allowedSkillNames,
   toolPreferences,
   apiType,
   enableToolDisclosure = true,
   jsSandboxSettings = {},
+  settings,
+  serverToolTokenBudgets,
 }: {
   availableTools: McpTool[]
   allowedToolNames?: string[]
-  allowedSkillIds?: string[]
-  allowedSkillNames?: string[]
   toolPreferences?: Record<string, AssistantToolPreference>
   apiType?: LLMProviderApiType | null
   enableToolDisclosure?: boolean
   jsSandboxSettings?: JsSandboxSettings
-}): {
+  settings?: YoloSettings
+  serverToolTokenBudgets?: ReadonlyMap<string, number>
+}): Promise<{
   filteredTools: McpTool[]
   hasTools: boolean
   hasMemoryTools: boolean
+  hasOnDemandTools: boolean
   requestTools: RequestTool[] | undefined
-} => {
+  serverToolTokenBudgets: ReadonlyMap<string, number>
+}> => {
   const normalizedAllowedToolNames = expandAllowedToolNames(allowedToolNames)
-  const normalizedAllowedSkillIds = allowedSkillIds
-    ? new Set(allowedSkillIds.map((id) => id.toLowerCase()))
-    : undefined
-  const normalizedAllowedSkillNames = allowedSkillNames
-    ? new Set(allowedSkillNames.map((name) => name.toLowerCase()))
-    : undefined
 
   const baseFiltered = applyDynamicToolDescriptions(
     availableTools.filter((tool) =>
       isToolAllowed({
         toolName: tool.name,
         allowedToolNames: normalizedAllowedToolNames,
-        allowedSkillIds: normalizedAllowedSkillIds,
-        allowedSkillNames: normalizedAllowedSkillNames,
       }),
     ),
-    { jsSandboxSettings },
+    { jsSandboxSettings, settings },
   )
   const assistantLike = {
     toolPreferences,
@@ -220,6 +263,12 @@ export const selectAllowedTools = ({
       ? [...normalizedAllowedToolNames]
       : undefined,
   }
+  const resolvedServerToolTokenBudgets =
+    serverToolTokenBudgets ??
+    (await buildServerToolTokenBudgets(
+      groupToolsByServer(baseFiltered),
+      estimateJsonTokens,
+    ))
 
   // Per-tool disclosure decisions for the filtered (non-loader) tools.
   // Computed up front so the loader injection can ask "does any surviving
@@ -230,6 +279,7 @@ export const selectAllowedTools = ({
       tool.name,
       getAssistantToolDisclosureMode(assistantLike, tool.name, {
         enableToolDisclosure,
+        serverToolTokenBudgets: resolvedServerToolTokenBudgets,
       }),
     )
   }
@@ -271,7 +321,9 @@ export const selectAllowedTools = ({
     hasMemoryTools: filteredTools.some((tool) =>
       isMemoryToolAvailable(tool.name),
     ),
+    hasOnDemandTools: hasOnDemand,
     requestTools: buildRequestTools(requestToolDefinitions),
+    serverToolTokenBudgets: resolvedServerToolTokenBudgets,
   }
 }
 

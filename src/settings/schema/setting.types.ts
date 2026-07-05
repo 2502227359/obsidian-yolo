@@ -41,6 +41,13 @@ const ragOptionsSchema = z.object({
    */
   embeddingConcurrency: z.number().catch(10),
   excludePatterns: z.array(z.string()).catch([]),
+  /**
+   * When true, the plugin's YOLO base directory (resolved dynamically from
+   * `yolo.baseDir`) is excluded from indexing on top of `excludePatterns`.
+   * The UI surfaces this as a removable chip in the exclude folder list;
+   * deleting that chip flips this flag to false and persists the choice.
+   */
+  excludeYoloBaseDir: z.boolean().catch(true),
   includePatterns: z.array(z.string()).catch([]),
   /** When true, index `.pdf` files for RAG (text extraction). */
   indexPdf: z.boolean().catch(true),
@@ -111,6 +118,7 @@ export const DEFAULT_TAB_COMPLETION_OPTIONS: TabCompletionOptionDefaults = {
 }
 
 export const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 60000
+export const MAX_MODEL_REQUEST_TIMEOUT_MS = 60 * 60 * 1000
 
 const notificationOptionsSchema = z
   .object({
@@ -249,14 +257,16 @@ export const jsSandboxSettingsSchema = z.object({
   // Maximum size (in KB) returned by $vault.readText / $vault.readBinary.
   // Files exceeding this are truncated (text) or refused (binary).
   vaultReadMaxKb: z.number().optional(),
+  allowBrowserRead: z.boolean().optional(),
+  // Maximum size (in KB) returned by $browser.readHtml. Pages exceeding
+  // this are refused so callers do not silently receive partial HTML.
+  browserReadMaxKb: z.number().optional(),
   allowExternalScripts: z.boolean().optional(),
   // Execution timeout cap, in milliseconds. The LLM may pass a smaller
   // timeoutMs in its tool args, but the host clamps the effective value
   // to this cap. Undefined means use the built-in default.
   timeoutMs: z.number().optional(),
-  // Maximum rows returned by $db.search / $db.find. The LLM may request a
-  // smaller limit per call but never larger. Undefined falls back to a
-  // built-in default.
+  // Maximum rows returned by $db.search (knowledge-base RAG/vector search).
   dbQueryMaxLimit: z.number().optional(),
   // Maximum size (in KB) of the tool's serialized JSON result returned to
   // the model. Output above this is truncated with a prefix. Undefined
@@ -296,11 +306,24 @@ export const yoloSettingsSchema = z.object({
   embeddingModels: resilientArraySchema(embeddingModelSchema),
 
   chatModelId: z.string().catch(''), // model for default chat feature
-  chatTitleModelId: z.string().catch(''), // model for automatic conversation naming and compact summaries
+  chatTitleModelId: z.string().catch(''), // model for automatic conversation naming
   embeddingModelId: z.string().catch(''), // model for embedding
 
   // System Prompt
   systemPrompt: z.string().catch(''),
+
+  // 时间感知:开启后,每条新用户消息发送时固定当前时间并以 <current_time> 前缀注入。
+  // 只影响之后的新消息,历史消息已固定不变。
+  timeContextEnabled: z.boolean().catch(true),
+
+  // 更新提示:同版本第一次关闭后记录软关闭版本,下次启动仍提示一次。
+  softDismissedUpdateVersion: z.string().catch(''),
+
+  // 更新提示:同版本第二次关闭后记录被静音的版本号,只有出现更高版本才会再次提示。
+  mutedUpdateVersion: z.string().catch(''),
+
+  /** 检测到新版本时在后台自动下载 release 文件；安装仍需用户确认。 */
+  pluginUpdateAutoDownloadEnabled: z.boolean().catch(true),
 
   // RAG Options
   ragOptions: ragOptionsSchema.catch({
@@ -311,6 +334,7 @@ export const yoloSettingsSchema = z.object({
     limit: 10,
     embeddingConcurrency: 10,
     excludePatterns: [],
+    excludeYoloBaseDir: true,
     includePatterns: [],
     indexPdf: true,
     autoUpdateEnabled: true,
@@ -331,10 +355,8 @@ export const yoloSettingsSchema = z.object({
       enableToolDisclosure: false,
     }),
 
-  // JS sandbox (js_eval) configuration. Global because the capability surface
-  // (network / vault read / $db / external scripts) is sensitive enough that
-  // we don't want it implicitly varying per agent — toggling any extension
-  // capability forces approval for every agent that has js_eval enabled.
+  // JS sandbox (js_eval) capability configuration is global; execution
+  // approval remains a per-agent tool preference.
   jsSandbox: jsSandboxSettingsSchema.catch({}),
 
   // Web search configuration (built-in agent tool)
@@ -351,6 +373,9 @@ export const yoloSettingsSchema = z.object({
   // Skills configuration
   skills: z
     .object({
+      // Globally disabled skills, stored by canonical skill *name* (frontmatter
+      // `name`, trim-only, case-sensitive). Field name kept for backwards
+      // compatibility; its elements are skill names, not a separate id.
       disabledSkillIds: z.array(z.string()).catch([]),
     })
     .catch({
@@ -383,15 +408,21 @@ export const yoloSettingsSchema = z.object({
       chatInputHeight: z.number().int().min(80).max(520).optional(),
       chatApplyMode: z.enum(['review-required', 'direct-apply']).optional(),
       chatTitlePrompt: z.string().optional(),
-      // Chat mode (chat/agent)
-      chatMode: z.enum(['chat', 'agent']).optional(),
+      // Chat mode (ask/agent)
+      chatMode: z.enum(['ask', 'agent']).optional(),
+      // Auto-approve tool calls (YOLO). Orthogonal to chatMode; only effective
+      // in Agent mode.
+      agentYoloEnabled: z.boolean().optional(),
       // Whether the user has acknowledged the first-time agent mode warning
       agentModeWarningConfirmed: z.boolean().optional(),
+      // Whether the user has acknowledged the first-time full access (YOLO) warning
+      fullAccessWarningConfirmed: z.boolean().optional(),
       // Persist preferred reasoning level per model id in Chat input
       reasoningLevelByModelId: z
         .record(z.string(), z.enum(REASONING_LEVELS))
         .optional(),
-      // Auto context compaction before next user send (based on last assistant usage)
+      // Auto context compaction prompt injected at runtime LLM boundaries
+      // (based on last assistant usage).
       autoContextCompactionEnabled: z.boolean().optional(),
       autoContextCompactionThresholdMode: z
         .enum(['tokens', 'ratio'])
@@ -406,6 +437,10 @@ export const yoloSettingsSchema = z.object({
       imageCompressionQuality: z.number().min(1).max(100).optional(),
       // Fetch external (http/https) image URLs referenced in Markdown
       externalImageFetchEnabled: z.boolean().optional(),
+      // Include assistant reasoning in exported chat markdown
+      chatExportIncludeThinking: z.boolean().optional(),
+      // Include tool call blocks in exported chat markdown
+      chatExportIncludeToolCalls: z.boolean().optional(),
       // Where the ribbon icon should open the Chat view
       ribbonClickAction: z
         .enum(['sidebar', 'tab', 'split', 'window', 'last'])
@@ -425,16 +460,19 @@ export const yoloSettingsSchema = z.object({
       chatTitlePrompt: '',
       chatMode: 'agent',
       agentModeWarningConfirmed: false,
+      fullAccessWarningConfirmed: false,
       reasoningLevelByModelId: {},
       autoContextCompactionEnabled: false,
       autoContextCompactionThresholdMode: 'tokens',
-      autoContextCompactionThresholdTokens: 24000,
+      autoContextCompactionThresholdTokens: 100000,
       autoContextCompactionThresholdRatio: 0.8,
       chatFontScale: undefined,
       imageReadingEnabled: true,
       imageCompressionEnabled: true,
       imageCompressionQuality: 85,
       externalImageFetchEnabled: false,
+      chatExportIncludeThinking: false,
+      chatExportIncludeToolCalls: false,
       ribbonClickAction: 'sidebar',
       lastChatPlacement: undefined,
     }),
@@ -450,6 +488,8 @@ export const yoloSettingsSchema = z.object({
       enableSmartSpace: z.boolean().optional(),
       // enable selection chat (Cursor-like text selection actions)
       enableSelectionChat: z.boolean().optional(),
+      // persist selected editor block highlight while chatting in sidebar
+      persistSelectionHighlight: z.boolean().optional(),
       // enable manual context selection for continuation
       manualContextEnabled: z.boolean().optional(),
       // manual context folders picked by user from the vault
@@ -524,9 +564,7 @@ export const yoloSettingsSchema = z.object({
       // trigger character for quick ask (default: @)
       quickAskTrigger: z.string().optional(),
       // quick ask mode: support legacy ask/edit values and current chat/agent values
-      quickAskMode: z
-        .enum(['ask', 'edit', 'edit-direct', 'chat', 'agent'])
-        .optional(),
+      quickAskMode: z.enum(['ask', 'edit', 'edit-direct', 'agent']).optional(),
       // auto dock quick ask to editor top right after sending
       quickAskAutoDockToTopRight: z.boolean().optional(),
       // quick ask context chars before cursor
@@ -540,7 +578,7 @@ export const yoloSettingsSchema = z.object({
         .number()
         .int()
         .min(1000)
-        .max(600000)
+        .max(MAX_MODEL_REQUEST_TIMEOUT_MS)
         .optional(),
     })
     .catch({
@@ -549,6 +587,7 @@ export const yoloSettingsSchema = z.object({
           ?.id ?? '',
       enableSmartSpace: true,
       enableSelectionChat: true,
+      persistSelectionHighlight: true,
       manualContextEnabled: false,
       manualContextFolders: [],
       referenceRuleFolders: [],
@@ -571,7 +610,7 @@ export const yoloSettingsSchema = z.object({
       smartSpaceUseUrlContext: false,
       enableQuickAsk: true,
       quickAskTrigger: '@',
-      quickAskMode: 'chat',
+      quickAskMode: 'ask',
       quickAskAutoDockToTopRight: true,
       quickAskContextBeforeChars: 5000,
       quickAskContextAfterChars: 2000,

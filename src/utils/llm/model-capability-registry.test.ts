@@ -24,13 +24,16 @@ describe('model-capability-registry', () => {
       200000,
     )
     expect(resolveKnownMaxContextTokens('gemini-2.5-flash')).toBe(1048576)
-    expect(resolveKnownMaxContextTokens('openrouter/grok-4-fast')).toBe(2000000)
+    expect(resolveKnownMaxContextTokens('openrouter/grok-4.20')).toBe(2000000)
+    expect(resolveKnownMaxContextTokens('deepseek/deepseek-v4-pro')).toBe(
+      1048576,
+    )
   })
 
   it('resolves known modalities per model', () => {
-    expect(resolveKnownChatModelModalities('deepseek/deepseek-chat')).toEqual([
-      'text',
-    ])
+    expect(
+      resolveKnownChatModelModalities('deepseek/deepseek-v4-flash'),
+    ).toEqual(['text'])
     expect(
       resolveKnownChatModelModalities('anthropic/claude-sonnet-4.5'),
     ).toEqual(expect.arrayContaining(['text', 'vision']))

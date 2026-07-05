@@ -1,11 +1,24 @@
 import { GoogleGenAI } from '@google/genai'
-import { FileText, Image as ImageIcon, Type } from 'lucide-react'
+import {
+  Check,
+  FileText,
+  Image as ImageIcon,
+  Layers,
+  Square,
+  Type,
+} from 'lucide-react'
 import { App, Notice, requestUrl } from 'obsidian'
-import { useEffect, useRef, useState } from 'react'
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from 'react'
 
 import { DEFAULT_CHAT_MODELS } from '../../../constants'
+import { BAKED_PLUGIN_VERSION } from '../../../constants/bakedVersion'
 import { useLanguage } from '../../../contexts/language-context'
 import { listBedrockChatModelIds } from '../../../core/llm/bedrockCatalog'
+import { listChatGPTOAuthModels } from '../../../core/llm/chatgptOAuthModelCatalog'
+import {
+  collectModelIdentifiers,
+  extractModelIdentifier,
+} from '../../../core/llm/modelCatalogIdentifiers'
 import YoloPlugin from '../../../main'
 import {
   ChatModel,
@@ -47,8 +60,6 @@ type AddChatModelModalComponentProps = {
 type CustomParameterFormEntry = CustomParameter & {
   uid: string
 }
-
-const MODEL_IDENTIFIER_KEYS = ['id', 'name', 'model'] as const
 
 const REASONING_TYPES = ['none', 'openai', 'gemini', 'anthropic'] as const
 type ReasoningType = (typeof REASONING_TYPES)[number]
@@ -109,28 +120,6 @@ const clampMaxContextTokens = (value: number): number =>
 const clampMaxOutputTokens = (value: number): number =>
   Math.max(1, Math.floor(value))
 
-const extractModelIdentifier = (value: unknown): string | null => {
-  if (typeof value === 'string') {
-    return value
-  }
-  if (!value || typeof value !== 'object') {
-    return null
-  }
-  const record = value as Record<string, unknown>
-  for (const key of MODEL_IDENTIFIER_KEYS) {
-    const candidate = record[key]
-    if (typeof candidate === 'string' && candidate.length > 0) {
-      return candidate
-    }
-  }
-  return null
-}
-
-const collectModelIdentifiers = (values: unknown[]): string[] =>
-  values
-    .map((entry) => extractModelIdentifier(entry))
-    .filter((id): id is string => Boolean(id))
-
 const normalizeGeminiBaseUrl = (raw?: string): string | undefined => {
   if (!raw) return undefined
   const trimmed = raw.replace(/\/+$/, '')
@@ -149,11 +138,10 @@ const CHATGPT_OAUTH_DEFAULT_MODELS = Array.from(
     ...DEFAULT_CHAT_MODELS.filter((model) =>
       model.providerId.startsWith('chatgpt-oauth'),
     ).map((model) => model.model),
-    'gpt-5.1-codex',
-    'gpt-5.1-codex-max',
-    'gpt-5.1-codex-mini',
-    'gpt-5.2',
-    'gpt-5.2-codex',
+    'gpt-5.5',
+    'gpt-5.4',
+    'gpt-5.4-mini',
+    'gpt-5.3-codex-spark',
   ]),
 )
 
@@ -222,8 +210,11 @@ export class AddChatModelModal extends ReactModal<AddChatModelModalComponentProp
       app: app,
       Component: AddChatModelModalComponent,
       props: { plugin, provider },
+      // No native title: the component renders its own header so the
+      // single/batch switcher can share the title's row (native title bar is
+      // hidden via the className below).
       options: {
-        title: 'Add custom chat model', // Will be translated in component
+        className: 'yolo-add-chat-model-modal',
       },
       plugin: plugin,
     })
@@ -327,6 +318,13 @@ function AddChatModelModalComponent({
     CustomParameterFormEntry[]
   >([])
 
+  // Batch add: pick many fetched models at once, save with default settings.
+  const [addMode, setAddMode] = useState<'single' | 'batch'>('single')
+  const [batchSearchQuery, setBatchSearchQuery] = useState('')
+  const [batchSelected, setBatchSelected] = useState<Set<string>>(
+    () => new Set(),
+  )
+
   useEffect(() => {
     const fetchModels = async () => {
       if (!selectedProvider) {
@@ -369,79 +367,30 @@ function AddChatModelModalComponent({
             return
           }
 
-          const base = (
-            selectedProvider.baseUrl?.trim() ||
-            'https://chatgpt.com/backend-api/codex'
-          ).replace(/\/+$/, '')
-          const baseWithoutVersion = base.replace(/\/v\d+$/, '')
-          const urlCandidates = Array.from(
-            new Set([
-              `${base}/models`,
-              `${baseWithoutVersion}/models`,
-              `${base}/responses/models`,
-              `${baseWithoutVersion}/responses/models`,
-            ]),
-          )
-
-          let lastErr: unknown = null
-          for (const url of urlCandidates) {
-            try {
-              const response = await requestUrl({
-                url,
-                method: 'GET',
-                headers: {
-                  Accept: 'application/json',
-                  Authorization: `Bearer ${credential.accessToken}`,
-                  originator: 'opencode',
-                  ...(credential.accountId
-                    ? { 'ChatGPT-Account-Id': credential.accountId }
-                    : {}),
-                  ...(providerHeaders ?? {}),
-                },
-              })
-              if (response.status < 200 || response.status >= 300) {
-                lastErr = new Error(
-                  `Failed to fetch models: ${response.status}`,
-                )
-                continue
-              }
-              const json = response.json ?? JSON.parse(response.text)
-              const buckets: string[] = []
-              if (Array.isArray(json?.data)) {
-                buckets.push(...collectModelIdentifiers(json.data))
-              }
-              if (Array.isArray(json?.models)) {
-                buckets.push(...collectModelIdentifiers(json.models))
-              }
-              if (Array.isArray(json)) {
-                buckets.push(...collectModelIdentifiers(json))
-              }
-
-              const unique = Array.from(
-                new Set([...buckets, ...CHATGPT_OAUTH_DEFAULT_MODELS]),
-              ).sort()
-              if (unique.length === 0) {
-                lastErr = new Error('Empty models list in response')
-                continue
-              }
-
-              setAvailableModels(unique)
-              plugin.setCachedModelList(selectedProvider.id, unique, 'chat')
-              return
-            } catch (error) {
-              lastErr = error
-            }
+          try {
+            const models = await listChatGPTOAuthModels({
+              baseUrl: selectedProvider.baseUrl,
+              accessToken: credential.accessToken,
+              accountId: credential.accountId,
+              headers: providerHeaders,
+              clientVersion: BAKED_PLUGIN_VERSION,
+            })
+            const unique = Array.from(
+              new Set([...models, ...CHATGPT_OAUTH_DEFAULT_MODELS]),
+            ).sort()
+            setAvailableModels(unique)
+            plugin.setCachedModelList(selectedProvider.id, unique, 'chat')
+          } catch (error) {
+            console.warn(
+              '[YOLO] Failed to fetch ChatGPT OAuth models, fallback to defaults.',
+              error,
+            )
+            const fallback = Array.from(
+              new Set(CHATGPT_OAUTH_DEFAULT_MODELS),
+            ).sort()
+            setAvailableModels(fallback)
+            plugin.setCachedModelList(selectedProvider.id, fallback, 'chat')
           }
-
-          console.warn(
-            '[YOLO] Failed to fetch ChatGPT OAuth models, fallback to defaults.',
-            lastErr,
-          )
-          const fallback = Array.from(
-            new Set(CHATGPT_OAUTH_DEFAULT_MODELS),
-          ).sort()
-          setAvailableModels(fallback)
-          plugin.setCachedModelList(selectedProvider.id, fallback, 'chat')
           return
         }
 
@@ -805,8 +754,318 @@ function AddChatModelModalComponent({
       })
   }
 
+  // Models already configured under this provider — used to dedupe the batch
+  // list. Keyed by calling id (`model`); display name is intentionally ignored.
+  const existingProviderModelIds = useMemo(
+    () =>
+      new Set(
+        plugin.settings.chatModels
+          .filter((model) => model.providerId === formData.providerId)
+          .map((model) => model.model),
+      ),
+    [plugin.settings.chatModels, formData.providerId],
+  )
+
+  const filteredBatchModels = useMemo(() => {
+    const query = batchSearchQuery.trim().toLowerCase()
+    return availableModels
+      .filter((model) => (query ? model.toLowerCase().includes(query) : true))
+      .map((model) => ({
+        model,
+        alreadyAdded: existingProviderModelIds.has(model),
+      }))
+  }, [availableModels, batchSearchQuery, existingProviderModelIds])
+
+  const selectableFiltered = filteredBatchModels.filter((m) => !m.alreadyAdded)
+  const allFilteredSelected =
+    selectableFiltered.length > 0 &&
+    selectableFiltered.every((m) => batchSelected.has(m.model))
+  const totalSelected = Array.from(batchSelected).filter(
+    (model) => !existingProviderModelIds.has(model),
+  ).length
+  // How many of the fetched models are already configured for this provider —
+  // shown so an opened-with-existing-models list doesn't read as empty.
+  const addedCount = availableModels.filter((model) =>
+    existingProviderModelIds.has(model),
+  ).length
+
+  const toggleBatchModel = (model: string) => {
+    setBatchSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(model)) {
+        next.delete(model)
+      } else {
+        next.add(model)
+      }
+      return next
+    })
+  }
+
+  const toggleSelectAllFiltered = () => {
+    setBatchSelected((prev) => {
+      const next = new Set(prev)
+      if (allFilteredSelected) {
+        selectableFiltered.forEach((m) => next.delete(m.model))
+      } else {
+        selectableFiltered.forEach((m) => next.add(m.model))
+      }
+      return next
+    })
+  }
+
+  const handleBatchSubmit = () => {
+    if (!selectedProvider) {
+      new Notice(t('common.error'))
+      return
+    }
+    if (
+      !plugin.settings.providers.some(
+        (provider) => provider.id === formData.providerId,
+      )
+    ) {
+      new Notice('Provider with this ID does not exist')
+      return
+    }
+
+    const selectedList = Array.from(batchSelected).filter(
+      (model) => !existingProviderModelIds.has(model),
+    )
+    if (selectedList.length === 0) {
+      return
+    }
+
+    // Accumulate ids locally so models added in the same batch don't collide.
+    const existingIds = plugin.settings.chatModels.map((m) => m.id)
+    const newModels: ChatModel[] = []
+    for (const model of selectedList) {
+      const uniqueId = ensureUniqueModelId(
+        existingIds,
+        generateModelId(formData.providerId, model),
+      )
+      existingIds.push(uniqueId)
+
+      const detectedReasoning = detectReasoningTypeFromModelId(model)
+      const reasoning = isReasoningTypeCompatible(
+        selectedProvider,
+        detectedReasoning,
+      )
+        ? detectedReasoning
+        : 'none'
+      const knownMaxContext = resolveKnownMaxContextTokens(model)
+
+      const candidate: ChatModel = {
+        providerId: formData.providerId,
+        id: uniqueId,
+        model,
+        name: model,
+        reasoningType: reasoning,
+        modalities:
+          resolveKnownChatModelModalities(model) ??
+          resolveDefaultChatModelModalities(selectedProvider),
+        ...(typeof knownMaxContext === 'number'
+          ? { maxContextTokens: knownMaxContext }
+          : {}),
+      }
+
+      const validationResult = chatModelSchema.safeParse(candidate)
+      if (!validationResult.success) {
+        new Notice(
+          validationResult.error.issues.map((v) => v.message).join('\n'),
+        )
+        return
+      }
+      newModels.push(candidate)
+    }
+
+    void plugin
+      .setSettings({
+        ...plugin.settings,
+        chatModels: [...plugin.settings.chatModels, ...newModels],
+      })
+      .then(() => {
+        onClose()
+      })
+      .catch((error) => {
+        console.error('Failed to batch add chat models', error)
+        new Notice(t('common.error'))
+      })
+  }
+
+  const modeTabs = [
+    {
+      key: 'single' as const,
+      label: t('settings.models.modeSingle', '单个'),
+      Icon: Square,
+    },
+    {
+      key: 'batch' as const,
+      label: t('settings.models.modeBatch', '批量'),
+      Icon: Layers,
+    },
+  ]
+  const modeSwitcher = (
+    <div className="yolo-chat-model-modal-header">
+      <h2 className="yolo-chat-model-modal-title">
+        {t('settings.models.addCustomChatModel')}
+      </h2>
+      <div
+        className="yolo-model-mode-seg"
+        role="tablist"
+        style={
+          {
+            '--yolo-mode-seg-count': modeTabs.length,
+            '--yolo-mode-seg-index': addMode === 'single' ? 0 : 1,
+          } as CSSProperties
+        }
+      >
+        <div className="yolo-model-mode-seg-glider" aria-hidden="true" />
+        {modeTabs.map(({ key, label, Icon }) => (
+          <button
+            key={key}
+            type="button"
+            role="tab"
+            aria-selected={addMode === key}
+            className={`yolo-model-mode-seg-btn${
+              addMode === key ? ' is-active' : ''
+            }`}
+            onClick={() => setAddMode(key)}
+          >
+            <span className="yolo-model-mode-seg-icon" aria-hidden="true">
+              <Icon size={14} />
+            </span>
+            <span className="yolo-model-mode-seg-label">{label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+
+  if (addMode === 'batch') {
+    return (
+      <div className="yolo-chat-model-modal-form">
+        {modeSwitcher}
+
+        <div className="yolo-batch-add">
+          <input
+            type="text"
+            className="yolo-batch-add-search"
+            value={batchSearchQuery}
+            placeholder={t('settings.models.searchModels', '搜索模型...')}
+            onChange={(event) => setBatchSearchQuery(event.currentTarget.value)}
+            disabled={loadingModels}
+          />
+
+          <div className="yolo-batch-add-toolbar">
+            <button
+              type="button"
+              className="yolo-batch-add-selectall"
+              onClick={toggleSelectAllFiltered}
+              disabled={selectableFiltered.length === 0}
+            >
+              <span
+                className={`yolo-batch-add-check${
+                  allFilteredSelected ? ' is-checked' : ''
+                }`}
+              >
+                {allFilteredSelected ? <Check size={12} /> : null}
+              </span>
+              {t('settings.models.batchSelectAll', '全选')}
+            </button>
+            <span className="yolo-batch-add-count">
+              {addedCount > 0 ? (
+                <>
+                  {t('settings.models.batchAlreadyAdded', '已添加')}{' '}
+                  {addedCount} ·{' '}
+                </>
+              ) : null}
+              {t('settings.models.batchSelected', '已选')} {totalSelected} /{' '}
+              {availableModels.length}
+            </span>
+          </div>
+
+          <div className="yolo-batch-add-list">
+            {loadingModels ? (
+              <div className="yolo-batch-add-empty">{t('common.loading')}</div>
+            ) : loadError ? (
+              <div className="yolo-batch-add-empty yolo-batch-add-empty--error">
+                {t('settings.models.fetchModelsFailed', '获取模型失败')}：
+                {loadError}
+              </div>
+            ) : filteredBatchModels.length === 0 ? (
+              <div className="yolo-batch-add-empty">
+                {t('common.noResults', '没有匹配的模型')}
+              </div>
+            ) : (
+              filteredBatchModels.map(({ model, alreadyAdded }) => {
+                const checked = batchSelected.has(model)
+                return (
+                  <div
+                    key={model}
+                    className={`yolo-batch-add-row${
+                      alreadyAdded ? ' is-added' : ''
+                    }${checked ? ' is-checked' : ''}`}
+                    role={alreadyAdded ? undefined : 'button'}
+                    tabIndex={alreadyAdded ? undefined : 0}
+                    onClick={
+                      alreadyAdded ? undefined : () => toggleBatchModel(model)
+                    }
+                    onKeyDown={
+                      alreadyAdded
+                        ? undefined
+                        : (event) => {
+                            if (event.key === 'Enter' || event.key === ' ') {
+                              event.preventDefault()
+                              toggleBatchModel(model)
+                            }
+                          }
+                    }
+                  >
+                    <span
+                      className={`yolo-batch-add-check${
+                        checked ? ' is-checked' : ''
+                      }`}
+                    >
+                      {checked ? <Check size={12} /> : null}
+                    </span>
+                    <span className="yolo-batch-add-row-id">{model}</span>
+                    {alreadyAdded ? (
+                      <span className="yolo-batch-add-added">
+                        {t('settings.models.batchAlreadyAdded', '已添加')}
+                      </span>
+                    ) : null}
+                  </div>
+                )
+              })
+            )}
+          </div>
+
+          <div className="yolo-batch-add-hint">
+            {t(
+              'settings.models.batchHint',
+              '批量添加使用默认参数，可在添加后单独调整',
+            )}
+          </div>
+        </div>
+
+        <ObsidianSetting>
+          <ObsidianButton
+            text={`${t('settings.models.batchAdd', '添加选中模型')}${
+              totalSelected > 0 ? ` (${totalSelected})` : ''
+            }`}
+            onClick={handleBatchSubmit}
+            cta
+            disabled={totalSelected === 0}
+          />
+          <ObsidianButton text={t('common.cancel')} onClick={onClose} />
+        </ObsidianSetting>
+      </div>
+    )
+  }
+
   return (
     <div className="yolo-chat-model-modal-form">
+      {modeSwitcher}
+
       {/* Available models dropdown (moved above modelId) */}
       <ObsidianSetting
         name={

@@ -9,7 +9,6 @@ import {
 import {
   ChevronDown,
   ChevronUp,
-  PencilLine,
   RotateCcw,
   Send,
   Square,
@@ -30,6 +29,7 @@ import { useApp } from '../../../contexts/app-context'
 import { useLanguage } from '../../../contexts/language-context'
 import { useMcp } from '../../../contexts/mcp-context'
 import { useSettings } from '../../../contexts/settings-context'
+import { resolveAssistantTimeContextEnabled } from '../../../core/agent/assistant-capabilities'
 import { getEnabledAssistantToolNames } from '../../../core/agent/tool-preferences'
 import { materializeTextEditPlan } from '../../../core/edits/textEditEngine'
 import { parseTextEditPlan } from '../../../core/edits/textEditPlan'
@@ -60,6 +60,7 @@ import {
   MentionableBlock,
   SerializedMentionable,
 } from '../../../types/mentionable'
+import type { ToolCallResponse } from '../../../types/tool-call.types'
 import { renderAssistantIcon } from '../../../utils/assistant-icon'
 import type { EditorSnapshotInjection } from '../../../utils/chat/contextual-injections'
 import { generateEditPlan } from '../../../utils/chat/editMode'
@@ -68,10 +69,10 @@ import {
   getMentionableKey,
   serializeMentionable,
 } from '../../../utils/chat/mentionable'
-import { groupAssistantAndToolMessages } from '../../../utils/chat/message-groups'
 import { RequestContextBuilder } from '../../../utils/chat/requestContextBuilder'
 import { buildMessageTimelineItems } from '../../../utils/chat/timeline'
 import { readTFileContent } from '../../../utils/obsidian'
+import { stampUserMessageTimeContext } from '../../../utils/prompt/timeContext'
 import AssistantToolMessageGroupItem from '../../chat-view/AssistantToolMessageGroupItem'
 import type { ChatUserInputRef } from '../../chat-view/chat-input/ChatUserInput'
 import LexicalContentEditable from '../../chat-view/chat-input/LexicalContentEditable'
@@ -83,6 +84,10 @@ import { resolveChatModeRuntime } from '../../chat-view/chat-runtime-profiles'
 import { getChatSurfacePreset } from '../../chat-view/chat-surface-presets'
 import { SharedConversationSurface } from '../../chat-view/SharedConversationSurface'
 import { useAutoScroll } from '../../chat-view/useAutoScroll'
+import {
+  useChatTimelineReadModel,
+  useStableChatTimelineItems,
+} from '../../chat-view/useChatTimelineReadModel'
 import UserMessageItem from '../../chat-view/UserMessageItem'
 import { YoloDropdownContent } from '../../common/popover'
 
@@ -92,10 +97,29 @@ import { createQuickAskEditorState } from './utils/createQuickAskEditorState'
 
 type QuickAskExecutionMode = QuickAskMode | 'edit' | 'edit-direct'
 
+const quickAskRenderVersionObjectIds = new WeakMap<object, number>()
+let nextQuickAskRenderVersionObjectId = 1
+
+function getQuickAskRenderVersionObjectId(
+  value: object | null | undefined,
+): number {
+  if (!value) {
+    return 0
+  }
+  const existing = quickAskRenderVersionObjectIds.get(value)
+  if (existing !== undefined) {
+    return existing
+  }
+  const id = nextQuickAskRenderVersionObjectId
+  nextQuickAskRenderVersionObjectId += 1
+  quickAskRenderVersionObjectIds.set(value, id)
+  return id
+}
+
 function normalizeQuickAskVisibleMode(
   mode?: QuickAskLaunchMode | null,
 ): QuickAskMode {
-  return mode === 'agent' ? 'agent' : 'chat'
+  return mode === 'agent' ? 'agent' : 'ask'
 }
 
 function normalizeQuickAskExecutionMode(
@@ -105,7 +129,7 @@ function normalizeQuickAskExecutionMode(
     return mode
   }
 
-  return 'chat'
+  return 'ask'
 }
 
 function getSelectionMentionable(
@@ -301,12 +325,12 @@ export function QuickAskPanel({
       const resolved = normalizeQuickAskExecutionMode(
         initialMode ?? settings.continuationOptions?.quickAskMode,
       )
-      // PDF path: edit modes are unavailable; fall back to 'chat'
+      // PDF path: edit modes are unavailable; fall back to 'ask'
       if (
         !capabilities.edit &&
         (resolved === 'edit' || resolved === 'edit-direct')
       ) {
-        return 'chat'
+        return 'ask'
       }
       return resolved
     },
@@ -331,17 +355,20 @@ export function QuickAskPanel({
   const [focusedUserMessageId, setFocusedUserMessageId] = useState<
     string | null
   >(null)
+  const suppressNextFocusedUserMessageOutsidePointerRef = useRef<string | null>(
+    null,
+  )
 
   useEffect(() => {
     if (initialMode) {
       setMode(normalizeQuickAskVisibleMode(initialMode))
       const resolved = normalizeQuickAskExecutionMode(initialMode)
-      // PDF path: edit modes are unavailable; fall back to 'chat'
+      // PDF path: edit modes are unavailable; fall back to 'ask'
       if (
         !capabilities.edit &&
         (resolved === 'edit' || resolved === 'edit-direct')
       ) {
-        setExecutionMode('chat')
+        setExecutionMode('ask')
       } else {
         setExecutionMode(resolved)
       }
@@ -399,9 +426,6 @@ export function QuickAskPanel({
   const modeTriggerLabel = isTemporaryRewriteMode
     ? t('chatMode.rewrite', '改写')
     : undefined
-  const modeTriggerIcon = isTemporaryRewriteMode ? (
-    <PencilLine size={14} />
-  ) : undefined
   const buildEditInstruction = useCallback(
     (instruction: string) => {
       const context = selectionEditContextText.trim()
@@ -506,7 +530,7 @@ export function QuickAskPanel({
   const shouldShowInlineRunStatus =
     isStreaming &&
     !!runStatusLabel &&
-    ((executionMode !== 'agent' && executionMode !== 'chat') ||
+    ((executionMode !== 'agent' && executionMode !== 'ask') ||
       (!hasStreamingAssistantPlaceholder && !hasVisibleAssistantOrToolMessages))
 
   const noop = useCallback(() => {}, [])
@@ -627,10 +651,20 @@ export function QuickAskPanel({
         systemPrompt: combinedSystemPrompt,
       },
       {
-        includeSkills: executionMode === 'agent' || executionMode === 'chat',
+        includeSkills: executionMode === 'agent' || executionMode === 'ask',
+        systemPromptSnapshotStore: plugin
+          .getAgentService()
+          .getSystemPromptSnapshotStore(),
+        getPromptSourceRevision: () =>
+          plugin.getAgentService().getPromptSourceWatcher().getRevision(),
+        promptSourcePathsCallback: (paths) =>
+          plugin
+            .getAgentService()
+            .getPromptSourceWatcher()
+            .setWatchedPaths(paths),
       },
     )
-  }, [app, executionMode, selectedAssistant, settings])
+  }, [app, executionMode, selectedAssistant, settings, plugin])
 
   const editorSnapshotInjection =
     useMemo<EditorSnapshotInjection | null>(() => {
@@ -999,13 +1033,17 @@ export function QuickAskPanel({
         }
       })
 
-      const userMessage: ChatUserMessage = {
-        role: 'user',
-        content: editorState,
-        promptContent: null,
-        id: options?.userMessageId ?? uuidv4(),
-        mentionables: mentionablesOverride ?? mentionables,
-      }
+      // 新用户回合进入对话:在此固定当前时间(与侧边栏 Chat 同一机制)。
+      const userMessage: ChatUserMessage = stampUserMessageTimeContext(
+        {
+          role: 'user',
+          content: editorState,
+          promptContent: null,
+          id: options?.userMessageId ?? uuidv4(),
+          mentionables: mentionablesOverride ?? mentionables,
+        },
+        resolveAssistantTimeContextEnabled(selectedAssistant, settings),
+      )
 
       // Clear mentionables after creating the message
       setMentionables([])
@@ -1079,24 +1117,23 @@ export function QuickAskPanel({
 
         const isAgentMode = executionMode === 'agent'
         const chatModeRuntime = resolveChatModeRuntime({
-          mode: isAgentMode ? 'agent' : 'chat',
+          mode: isAgentMode ? 'agent' : 'ask',
           assistant: selectedAssistant,
           assistantEnabledToolNames:
             getEnabledAssistantToolNames(selectedAssistant),
         })
         const effectiveModel = model
-        const disabledSkillIds = settings.skills?.disabledSkillIds ?? []
+        const disabledSkillNames = settings.skills?.disabledSkillIds ?? []
         const enabledSkillEntries = selectedAssistant
-          ? listLiteSkillEntries(app, { settings }).filter((skill) =>
+          ? (await listLiteSkillEntries(app, { settings })).filter((skill) =>
               isSkillEnabledForAssistant({
                 assistant: selectedAssistant,
-                skillId: skill.id,
-                disabledSkillIds,
+                skillName: skill.name,
+                disabledSkillNames,
               }),
             )
           : []
-        const allowedSkillIds = enabledSkillEntries.map((skill) => skill.id)
-        const allowedSkillNames = enabledSkillEntries.map((skill) => skill.name)
+        const allowedSkillPaths = enabledSkillEntries.map((skill) => skill.path)
 
         const agentService = plugin.getAgentService()
         unsubscribeRunner = agentService.subscribe(
@@ -1122,13 +1159,14 @@ export function QuickAskPanel({
             allowedToolNames: chatModeRuntime.allowedToolNames,
             enableToolDisclosure: settings.mcp.enableToolDisclosure,
             toolPreferences: chatModeRuntime.toolPreferences,
-            allowedSkillIds,
-            allowedSkillNames,
+            toolServerPreferences: chatModeRuntime.toolServerPreferences,
+            allowedSkillPaths,
+            runtimeModePrompt: chatModeRuntime.runtimeModePrompt,
             contextualInjections: editorSnapshotInjection
               ? [editorSnapshotInjection]
               : [],
             requestParams: {
-              stream: true,
+              deliveryMode: 'incremental',
               primaryRequestTimeoutMs:
                 settings.continuationOptions.primaryRequestTimeoutMs,
               streamFallbackRecoveryEnabled:
@@ -1199,6 +1237,33 @@ export function QuickAskPanel({
     [],
   )
 
+  const handleToolCallResponseUpdate = useCallback(
+    (toolMessageId: string, toolCallId: string, response: ToolCallResponse) => {
+      setChatMessages((prev) =>
+        prev.map((message) => {
+          if (message.id !== toolMessageId || message.role !== 'tool') {
+            return message
+          }
+
+          let didChange = false
+          const nextToolCalls = message.toolCalls.map((toolCall) => {
+            if (toolCall.request.id !== toolCallId) {
+              return toolCall
+            }
+            if (toolCall.response === response) {
+              return toolCall
+            }
+            didChange = true
+            return { ...toolCall, response }
+          })
+
+          return didChange ? { ...message, toolCalls: nextToolCalls } : message
+        }),
+      )
+    },
+    [],
+  )
+
   const registerChatUserInputRef = useCallback(
     (messageId: string, ref: ChatUserInputRef | null) => {
       if (ref) {
@@ -1212,6 +1277,7 @@ export function QuickAskPanel({
 
   useEffect(() => {
     if (!focusedUserMessageId) {
+      suppressNextFocusedUserMessageOutsidePointerRef.current = null
       return
     }
 
@@ -1229,6 +1295,14 @@ export function QuickAskPanel({
         `[data-user-message-id="${focusedUserMessageId}"]`,
       )
       if (activeMessageElement?.contains(target)) {
+        return
+      }
+
+      if (
+        suppressNextFocusedUserMessageOutsidePointerRef.current ===
+        focusedUserMessageId
+      ) {
+        suppressNextFocusedUserMessageOutsidePointerRef.current = null
         return
       }
 
@@ -1744,7 +1818,14 @@ export function QuickAskPanel({
 
   // Clear conversation
   const clearConversation = useCallback(() => {
+    // Abort any in-flight run first: clearing starts a new topic under the same
+    // conversationId, and a still-running loop would otherwise re-create the
+    // snapshot we are about to evict on its next iteration.
+    abortStream()
     setChatMessages([])
+    // New topic under the same conversationId, so drop the frozen system prompt
+    // to re-snapshot against the current memory / config on the next message.
+    plugin.getAgentService().evictSystemPromptSnapshot(conversationId)
     new Notice(t('quickAsk.cleared', 'Conversation cleared'))
     // Re-enable follow mode after clearing.
     forceScrollToBottom()
@@ -1752,13 +1833,15 @@ export function QuickAskPanel({
     setTimeout(() => {
       contentEditableRef.current?.focus()
     }, 0)
-  }, [forceScrollToBottom, t])
+  }, [abortStream, conversationId, plugin, forceScrollToBottom, t])
 
   // Open in sidebar
   const hasMessages = chatMessages.length > 0
   const isResizedEmptyState = !hasMessages && !!panelSize?.height
-  const groupedChatMessages: (ChatUserMessage | AssistantToolMessageGroup)[] =
-    useMemo(() => groupAssistantAndToolMessages(chatMessages), [chatMessages])
+  const chatTimelineReadModel = useChatTimelineReadModel({
+    messages: chatMessages,
+  })
+  const groupedChatMessages = chatTimelineReadModel.groupedChatMessages
   const activeStreamingMessageId = useMemo(() => {
     for (let index = chatMessages.length - 1; index >= 0; index -= 1) {
       const message = chatMessages[index]
@@ -1776,11 +1859,20 @@ export function QuickAskPanel({
     () =>
       buildMessageTimelineItems({
         groupedChatMessages,
+        revisionsById: chatTimelineReadModel.revisionsById,
         activeEditableMessageId: focusedUserMessageId,
         activeStreamingMessageId,
         includeBottomAnchor: true,
       }),
-    [activeStreamingMessageId, focusedUserMessageId, groupedChatMessages],
+    [
+      activeStreamingMessageId,
+      chatTimelineReadModel.revisionsById,
+      focusedUserMessageId,
+      groupedChatMessages,
+    ],
+  )
+  const stableQuickAskTimelineItems = useStableChatTimelineItems(
+    quickAskTimelineItems,
   )
   const hideScrollbarWhileFollowing =
     isStreaming && isAutoFollowEnabled && hasMessages
@@ -1791,16 +1883,19 @@ export function QuickAskPanel({
     [hideScrollbarWhileFollowing],
   )
   const latestTimelineAssistantToolGroupKey = useMemo(() => {
-    for (let index = quickAskTimelineItems.length - 1; index >= 0; index -= 1) {
-      const candidate = quickAskTimelineItems[index]
+    for (
+      let index = stableQuickAskTimelineItems.length - 1;
+      index >= 0;
+      index -= 1
+    ) {
+      const candidate = stableQuickAskTimelineItems[index]
       if (candidate.kind === 'assistant-group') {
         return candidate.renderKey
       }
     }
 
     return null
-  }, [quickAskTimelineItems])
-
+  }, [stableQuickAskTimelineItems])
   useLayoutEffect(() => {
     if (timelineIsVirtualized) {
       return
@@ -2022,9 +2117,19 @@ export function QuickAskPanel({
   const renderQuickAskTimelineItem = useCallback(
     (timelineItem: ChatTimelineItem) => {
       if (timelineItem.kind === 'assistant-group') {
+        const messages = timelineItem.messageIds
+          .map((messageId) => chatTimelineReadModel.messagesById.get(messageId))
+          .filter(
+            (message): message is AssistantToolMessageGroup[number] =>
+              message !== undefined && message.role !== 'user',
+          )
+        if (messages.length === 0) {
+          return null
+        }
+
         return (
           <AssistantToolMessageGroupItem
-            messages={timelineItem.messages}
+            messages={messages}
             conversationId={conversationId}
             suppressFooter={
               isStreaming &&
@@ -2055,6 +2160,7 @@ export function QuickAskPanel({
             activeApplyRequestKey={activeApplyRequestKey}
             onApply={handleApply}
             onToolMessageUpdate={handleToolMessageUpdate}
+            onToolCallResponseUpdate={handleToolCallResponseUpdate}
             onEditStart={noop}
             onEditCancel={noop}
             onEditSave={noop}
@@ -2072,7 +2178,12 @@ export function QuickAskPanel({
       }
 
       if (timelineItem.kind === 'user-message') {
-        const messageOrGroup = timelineItem.message
+        const messageOrGroup = chatTimelineReadModel.messagesById.get(
+          timelineItem.messageId,
+        )
+        if (!messageOrGroup || messageOrGroup.role !== 'user') {
+          return null
+        }
         const groupedMessageIndex = groupedChatMessages.findIndex(
           (candidate) =>
             !Array.isArray(candidate) && candidate.id === messageOrGroup.id,
@@ -2090,8 +2201,12 @@ export function QuickAskPanel({
               chatUserInputRef={(ref) =>
                 registerChatUserInputRef(messageOrGroup.id, ref)
               }
-              onBlur={() => {
-                setFocusedUserMessageId(null)
+              onControlPopoverOpenChange={(isOpen) => {
+                if (!isOpen) {
+                  return
+                }
+                suppressNextFocusedUserMessageOutsidePointerRef.current =
+                  messageOrGroup.id
               }}
               onInputChange={(content) => {
                 setChatMessages((prev) =>
@@ -2192,6 +2307,7 @@ export function QuickAskPanel({
     },
     [
       activeApplyRequestKey,
+      chatTimelineReadModel.messagesById,
       conversationId,
       focusedUserMessageId,
       groupedChatMessages,
@@ -2210,6 +2326,59 @@ export function QuickAskPanel({
       settings,
       submitMessage,
       mode,
+    ],
+  )
+
+  const quickAskTimelineRenderVersion = useCallback(
+    (timelineItem: ChatTimelineItem): string => {
+      if (timelineItem.kind === 'assistant-group') {
+        return [
+          'assistant',
+          timelineItem.revision,
+          conversationId,
+          isStreaming &&
+            timelineItem.renderKey === latestTimelineAssistantToolGroupKey,
+          quickAskSurfacePreset.assistantActions.showInlineInfo,
+          quickAskSurfacePreset.assistantActions.showRetryAction,
+          quickAskSurfacePreset.assistantActions.showInsertAction,
+          quickAskSurfacePreset.assistantActions.showCopyAction,
+          quickAskSurfacePreset.assistantActions.showBranchAction,
+          quickAskSurfacePreset.assistantActions.showEditAction,
+          quickAskSurfacePreset.assistantActions.showDeleteAction,
+          quickAskSurfacePreset.assistantActions.showQuoteAction,
+          isApplying,
+          activeApplyRequestKey ?? '',
+        ].join('|')
+      }
+
+      if (timelineItem.kind === 'user-message') {
+        return [
+          'user',
+          timelineItem.revision,
+          focusedUserMessageId === timelineItem.messageId,
+          settings.continuationOptions?.continuationModelId ?? '',
+          settings.chatModelId,
+          getQuickAskRenderVersionObjectId(settings.chatModels),
+          selectedAssistant?.id ?? '',
+          mode,
+          quickAskSurfacePreset.userMessage.showReasoningSelect,
+          quickAskSurfacePreset.userMessage.allowAgentModeOption,
+        ].join('|')
+      }
+
+      return timelineItem.renderKey
+    },
+    [
+      activeApplyRequestKey,
+      conversationId,
+      focusedUserMessageId,
+      isApplying,
+      isStreaming,
+      latestTimelineAssistantToolGroupKey,
+      mode,
+      quickAskSurfacePreset,
+      selectedAssistant?.id,
+      settings,
     ],
   )
 
@@ -2298,17 +2467,20 @@ export function QuickAskPanel({
       {/* Chat area - only shown when there are messages */}
       {hasMessages && (
         <SharedConversationSurface
-          items={quickAskTimelineItems}
+          items={stableQuickAskTimelineItems}
           conversationId={conversationId}
           scrollContainerRef={chatAreaRef}
           onScrollContainerChange={setChatAreaElement}
           containerClassName={quickAskChatShellClassName}
           renderItem={renderQuickAskTimelineItem}
+          renderVersion={quickAskTimelineRenderVersion}
           forceRenderItemIds={['bottom-anchor']}
           followOutput={followOutput}
           onAtBottomStateChange={onAtBottomStateChange}
           virtualizationThreshold={
-            focusedUserMessageId ? quickAskTimelineItems.length : undefined
+            focusedUserMessageId
+              ? stableQuickAskTimelineItems.length
+              : undefined
           }
           onVirtualizationChange={setTimelineIsVirtualized}
           scrollContainerClassName={quickAskChatAreaClassName}
@@ -2465,7 +2637,6 @@ export function QuickAskPanel({
               mode={mode}
               onChange={handleModeChange}
               triggerLabel={modeTriggerLabel}
-              triggerIcon={modeTriggerIcon}
               onMenuOpenChange={(open) => setIsModeMenuOpen(open)}
               side="bottom"
               align="start"
@@ -2508,7 +2679,6 @@ export function QuickAskPanel({
               className="yolo-quick-ask-toolbar-button"
               onClick={clearConversation}
               aria-label={t('quickAsk.clear', 'Clear conversation')}
-              title={t('quickAsk.clear', 'Clear conversation')}
             >
               <RotateCcw size={14} />
             </button>

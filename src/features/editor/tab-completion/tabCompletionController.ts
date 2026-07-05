@@ -2,6 +2,8 @@ import type { Extension, Text } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import type { Editor, MarkdownView } from 'obsidian'
 
+import { isRequestErrorNonRetryable } from '../../../core/ai/requestRetry'
+import { executeSingleTurn } from '../../../core/ai/single-turn'
 import { getChatModelClient } from '../../../core/llm/manager'
 import { promoteProviderTransportModeToObsidian } from '../../../core/llm/transportModePromotion'
 import {
@@ -17,12 +19,7 @@ import {
   splitContextRange,
 } from '../../../settings/schema/setting.types'
 import type { ConversationOverrideSettings } from '../../../types/conversation-settings.types'
-import type {
-  LLMRequestNonStreaming,
-  LLMRequestStreaming,
-  RequestMessage,
-} from '../../../types/llm/request'
-import type { LLMResponseStreaming } from '../../../types/llm/response'
+import type { LLMRequestBase, RequestMessage } from '../../../types/llm/request'
 import { escapeMarkdownSpecialChars } from '../../../utils/markdown-escape'
 import type { InlineSuggestionGhostPayload } from '../inline-suggestion/inlineSuggestion'
 
@@ -106,20 +103,6 @@ const buildTabCompletionConstraints = (
   return [presetConstraint, trimmedCustom].filter(Boolean).join('\n')
 }
 
-const extractAfterContext = (window: string): string => {
-  if (!window) return ''
-  return window
-}
-
-const extractBeforeContext = (window: string): string => {
-  if (!window) return ''
-  const lastParagraphBreak = window.lastIndexOf('\n\n')
-  if (lastParagraphBreak !== -1 && lastParagraphBreak + 2 < window.length) {
-    return window.slice(lastParagraphBreak + 2)
-  }
-  return window
-}
-
 const extractMaskedContext = (
   doc: Text,
   cursorOffset: number,
@@ -127,18 +110,33 @@ const extractMaskedContext = (
   maxAfterChars: number,
 ): { before: string; after: string } => {
   const beforeStart = Math.max(0, cursorOffset - maxBeforeChars)
-  const beforeWindow = doc.sliceString(beforeStart, cursorOffset)
-  const before = extractBeforeContext(beforeWindow)
+  const before = doc.sliceString(beforeStart, cursorOffset)
 
   if (maxAfterChars <= 0) {
     return { before, after: '' }
   }
 
   const afterEnd = Math.min(doc.length, cursorOffset + maxAfterChars)
-  const afterWindow = doc.sliceString(cursorOffset, afterEnd)
-  const after = extractAfterContext(afterWindow)
+  const after = doc.sliceString(cursorOffset, afterEnd)
 
   return { before, after }
+}
+
+const buildTabCompletionUserMessage = (
+  fileTitle: string,
+  before: string,
+  after: string,
+): string => {
+  const titleSection = fileTitle ? `File title:\n${fileTitle}\n\n` : ''
+  return (
+    titleSection +
+    'This is an inline completion request. The <mask/> is the cursor position between <text_before_cursor> and <text_after_cursor>.\n' +
+    'The final document text will be: <text_before_cursor> + your output + <text_after_cursor>.\n' +
+    'Continue exactly from the end of <text_before_cursor>. Return only the text to insert at <mask/>.\n\n' +
+    `<text_before_cursor>\n${before}\n</text_before_cursor>\n` +
+    `${MASK_TAG}\n` +
+    `<text_after_cursor>\n${after}\n</text_after_cursor>`
+  )
 }
 
 export class TabCompletionController {
@@ -400,7 +398,6 @@ export class TabCompletionController {
       })
 
       const fileTitle = this.deps.getActiveFileTitle()
-      const titleSection = fileTitle ? `File title: ${fileTitle}\n\n` : ''
       const baseSystemPrompt =
         settings.continuationOptions?.tabCompletionSystemPrompt ??
         DEFAULT_TAB_COMPLETION_SYSTEM_PROMPT
@@ -418,8 +415,6 @@ export class TabCompletionController {
         combinedConstraints,
       )
 
-      const contextWithMask = `${before}${MASK_TAG}${after}`
-
       const requestMessages: RequestMessage[] = [
         {
           role: 'system' as const,
@@ -427,7 +422,7 @@ export class TabCompletionController {
         },
         {
           role: 'user' as const,
-          content: `${titleSection}${contextWithMask}`,
+          content: buildTabCompletionUserMessage(fileTitle, before, after),
         },
       ]
 
@@ -435,10 +430,9 @@ export class TabCompletionController {
       this.deps.clearInlineSuggestion()
       this.tabCompletionPending = null
 
-      const baseRequest: LLMRequestNonStreaming = {
+      const baseRequest: LLMRequestBase = {
         model: model.model,
         messages: requestMessages,
-        stream: false,
         max_tokens: Math.max(16, Math.min(options.maxTokens, 2000)),
         // Tab 补全是延迟敏感场景，默认 'off'；用户可在设置中改为 'low'/'auto' 以适配强制推理的模型
         reasoningLevel: options.reasoningLevel,
@@ -512,29 +506,41 @@ export class TabCompletionController {
         }
 
         try {
-          let stream: AsyncIterable<LLMResponseStreaming>
+          let rawText = ''
+          let requestInvalidated = false
           try {
-            const streamingRequest: LLMRequestStreaming = {
-              ...baseRequest,
-              stream: true,
-            }
-            stream = await providerClient.streamResponse(
+            const result = await executeSingleTurn({
+              providerClient,
               model,
-              streamingRequest,
-              { signal: controller.signal },
-            )
-          } catch (error) {
-            const msg = String(error?.message ?? '')
-            const shouldFallback =
-              /protocol error|unexpected EOF|incomplete envelope/i.test(msg)
-            if (!shouldFallback) throw error
+              request: baseRequest,
+              deliveryMode: 'incremental',
+              purpose: 'lightweight',
+              signal: controller.signal,
+              onStreamDelta: ({ contentDelta }) => {
+                if (!contentDelta) return
+                rawText += contentDelta
 
-            const response = await providerClient.generateResponse(
-              model,
-              baseRequest,
-              { signal: controller.signal },
-            )
-            const suggestion = response.choices?.[0]?.message?.content ?? ''
+                const currentView = this.deps.getEditorView(editor)
+                if (
+                  !currentView ||
+                  currentView.state.selection.main.head !==
+                    scheduledCursorOffset ||
+                  editor.getSelection()?.length
+                ) {
+                  requestInvalidated = true
+                  controller.abort()
+                  return
+                }
+
+                if (!rawText.trim()) return
+                updateSuggestion(rawText, currentView)
+              },
+            })
+
+            if (requestInvalidated) return
+
+            const finalText = result.content || rawText
+            if (finalText.length === 0) return
 
             const currentView = this.deps.getEditorView(editor)
             if (!currentView) return
@@ -542,43 +548,23 @@ export class TabCompletionController {
               return
             if (editor.getSelection()?.length) return
 
-            updateSuggestion(suggestion, currentView)
+            updateSuggestion(finalText, currentView)
             if (timeoutHandle) clearTimeout(timeoutHandle)
             return
+          } catch (error) {
+            if (requestInvalidated) return
+            throw error
           }
-
-          let rawText = ''
-          for await (const chunk of stream) {
-            const delta = chunk.choices?.[0]?.delta?.content ?? ''
-            if (!delta) continue
-            rawText += delta
-
-            const currentView = this.deps.getEditorView(editor)
-            if (!currentView) return
-            if (currentView.state.selection.main.head !== scheduledCursorOffset)
-              return
-            if (editor.getSelection()?.length) return
-
-            if (!rawText.trim()) continue
-            updateSuggestion(rawText, currentView)
-          }
-
-          if (rawText.length === 0) return
-          const currentView = this.deps.getEditorView(editor)
-          if (!currentView) return
-          if (currentView.state.selection.main.head !== scheduledCursorOffset)
-            return
-          if (editor.getSelection()?.length) return
-
-          updateSuggestion(rawText, currentView)
-          if (timeoutHandle) clearTimeout(timeoutHandle)
-          return
         } catch (error) {
           if (timeoutHandle) clearTimeout(timeoutHandle)
 
           const aborted =
             controller.signal.aborted || error?.name === 'AbortError'
-          if (attempt < attempts - 1 && aborted) {
+          if (
+            attempt < attempts - 1 &&
+            aborted &&
+            !isRequestErrorNonRetryable(error)
+          ) {
             this.deps.removeAbortController(controller)
             this.tabCompletionAbortController = null
             continue

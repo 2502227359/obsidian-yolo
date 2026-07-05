@@ -60,12 +60,21 @@ import { migrateFrom60To61 } from './60_to_61'
 import { migrateFrom61To62 } from './61_to_62'
 import { migrateFrom62To63 } from './62_to_63'
 import { migrateFrom63To64 } from './63_to_64'
+import { migrateFrom64To65 } from './64_to_65'
+import { migrateFrom65To66 } from './65_to_66'
+import { migrateFrom66To67 } from './66_to_67'
+import { migrateFrom67To68 } from './67_to_68'
+import { migrateFrom68To69 } from './68_to_69'
+import { migrateFrom69To70 } from './69_to_70'
 import { migrateFrom6To7 } from './6_to_7'
+import { migrateFrom70To71 } from './70_to_71'
+import { migrateFrom71To72 } from './71_to_72'
+import { migrateFrom72To73 } from './72_to_73'
 import { migrateFrom7To8 } from './7_to_8'
 import { migrateFrom8To9 } from './8_to_9'
 import { migrateFrom9To10 } from './9_to_10'
 
-export const SETTINGS_SCHEMA_VERSION = 64
+export const SETTINGS_SCHEMA_VERSION = 73
 
 export const SETTING_MIGRATIONS: SettingMigration[] = [
   {
@@ -387,5 +396,50 @@ export const SETTING_MIGRATIONS: SettingMigration[] = [
     fromVersion: 63,
     toVersion: 64,
     migrate: migrateFrom63To64,
+  },
+  {
+    fromVersion: 64,
+    toVersion: 65,
+    migrate: migrateFrom64To65,
+  },
+  {
+    fromVersion: 65,
+    toVersion: 66,
+    migrate: migrateFrom65To66,
+  },
+  {
+    fromVersion: 66,
+    toVersion: 67,
+    migrate: migrateFrom66To67,
+  },
+  {
+    fromVersion: 67,
+    toVersion: 68,
+    migrate: migrateFrom67To68,
+  },
+  {
+    fromVersion: 68,
+    toVersion: 69,
+    migrate: migrateFrom68To69,
+  },
+  {
+    fromVersion: 69,
+    toVersion: 70,
+    migrate: migrateFrom69To70,
+  },
+  {
+    fromVersion: 70,
+    toVersion: 71,
+    migrate: migrateFrom70To71,
+  },
+  {
+    fromVersion: 71,
+    toVersion: 72,
+    migrate: migrateFrom71To72,
+  },
+  {
+    fromVersion: 72,
+    toVersion: 73,
+    migrate: migrateFrom72To73,
   },
 ]

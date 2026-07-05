@@ -4,7 +4,6 @@ import {
   Editor,
   MarkdownView,
   Notice,
-  Platform,
   Plugin,
   TFile,
   TFolder,
@@ -13,12 +12,14 @@ import {
 } from 'obsidian'
 
 import { ChatView } from './ChatView'
-import { InstallerUpdateRequiredModal } from './components/modals/InstallerUpdateRequiredModal'
+import { mountUpdateToast } from './components/UpdateToast'
 import { CHAT_VIEW_TYPE } from './constants'
 import { BAKED_PLUGIN_VERSION } from './constants/bakedVersion'
-import { createAgentConversationPersistence } from './core/agent/conversationPersistence'
-import { ensureDefaultAssistantInSettings } from './core/agent/default-assistant'
-import { AgentConversationRunSummary, AgentService } from './core/agent/service'
+import type { YoloAgentApi, YoloAgentApiService } from './core/agent/agent-api'
+import type {
+  AgentConversationRunSummary,
+  AgentService,
+} from './core/agent/service'
 import {
   clearChatGPTOAuthService,
   getChatGPTOAuthService as getChatGPTOAuthServiceRuntime,
@@ -39,9 +40,11 @@ import {
   BackgroundActivityAction,
   BackgroundActivityRegistry,
 } from './core/background/backgroundActivityRegistry'
+import { noteWebviewLeafFocus } from './core/browser/activeWebviewProbe'
+import { WebviewSelectionBridge } from './core/browser/webviewSelectionBridge'
 import { setLLMDebugCaptureEnabled } from './core/llm/debugCapture'
 import { clearRequestTransportMemory } from './core/llm/requestTransport'
-import { McpCoordinator } from './core/mcp/mcpCoordinator'
+import type { McpCoordinator } from './core/mcp/mcpCoordinator'
 import type { McpManager } from './core/mcp/mcpManager'
 import { AgentNotificationCoordinator } from './core/notifications/agentNotificationCoordinator'
 import { NotificationService } from './core/notifications/notificationService'
@@ -61,17 +64,40 @@ import {
   RagIndexRunSnapshot,
   RagIndexService,
 } from './core/rag/ragIndexService'
+import { migrateVaultSkillFrontmatter } from './core/skills/liteSkills'
 import {
+  type InstallationIncompleteDetail,
+  type ReleaseFileName,
+  checkInstallationIntegrityLayer1And2,
+} from './core/update/installationIntegrity'
+import {
+  type PluginUpdateState,
+  applyRepairFiles,
+  applyStagedUpdate,
+  canSelfUpdate,
+  downloadReleaseToStaging,
+  downloadRepairFilesToStaging,
+  getRepairStagingStatus,
+  getStagingDir,
+  getStagingStatus,
+} from './core/update/pluginUpdater'
+import {
+  type ReleaseAssets,
   type UpdateCheckResult,
+  buildReleaseAssets,
   checkForUpdate,
+  normalizePluginVersion,
 } from './core/update/updateChecker'
-import { DatabaseManager } from './database/DatabaseManager'
+import type { DatabaseManager } from './database/DatabaseManager'
 import { PGLiteAbortedException } from './database/exception'
 import { ChatManager } from './database/json/chat/ChatManager'
 import { pruneImageCache } from './database/json/chat/imageCacheStore'
 import { prunePdfTextCache } from './database/json/chat/pdfTextCacheStore'
-import type { VectorManager } from './database/modules/vector/VectorManager'
-import { PGliteRuntimeManager } from './database/runtime/PGliteRuntimeManager'
+import type {
+  ReconcileResult,
+  VectorManager,
+} from './database/modules/vector/VectorManager'
+import type { PGliteRuntimeManager } from './database/runtime/PGliteRuntimeManager'
 import { PGLITE_RUNTIME_VERSION } from './database/runtime/pgliteRuntimeMetadata'
 import {
   ChatLeafPlacement,
@@ -79,8 +105,6 @@ import {
 } from './features/chat/chatLeafSessionManager'
 import { ChatViewNavigator } from './features/chat/chatViewNavigator'
 import { NewTabEmptyStateEnhancer } from './features/chat/newTabEmptyStateEnhancer'
-import { ExportConfigModal } from './features/config-transfer/components/ExportConfigModal'
-import { ImportConfigModal } from './features/config-transfer/components/ImportConfigModal'
 import { DiffReviewController } from './features/editor/diff-review/diffReviewController'
 import {
   buildFullReviewBlocks,
@@ -101,8 +125,7 @@ import {
 import { TabCompletionController } from './features/editor/tab-completion/tabCompletionController'
 import { WriteAssistController } from './features/editor/write-assist/writeAssistController'
 import { enablePdfScreenshotFeature } from './features/pdf-screenshot'
-import { isUntitledConversationTitle } from './hooks/useChatHistory'
-import { Language, createTranslationFunction } from './i18n'
+import { type Language, createTranslationFunction, loadLocale } from './i18n'
 import {
   YoloSettings,
   yoloSettingsSchema,
@@ -120,11 +143,24 @@ import type {
   MentionableImage,
 } from './types/mentionable'
 import { MentionableFile, MentionableFolder } from './types/mentionable'
+import { isUntitledConversationTitle } from './utils/chat/conversationTitle'
+import { stableStringify } from './utils/json/stableStringify'
 import { applyKnownMaxContextTokensToChatModels } from './utils/llm/model-capability-registry'
 import { getMentionableBlockData } from './utils/obsidian'
 import { ensureBufferByteLengthCompat } from './utils/runtime/ensureBufferByteLengthCompat'
 
+export type {
+  YoloAgentApi,
+  YoloAgentContext,
+  YoloAgentEvent,
+  YoloAgentRunRequest,
+  YoloAgentRunResult,
+} from './core/agent/agent-api'
+
+export type { PluginUpdateState } from './core/update/pluginUpdater'
+
 const STARTUP_GRACE_MS = 30 * 1000
+type TranslateFn = (keyPath: string, fallback?: string) => string
 
 export default class YoloPlugin extends Plugin {
   settings: YoloSettings
@@ -133,19 +169,22 @@ export default class YoloPlugin extends Plugin {
   private currentSettingsMeta: YoloDataMeta | null = null
   updateCheckResult: UpdateCheckResult | null = null
   private hasCheckedForUpdate = false
-  private updateBannerDismissed = false
   private updateCheckListeners: (() => void)[] = []
-  installationIncompleteDetail: {
-    bakedVersion: string
-    manifestVersion: string
-  } | null = null
+  pluginUpdateState: PluginUpdateState = { status: 'idle' }
+  private pluginUpdateListeners: (() => void)[] = []
+  private pluginUpdateDownloadPromise: Promise<void> | null = null
+  private updateToastCleanup: (() => void) | null = null
+  installationIncompleteDetail: InstallationIncompleteDetail | null = null
   private installationIncompleteBannerDismissed = false
   private installationIncompleteListeners: (() => void)[] = []
+  private installationIntegrityCheckStarted = false
   mcpManager: McpManager | null = null
   dbManager: DatabaseManager | null = null
   private dbManagerInitPromise: Promise<DatabaseManager> | null = null
   private timeoutIds: ReturnType<typeof setTimeout>[] = [] // Use ReturnType instead of number
   private pgliteRuntimeManager: PGliteRuntimeManager | null = null
+  private pgliteRuntimeManagerInitPromise: Promise<PGliteRuntimeManager> | null =
+    null
   private isContinuationInProgress = false
   private activeAbortControllers: Set<AbortController> = new Set()
   private tabCompletionController: TabCompletionController | null = null
@@ -166,6 +205,7 @@ export default class YoloPlugin extends Plugin {
   private ragCoordinator: RagCoordinator | null = null
   private ragIndexService: RagIndexService | null = null
   private mcpCoordinator: McpCoordinator | null = null
+  private webviewSelectionBridge: WebviewSelectionBridge | null = null
   private writeAssistController: WriteAssistController | null = null
   // Model list cache for provider model fetching
   private modelListCache: Map<string, { models: string[]; timestamp: number }> =
@@ -173,6 +213,8 @@ export default class YoloPlugin extends Plugin {
   // Quick Ask state
   private quickAskController: QuickAskController | null = null
   private agentService: AgentService | null = null
+  private agentServiceReady: Promise<AgentService> | null = null
+  private agentApiService: YoloAgentApiService | null = null
   private agentNotificationCoordinator: AgentNotificationCoordinator | null =
     null
   private backgroundActivityRegistry: BackgroundActivityRegistry | null = null
@@ -184,6 +226,7 @@ export default class YoloPlugin extends Plugin {
   private backgroundStatusPanelEmpty: HTMLElement | null = null
   private latestBackgroundActivities = new Map<string, BackgroundActivity>()
   private backgroundStatusPanelRenderVersion = 0
+  private isUnloaded = false
   private backgroundStatusPanelItems = new Map<
     string,
     {
@@ -200,6 +243,45 @@ export default class YoloPlugin extends Plugin {
 
   setSmartSpaceDraftState(state: SmartSpaceDraftState) {
     this.smartSpaceDraftState = state
+  }
+
+  private getPromptSourceSettingsFingerprint(
+    settings: YoloSettings | undefined,
+  ): string {
+    if (!settings) {
+      return ''
+    }
+    return stableStringify({
+      systemPrompt: settings.systemPrompt ?? '',
+      baseDir: normalizePath(settings.yolo?.baseDir ?? ''),
+      disabledSkillIds: [...(settings.skills?.disabledSkillIds ?? [])]
+        .map((id) => id.trim())
+        .sort(),
+      assistants: (settings.assistants ?? [])
+        .map((assistant) => ({
+          id: assistant.id,
+          name: assistant.name,
+          systemPrompt: assistant.systemPrompt ?? '',
+          skillPreferences: assistant.skillPreferences ?? null,
+          enableProjectInstructions:
+            assistant.enableProjectInstructions ?? false,
+          workspaceScope: assistant.workspaceScope ?? null,
+        }))
+        .sort((left, right) => left.id.localeCompare(right.id)),
+    })
+  }
+
+  private markPromptSourceSettingsChange(
+    previousSettings: YoloSettings | undefined,
+    nextSettings: YoloSettings,
+  ): void {
+    if (
+      this.getPromptSourceSettingsFingerprint(previousSettings) ===
+      this.getPromptSourceSettingsFingerprint(nextSettings)
+    ) {
+      return
+    }
+    this.agentService?.getPromptSourceWatcher().markExternalChange()
   }
 
   getChatLeafSessionManager(): ChatLeafSessionManager {
@@ -372,19 +454,33 @@ export default class YoloPlugin extends Plugin {
     }
   }
 
-  getPGliteRuntimeManager(): PGliteRuntimeManager {
+  async getPGliteRuntimeManager(): Promise<PGliteRuntimeManager> {
     if (!this.pgliteRuntimeManager) {
-      this.pgliteRuntimeManager = new PGliteRuntimeManager({
-        app: this.app,
-        pluginId: this.manifest.id,
-        pluginDir: this.manifest.dir
-          ? normalizePath(this.manifest.dir)
-          : undefined,
-        runtimeVersion: PGLITE_RUNTIME_VERSION,
-      })
+      this.pgliteRuntimeManagerInitPromise ??= (async () => {
+        try {
+          const { PGliteRuntimeManager } = await import(
+            './database/runtime/PGliteRuntimeManager'
+          )
+          if (this.isUnloaded) {
+            throw new Error('[YOLO] Plugin unloaded during PGlite warmup')
+          }
+          this.pgliteRuntimeManager = new PGliteRuntimeManager({
+            app: this.app,
+            pluginId: this.manifest.id,
+            pluginDir: this.manifest.dir
+              ? normalizePath(this.manifest.dir)
+              : undefined,
+            runtimeVersion: PGLITE_RUNTIME_VERSION,
+          })
+          return this.pgliteRuntimeManager
+        } catch (error) {
+          this.pgliteRuntimeManagerInitPromise = null
+          throw error
+        }
+      })()
     }
 
-    return this.pgliteRuntimeManager
+    return this.pgliteRuntimeManager ?? this.pgliteRuntimeManagerInitPromise!
   }
 
   // Compute a robust panel anchor position just below the caret line
@@ -648,13 +744,17 @@ export default class YoloPlugin extends Plugin {
       this.ragAutoUpdateService = new RagAutoUpdateService({
         getSettings: () => this.settings,
         setSettings: (settings) => this.setSettings(settings),
-        runIndex: (request) =>
-          this.getRagIndexService().runIndex({
+        runIndex: async (request) => {
+          // Background auto-update never surfaces partial failures (product
+          // decision: settings page shows them durably via the snapshot). The
+          // reconcile result is intentionally discarded here.
+          await this.getRagIndexService().runIndex({
             mode: 'sync',
             scope: request,
             trigger: 'auto',
             retryPolicy: 'transient',
-          }),
+          })
+        },
         markRetryScheduled: (input) =>
           this.getRagIndexService().markRetryScheduled({
             mode: 'sync',
@@ -693,15 +793,18 @@ export default class YoloPlugin extends Plugin {
       this.ragCoordinator = new RagCoordinator({
         app: this.app,
         getSettings: () => this.settings,
-        ensureRuntimeReady: () => this.getPGliteRuntimeManager().ensureReady(),
+        ensureRuntimeReady: async () =>
+          (await this.getPGliteRuntimeManager()).ensureReady(),
         getDbManager: () => this.getDbManager(),
       })
     }
     return this.ragCoordinator
   }
 
-  private getMcpCoordinator(): McpCoordinator {
+  private async getMcpCoordinator(): Promise<McpCoordinator> {
     if (!this.mcpCoordinator) {
+      const agentService = await this.warmupAgentService()
+      const { McpCoordinator } = await import('./core/mcp/mcpCoordinator')
       this.mcpCoordinator = new McpCoordinator({
         app: this.app,
         getSettings: () => this.settings,
@@ -710,9 +813,31 @@ export default class YoloPlugin extends Plugin {
           listener: (settings: YoloSettings) => void,
         ) => this.addSettingsChangeListener(listener),
         getRagEngine: () => this.getRAGEngine(),
+        promptSourceWatcher: agentService.getPromptSourceWatcher(),
       })
     }
     return this.mcpCoordinator
+  }
+
+  private startWebviewSelectionBridge(): void {
+    this.webviewSelectionBridge?.destroy()
+    this.webviewSelectionBridge = new WebviewSelectionBridge(this.app, {
+      isEnabled: () =>
+        this.settings.continuationOptions?.enableSelectionChat ?? true,
+      onSelection: (selection) => {
+        const targetLeaf = this.getChatLeafSessionManager().resolveTargetLeaf()
+        if (targetLeaf?.view instanceof ChatView) {
+          targetLeaf.view.syncWebSelectionToInput(selection)
+        }
+      },
+      onClear: () => {
+        const targetLeaf = this.getChatLeafSessionManager().resolveTargetLeaf()
+        if (targetLeaf?.view instanceof ChatView) {
+          targetLeaf.view.clearSelectionFromChat()
+        }
+      },
+    })
+    this.webviewSelectionBridge.start()
   }
 
   private createSmartSpaceTriggerExtension(): Extension {
@@ -773,19 +898,36 @@ export default class YoloPlugin extends Plugin {
   }
 
   private warnIfInstallationIncomplete() {
-    const baked = BAKED_PLUGIN_VERSION
-    const runtime = this.manifest.version
-    if (baked && runtime && baked !== runtime) {
-      console.error(
-        `[YOLO] Version mismatch: main.js=${baked}, manifest=${runtime}. ` +
-          `Likely an incomplete update download.`,
-      )
-      this.installationIncompleteDetail = {
-        bakedVersion: baked,
-        manifestVersion: runtime,
-      }
-      this.notifyInstallationIncompleteListeners()
+    this.checkAndHandleInstallationIntegrity()
+  }
+
+  private checkAndHandleInstallationIntegrity(): void {
+    if (this.installationIntegrityCheckStarted) {
+      return
     }
+    this.installationIntegrityCheckStarted = true
+
+    void (async () => {
+      const detail = await checkInstallationIntegrityLayer1And2(
+        this,
+        BAKED_PLUGIN_VERSION || null,
+      )
+
+      if (!detail) {
+        return
+      }
+
+      console.error(
+        `[YOLO] Installation integrity issue: target=${detail.targetVersion}, ` +
+          `suspects=${detail.suspectFiles.join(', ')}`,
+      )
+      this.installationIncompleteDetail = detail
+      this.notifyInstallationIncompleteListeners()
+
+      if (canSelfUpdate(this)) {
+        void this.autoRepairInstallation()
+      }
+    })()
   }
 
   isInstallationIncompleteBannerDismissed(): boolean {
@@ -816,8 +958,17 @@ export default class YoloPlugin extends Plugin {
     this.notifyInstallationIncompleteListeners()
   }
 
-  get t() {
-    return createTranslationFunction(this.resolveObsidianLanguage())
+  private _tCache?: { language: Language; fn: TranslateFn }
+
+  get t(): TranslateFn {
+    const language = this.resolveObsidianLanguage()
+    if (this._tCache?.language !== language) {
+      this._tCache = {
+        language,
+        fn: createTranslationFunction(language),
+      }
+    }
+    return this._tCache.fn
   }
 
   private cancelAllAiTasks() {
@@ -838,18 +989,68 @@ export default class YoloPlugin extends Plugin {
     this.agentService?.abortAll()
   }
 
+  async warmupAgentService(): Promise<AgentService> {
+    if (!this.agentServiceReady) {
+      this.agentServiceReady = (async () => {
+        try {
+          const { AgentService } = await import('./core/agent/service')
+          const { YoloAgentApiService } = await import('./core/agent/agent-api')
+          const { createAgentConversationPersistence } = await import(
+            './core/agent/conversationPersistence'
+          )
+          if (this.isUnloaded) {
+            throw new Error('[YOLO] Plugin unloaded during agent warmup')
+          }
+          const { persistConversationMessages } =
+            createAgentConversationPersistence(this.app, () => this.settings)
+          const service = new AgentService({
+            getSettings: () => this.settings,
+            persistConversationMessages,
+          })
+          const watcher = service.getPromptSourceWatcher()
+          const h = watcher.buildVaultHandlers()
+          this.registerEvent(this.app.vault.on('create', h.create))
+          this.registerEvent(this.app.vault.on('modify', h.modify))
+          this.registerEvent(this.app.vault.on('delete', h.delete))
+          this.registerEvent(this.app.vault.on('rename', h.rename))
+          service.startBackgroundTaskResultListener()
+          this.agentService = service
+          this.agentApiService = new YoloAgentApiService({
+            app: this.app,
+            getSettings: () => this.settings,
+            getAgentService: () => this.getAgentService(),
+            getMcpManager: () => this.getMcpManager(),
+          })
+          return service
+        } catch (error) {
+          this.agentServiceReady = null
+          throw error
+        }
+      })()
+    }
+    return this.agentServiceReady
+  }
+
   getAgentService(): AgentService {
     if (!this.agentService) {
-      const { persistConversationMessages } =
-        createAgentConversationPersistence(this.app, () => this.settings)
-      this.agentService = new AgentService({
-        getSettings: () => this.settings,
-        persistConversationMessages,
-      })
-      // Start listening for async external agent task-completed events (desktop-only, no-op on mobile)
-      this.agentService.startExternalAgentResultListener()
+      throw new Error(
+        '[YOLO] Agent service is not ready yet; await plugin.warmupAgentService() first.',
+      )
     }
     return this.agentService
+  }
+
+  getAgentApi(): YoloAgentApi {
+    if (!this.agentApiService) {
+      throw new Error(
+        '[YOLO] Agent API is not ready yet; await plugin.warmupAgentService() first.',
+      )
+    }
+    return this.agentApiService
+  }
+
+  get agent(): YoloAgentApi {
+    return this.getAgentApi()
   }
 
   private getAgentNotificationCoordinator(): AgentNotificationCoordinator {
@@ -946,26 +1147,26 @@ export default class YoloPlugin extends Plugin {
       this.getBackgroundActivityRegistry().subscribe((activities) => {
         this.updateBackgroundStatusBar(activities)
       })
-    const unsubscribeAgentSummaries =
-      this.getAgentService().subscribeToRunSummaries((summaries) => {
-        this.syncAgentBackgroundActivities(summaries)
+    let isActive = true
+    let unsubscribeAgentSummaries: (() => void) | null = null
+    void this.warmupAgentService()
+      .then((agentService) => {
+        if (!isActive) {
+          return
+        }
+        unsubscribeAgentSummaries = agentService.subscribeToRunSummaries(
+          (summaries) => {
+            this.syncAgentBackgroundActivities(summaries)
+          },
+        )
       })
-    // 异步派遣的子进程是 desktop-only，懒加载注册表后再订阅。
-    let unsubscribeAsyncTasks: (() => void) | null = null
-    if (Platform.isDesktopApp) {
-      void import('./core/agent/external-cli/async-task-registry').then(
-        ({ asyncTaskRegistry }) => {
-          unsubscribeAsyncTasks = asyncTaskRegistry.subscribe((records) => {
-            this.syncAsyncExternalAgentBackgroundActivities(records)
-          })
-        },
-      )
-    }
-
+      .catch((error: unknown) => {
+        console.error('[YOLO] Agent service warmup failed:', error)
+      })
     this.register(() => {
+      isActive = false
       unsubscribeActivities()
-      unsubscribeAgentSummaries()
-      unsubscribeAsyncTasks?.()
+      unsubscribeAgentSummaries?.()
       this.backgroundStatusBarItem = null
       this.backgroundStatusBarRing = null
       this.backgroundStatusBarLabel = null
@@ -978,41 +1179,6 @@ export default class YoloPlugin extends Plugin {
       this.backgroundActivityRegistry?.clear()
       this.backgroundActivityRegistry = null
     })
-  }
-
-  private syncAsyncExternalAgentBackgroundActivities(
-    records: import('./core/agent/external-cli/async-task-registry').AsyncTaskRecord[],
-  ): void {
-    const registry = this.getBackgroundActivityRegistry()
-    const nextActivityIds = new Set<string>()
-
-    for (const record of records) {
-      if (record.status !== 'running') continue
-      const id = `external-agent:${record.taskId}`
-      nextActivityIds.add(id)
-      registry.upsert({
-        id,
-        kind: 'agent',
-        title: record.title,
-        detail: record.provider,
-        status: 'running',
-        updatedAt: record.createdAt,
-        ...(record.conversationId
-          ? {
-              action: {
-                type: 'open-agent-conversation',
-                conversationId: record.conversationId,
-              },
-            }
-          : {}),
-      })
-    }
-
-    for (const activityId of this.latestBackgroundActivities.keys()) {
-      if (!activityId.startsWith('external-agent:')) continue
-      if (nextActivityIds.has(activityId)) continue
-      registry.remove(activityId)
-    }
   }
 
   private syncAgentBackgroundActivities(
@@ -1649,10 +1815,13 @@ export default class YoloPlugin extends Plugin {
   }
 
   async onload() {
+    this.isUnloaded = false
     ensureBufferByteLengthCompat()
     clearRequestTransportMemory()
 
     await this.loadSettings()
+    await loadLocale(this.resolveObsidianLanguage())
+    this._tCache = undefined
     await this.migrateLegacyVaultMirrorIfNeeded()
     this.warnIfInstallationIncomplete()
     this.syncOAuthRuntimesFromSettings()
@@ -1661,6 +1830,17 @@ export default class YoloPlugin extends Plugin {
     void pruneImageCache(this.app, 30, this.settings)
     void prunePdfTextCache(this.app, 30, this.settings)
     await this.getRagIndexService().initialize()
+    // One-time, idempotent migration of vault skill files from legacy
+    // `id + name` frontmatter to the converged `name`-only form. Kicked off as
+    // soon as the vault index is ready. Note: Obsidian's metadataCache updates
+    // asynchronously after each modify, so on the very first post-upgrade
+    // startup a skill list/open may briefly observe pre-migration frontmatter
+    // until the cache re-parses — self-healing and one-time. A full
+    // cache-event barrier is intentionally avoided as over-engineering for this
+    // sub-second transient; the migration is idempotent so it always converges.
+    this.app.workspace.onLayoutReady(() => {
+      void migrateVaultSkillFrontmatter(this.app, this.settings)
+    })
     this.app.workspace.onLayoutReady(() => {
       if (!this.settings?.ragOptions?.enabled) return
       const snapshot = this.getRagIndexSnapshot()
@@ -1690,6 +1870,7 @@ export default class YoloPlugin extends Plugin {
     })
 
     this.registerView(CHAT_VIEW_TYPE, (leaf) => new ChatView(leaf, this))
+    this.startWebviewSelectionBridge()
 
     this.newTabEmptyStateEnhancer = new NewTabEmptyStateEnhancer(this)
     this.newTabEmptyStateEnhancer.enable()
@@ -1712,8 +1893,22 @@ export default class YoloPlugin extends Plugin {
     })
 
     this.setupBackgroundActivityStatusBar()
-    this.getAgentNotificationCoordinator().start()
+    this.updateToastCleanup = mountUpdateToast(this)
+    // The toast is anchored to the window (not a chat view), so trigger the
+    // check at load time rather than waiting for a chat view to open.
+    this.checkForUpdateOnce()
+    let shouldStartAgentNotifications = true
+    void this.warmupAgentService()
+      .then(() => {
+        if (shouldStartAgentNotifications) {
+          this.getAgentNotificationCoordinator().start()
+        }
+      })
+      .catch((error: unknown) => {
+        console.error('[YOLO] Agent service warmup failed:', error)
+      })
     this.register(() => {
+      shouldStartAgentNotifications = false
       this.agentNotificationCoordinator?.stop()
       this.agentNotificationCoordinator = null
     })
@@ -1883,6 +2078,9 @@ export default class YoloPlugin extends Plugin {
     this.registerDomEvent(window, 'blur', () => {
       this.getRagAutoUpdateService().onWindowBlur()
     })
+    this.registerDomEvent(window, 'online', () => {
+      this.getRagAutoUpdateService().onOnline()
+    })
 
     this.addCommand({
       id: 'rebuild-vault-index',
@@ -1890,7 +2088,7 @@ export default class YoloPlugin extends Plugin {
       callback: async () => {
         const notice = new Notice(this.t('notices.rebuildingIndex'), 0)
         try {
-          await this.getRagIndexService().runIndex({
+          const result = await this.getRagIndexService().runIndex({
             mode: 'rebuild',
             scope: { kind: 'all' },
             trigger: 'manual',
@@ -1905,7 +2103,15 @@ export default class YoloPlugin extends Plugin {
               )
             },
           })
-          notice.setMessage(this.t('notices.rebuildComplete'))
+          const skipped = result.permanentFailedPaths.length
+          notice.setMessage(
+            skipped > 0
+              ? this.t(
+                  'notices.indexedWithSkipped',
+                  '索引完成，{{count}} 个文件无法索引',
+                ).replace('{{count}}', String(skipped))
+              : this.t('notices.rebuildComplete'),
+          )
         } catch (error) {
           if (error instanceof RagIndexBusyError) {
             notice.setMessage(
@@ -1929,7 +2135,7 @@ export default class YoloPlugin extends Plugin {
       callback: async () => {
         const notice = new Notice(this.t('notices.updatingIndex'), 0)
         try {
-          await this.getRagIndexService().runIndex({
+          const result = await this.getRagIndexService().runIndex({
             mode: 'sync',
             scope: { kind: 'all' },
             trigger: 'manual',
@@ -1944,7 +2150,15 @@ export default class YoloPlugin extends Plugin {
               )
             },
           })
-          notice.setMessage(this.t('notices.indexUpdated'))
+          const skipped = result.permanentFailedPaths.length
+          notice.setMessage(
+            skipped > 0
+              ? this.t(
+                  'notices.indexedWithSkipped',
+                  '索引完成，{{count}} 个文件无法索引',
+                ).replace('{{count}}', String(skipped))
+              : this.t('notices.indexUpdated'),
+          )
         } catch (error) {
           if (error instanceof RagIndexBusyError) {
             notice.setMessage(
@@ -1965,16 +2179,32 @@ export default class YoloPlugin extends Plugin {
     this.addCommand({
       id: 'export-settings',
       name: this.t('commands.exportSettings', '导出插件配置'),
-      callback: () => {
-        new ExportConfigModal(this.app, this).open()
+      callback: async () => {
+        try {
+          const { ExportConfigModal } = await import(
+            './features/config-transfer/components/ExportConfigModal'
+          )
+          new ExportConfigModal(this.app, this).open()
+        } catch (error) {
+          console.error('[YOLO] Failed to load ExportConfigModal:', error)
+          new Notice('Failed to open export dialog')
+        }
       },
     })
 
     this.addCommand({
       id: 'import-settings',
       name: this.t('commands.importSettings', '导入插件配置'),
-      callback: () => {
-        new ImportConfigModal(this.app, this).open()
+      callback: async () => {
+        try {
+          const { ImportConfigModal } = await import(
+            './features/config-transfer/components/ImportConfigModal'
+          )
+          new ImportConfigModal(this.app, this).open()
+        } catch (error) {
+          console.error('[YOLO] Failed to load ImportConfigModal:', error)
+          new Notice('Failed to open import dialog')
+        }
       },
     })
 
@@ -1990,6 +2220,8 @@ export default class YoloPlugin extends Plugin {
           if (leaf?.view instanceof ChatView) {
             this.getChatLeafSessionManager().touchLeafActive(leaf)
           }
+          noteWebviewLeafFocus(this.app, leaf)
+          this.webviewSelectionBridge?.noteWorkspaceChange()
           const view = this.app.workspace.getActiveViewOfType(MarkdownView)
           const editor = view?.editor
           if (editor) {
@@ -2023,9 +2255,14 @@ export default class YoloPlugin extends Plugin {
   }
 
   onunload() {
+    this.isUnloaded = true
+    this.updateToastCleanup?.()
+    this.updateToastCleanup = null
     this.closeSmartSpace()
 
     // Selection chat cleanup
+    this.webviewSelectionBridge?.destroy()
+    this.webviewSelectionBridge = null
     this.selectionChatController?.destroy()
     this.selectionChatController = null
     this.chatViewNavigator = null
@@ -2064,16 +2301,16 @@ export default class YoloPlugin extends Plugin {
     this.mcpManager = null
     this.ragAutoUpdateService?.cleanup()
     this.ragAutoUpdateService = null
-    this.agentService?.stopExternalAgentResultListener()
+    this.agentService?.stopBackgroundTaskResultListener()
     this.agentService?.abortAll()
     this.agentService = null
-    // 终止所有活跃的外部 CLI 子进程（desktop-only，mobile 为空操作）
-    void import('./core/agent/external-cli/index').then(
-      ({ killAllActiveExternalCli }) => killAllActiveExternalCli(),
+    this.agentServiceReady = null
+    this.agentApiService = null
+    void import('./core/agent/bash/index').then(({ killAllBashSessions }) =>
+      killAllBashSessions(),
     )
-    // 终止所有异步派遣任务，标记为 killed_by_shutdown
-    void import('./core/agent/external-cli/async-task-registry').then(
-      ({ asyncTaskRegistry }) => asyncTaskRegistry.abortAll(),
+    void import('./core/agent/subagent/runner').then(
+      ({ abortAllSubagentTasks }) => abortAllSubagentTasks(),
     )
     // Ensure all in-flight requests are aborted on unload
     this.cancelAllAiTasks()
@@ -2105,6 +2342,9 @@ export default class YoloPlugin extends Plugin {
     const sourceMeta = pluginExtract?.meta ?? null
 
     const parsedSettings = parseYoloSettings(sourceRaw)
+    const { ensureDefaultAssistantInSettings } = await import(
+      './core/agent/default-assistant'
+    )
     const settingsWithDefaultAssistant =
       ensureDefaultAssistantInSettings(parsedSettings)
     const { chatModels, changed } = applyKnownMaxContextTokensToChatModels(
@@ -2242,6 +2482,9 @@ export default class YoloPlugin extends Plugin {
     }
 
     const parsedSettings = parseYoloSettings(raw)
+    const { ensureDefaultAssistantInSettings } = await import(
+      './core/agent/default-assistant'
+    )
     const settingsWithDefaultAssistant =
       ensureDefaultAssistantInSettings(parsedSettings)
     const { chatModels, changed } = applyKnownMaxContextTokensToChatModels(
@@ -2257,6 +2500,7 @@ export default class YoloPlugin extends Plugin {
 
     this.settings = normalizedSettings
     this.currentSettingsMeta = incomingMeta
+    this.markPromptSourceSettingsChange(previousSettings, normalizedSettings)
 
     if (baseDirChanged) {
       // External payload references a different `baseDir`. Don't call
@@ -2447,6 +2691,9 @@ export default class YoloPlugin extends Plugin {
   }
 
   async setSettings(newSettings: YoloSettings) {
+    const { ensureDefaultAssistantInSettings } = await import(
+      './core/agent/default-assistant'
+    )
     const normalizedSettings = ensureDefaultAssistantInSettings(
       normalizeYoloSettingsReferences(newSettings),
     )
@@ -2483,7 +2730,22 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
 
     if (yoloBaseDirChanged) {
       if (this.dbManager) {
-        await this.dbManager.save()
+        // Snapshot the in-memory DB to the OLD location before relocating.
+        // If this fails (#408 OOM, disk full, etc.), the move would carry a
+        // stale snapshot to the new location and silently lose embeddings —
+        // abort the relocation and keep the user on the previous root.
+        try {
+          await this.dbManager.save()
+        } catch (error) {
+          console.error(
+            '[YOLO] Failed to snapshot vector database before base-dir change; aborting move.',
+            error,
+          )
+          new Notice(
+            'Failed to snapshot YOLO vector database. Keeping previous YOLO root folder.',
+          )
+          return
+        }
       }
       const migrated = await relocateYoloManagedData({
         app: this.app,
@@ -2505,6 +2767,7 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
 
     this.settings = normalizedSettings
     await this.persistPluginDirSettings(normalizedSettings)
+    this.markPromptSourceSettingsChange(previousSettings, normalizedSettings)
     setLLMDebugCaptureEnabled(
       this.settings.debug?.captureRawRequestDebug ?? false,
     )
@@ -2534,10 +2797,6 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     }
   }
 
-  isUpdateBannerDismissed(): boolean {
-    return this.updateBannerDismissed
-  }
-
   addUpdateCheckListener(listener: () => void): () => void {
     this.updateCheckListeners.push(listener)
     return () => {
@@ -2553,9 +2812,353 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     }
   }
 
-  dismissUpdateBanner(): void {
-    this.updateBannerDismissed = true
+  addPluginUpdateListener(listener: () => void): () => void {
+    this.pluginUpdateListeners.push(listener)
+    return () => {
+      this.pluginUpdateListeners = this.pluginUpdateListeners.filter(
+        (l) => l !== listener,
+      )
+    }
+  }
+
+  private notifyPluginUpdateListeners(): void {
+    for (const listener of this.pluginUpdateListeners) {
+      listener()
+    }
+  }
+
+  private setPluginUpdateState(state: PluginUpdateState): void {
+    this.pluginUpdateState = state
+    this.notifyPluginUpdateListeners()
+  }
+
+  canSelfUpdatePlugin(): boolean {
+    return canSelfUpdate(this)
+  }
+
+  private async refreshPluginUpdateStaging(version: string): Promise<void> {
+    if (!canSelfUpdate(this) || !this.manifest.dir) {
+      return
+    }
+    const stagingDir = getStagingDir(this.manifest.dir, version)
+    const status = await getStagingStatus(
+      this.app.vault.adapter,
+      stagingDir,
+      version,
+    )
+    if (status.ready) {
+      this.setPluginUpdateState({ status: 'ready', version })
+    }
+  }
+
+  async startPluginUpdateDownload(): Promise<void> {
+    const result = this.updateCheckResult
+    if (
+      !result?.hasUpdate ||
+      !result.assets ||
+      !canSelfUpdate(this) ||
+      !this.manifest.dir
+    ) {
+      return
+    }
+
+    return this.downloadPluginRelease(result.latestVersion, result.assets)
+  }
+
+  private repairFilesMatch(
+    left: ReleaseFileName[] | undefined,
+    right: ReleaseFileName[],
+  ): boolean {
+    if (!left || left.length !== right.length) {
+      return false
+    }
+    const sortedLeft = [...left].sort()
+    const sortedRight = [...right].sort()
+    return sortedLeft.every((file, index) => file === sortedRight[index])
+  }
+
+  private async downloadPluginRelease(
+    version: string,
+    assets: ReleaseAssets,
+  ): Promise<void> {
+    if (!canSelfUpdate(this) || !this.manifest.dir) {
+      return
+    }
+
+    if (this.pluginUpdateDownloadPromise) {
+      return this.pluginUpdateDownloadPromise
+    }
+
+    const normalized = normalizePluginVersion(version)
+    if (
+      this.pluginUpdateState.status === 'ready' &&
+      this.pluginUpdateState.version === normalized
+    ) {
+      return
+    }
+
+    if (this.pluginUpdateState.status === 'downloading') {
+      return
+    }
+
+    const stagingDir = getStagingDir(this.manifest.dir, normalized)
+    const existing = await getStagingStatus(
+      this.app.vault.adapter,
+      stagingDir,
+      normalized,
+    )
+    if (existing.ready) {
+      this.setPluginUpdateState({ status: 'ready', version: normalized })
+      return
+    }
+
+    this.setPluginUpdateState({
+      status: 'downloading',
+      version: normalized,
+      progress: 0,
+    })
+
+    this.pluginUpdateDownloadPromise = (async () => {
+      try {
+        await downloadReleaseToStaging({
+          adapter: this.app.vault.adapter,
+          pluginDir: this.manifest.dir!,
+          version: normalized,
+          assets,
+          onProgress: (progress) => {
+            this.setPluginUpdateState({
+              status: 'downloading',
+              version: normalized,
+              progress,
+            })
+          },
+        })
+        this.setPluginUpdateState({ status: 'ready', version: normalized })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        this.setPluginUpdateState({
+          status: 'error',
+          version: normalized,
+          message,
+        })
+      } finally {
+        this.pluginUpdateDownloadPromise = null
+      }
+    })()
+
+    return this.pluginUpdateDownloadPromise
+  }
+
+  private async downloadPluginRepair(
+    version: string,
+    assets: ReleaseAssets,
+    files: ReleaseFileName[],
+  ): Promise<void> {
+    if (!canSelfUpdate(this) || !this.manifest.dir || files.length === 0) {
+      return
+    }
+
+    if (this.pluginUpdateDownloadPromise) {
+      return this.pluginUpdateDownloadPromise
+    }
+
+    const normalized = normalizePluginVersion(version)
+    const uniqueFiles = [...new Set(files)]
+    if (
+      this.pluginUpdateState.status === 'ready' &&
+      this.pluginUpdateState.version === normalized &&
+      this.repairFilesMatch(this.pluginUpdateState.repairFiles, uniqueFiles)
+    ) {
+      return
+    }
+
+    if (this.pluginUpdateState.status === 'downloading') {
+      return
+    }
+
+    const stagingDir = getStagingDir(this.manifest.dir, normalized)
+    const existing = await getRepairStagingStatus(
+      this.app.vault.adapter,
+      stagingDir,
+      normalized,
+    )
+    if (existing.ready && this.repairFilesMatch(existing.files, uniqueFiles)) {
+      this.setPluginUpdateState({
+        status: 'ready',
+        version: normalized,
+        repairFiles: uniqueFiles,
+      })
+      return
+    }
+
+    this.setPluginUpdateState({
+      status: 'downloading',
+      version: normalized,
+      progress: 0,
+      repairFiles: uniqueFiles,
+    })
+
+    this.pluginUpdateDownloadPromise = (async () => {
+      try {
+        await downloadRepairFilesToStaging({
+          adapter: this.app.vault.adapter,
+          pluginDir: this.manifest.dir!,
+          version: normalized,
+          assets,
+          files: uniqueFiles,
+          onProgress: (progress) => {
+            this.setPluginUpdateState({
+              status: 'downloading',
+              version: normalized,
+              progress,
+              repairFiles: uniqueFiles,
+            })
+          },
+        })
+        this.setPluginUpdateState({
+          status: 'ready',
+          version: normalized,
+          repairFiles: uniqueFiles,
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        this.setPluginUpdateState({
+          status: 'error',
+          version: normalized,
+          message,
+          repairFiles: uniqueFiles,
+        })
+      } finally {
+        this.pluginUpdateDownloadPromise = null
+      }
+    })()
+
+    return this.pluginUpdateDownloadPromise
+  }
+
+  async applyPluginUpdate(): Promise<void> {
+    if (this.pluginUpdateState.status !== 'ready') {
+      return
+    }
+
+    const version = this.pluginUpdateState.version
+    const repairFiles = this.pluginUpdateState.repairFiles
+
+    this.setPluginUpdateState({
+      status: 'applying',
+      version,
+      repairFiles,
+    })
+
+    const applyResult = repairFiles?.length
+      ? await applyRepairFiles(this.app, this, version)
+      : await applyStagedUpdate(this.app, this, version)
+    if (!applyResult.ok) {
+      if (applyResult.reason === 'min_app_version') {
+        const { InstallerUpdateRequiredModal } = await import(
+          './components/modals/InstallerUpdateRequiredModal'
+        )
+        new InstallerUpdateRequiredModal(this.app).open()
+      }
+      this.setPluginUpdateState({
+        status: 'error',
+        version,
+        message: applyResult.reason,
+        repairFiles,
+      })
+      return
+    }
+
+    this.setPluginUpdateState({ status: 'idle' })
+    this.updateCheckResult = null
     this.notifyUpdateCheckListeners()
+  }
+
+  private async autoRepairInstallation(): Promise<void> {
+    const detail = this.installationIncompleteDetail
+    if (!detail || !canSelfUpdate(this) || detail.suspectFiles.length === 0) {
+      return
+    }
+
+    const version = normalizePluginVersion(detail.targetVersion)
+    const files = [...new Set(detail.suspectFiles)]
+    if (
+      this.pluginUpdateState.status === 'ready' &&
+      this.pluginUpdateState.version === version &&
+      this.repairFilesMatch(this.pluginUpdateState.repairFiles, files)
+    ) {
+      return
+    }
+
+    const assets = buildReleaseAssets(version)
+    if (!assets) {
+      return
+    }
+
+    await this.downloadPluginRepair(version, assets, files)
+  }
+
+  async repairIncompleteInstallation(): Promise<void> {
+    const detail = this.installationIncompleteDetail
+    if (!detail || !canSelfUpdate(this)) {
+      return
+    }
+
+    const version = normalizePluginVersion(detail.targetVersion)
+    const files = [...new Set(detail.suspectFiles)]
+    if (
+      this.pluginUpdateState.status === 'ready' &&
+      this.pluginUpdateState.version === version &&
+      this.repairFilesMatch(this.pluginUpdateState.repairFiles, files)
+    ) {
+      await this.applyPluginUpdate()
+      return
+    }
+
+    const assets = buildReleaseAssets(version)
+    if (!assets) {
+      return
+    }
+
+    await this.downloadPluginRepair(version, assets, files)
+  }
+
+  isUpdateVersionSoftDismissed(version: string): boolean {
+    return this.settings.softDismissedUpdateVersion === version
+  }
+
+  isUpdateVersionMuted(version: string): boolean {
+    const muted = normalizePluginVersion(this.settings.mutedUpdateVersion)
+    if (!muted) {
+      return false
+    }
+    return muted === normalizePluginVersion(version)
+  }
+
+  async muteUpdateVersion(version: string): Promise<void> {
+    const normalized = normalizePluginVersion(version)
+    await this.setSettings({
+      ...this.settings,
+      mutedUpdateVersion: normalized,
+    })
+    if (this.isUpdateVersionMuted(normalized)) {
+      this.updateCheckResult = null
+      this.notifyUpdateCheckListeners()
+    }
+  }
+
+  async dismissUpdateVersion(version: string): Promise<void> {
+    await this.setSettings({
+      ...this.settings,
+      softDismissedUpdateVersion: version,
+    })
+    // setSettings can no-op (e.g. external settings conflict). Only hide the
+    // toast when the dismissal state actually persisted, so the user can retry.
+    const persisted = this.isUpdateVersionSoftDismissed(version)
+    if (persisted) {
+      this.updateCheckResult = null
+      this.notifyUpdateCheckListeners()
+    }
   }
 
   checkForUpdateOnce(): void {
@@ -2566,8 +3169,19 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     void (async () => {
       const fetched = await checkForUpdate(this.manifest.version)
       if (fetched?.hasUpdate) {
+        if (this.isUpdateVersionMuted(fetched.latestVersion)) {
+          return
+        }
         this.updateCheckResult = fetched
         this.notifyUpdateCheckListeners()
+        await this.refreshPluginUpdateStaging(fetched.latestVersion)
+        if (
+          this.settings.pluginUpdateAutoDownloadEnabled &&
+          canSelfUpdate(this) &&
+          fetched.assets
+        ) {
+          void this.startPluginUpdateDownload()
+        }
       }
     })()
   }
@@ -2602,7 +3216,10 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     if (!data) return
 
     const highlightId = crypto.randomUUID()
-    if (editorView) {
+    if (
+      editorView &&
+      (this.settings.continuationOptions.persistSelectionHighlight ?? true)
+    ) {
       const sel = editorView.state.selection.main
       if (!sel.empty) {
         selectionHighlightController.addHighlight(
@@ -2647,7 +3264,10 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     if (!this.dbManagerInitPromise) {
       this.dbManagerInitPromise = (async () => {
         try {
-          const runtime = await this.getPGliteRuntimeManager().ensureReady()
+          const runtime = await (
+            await this.getPGliteRuntimeManager()
+          ).ensureReady()
+          const { DatabaseManager } = await import('./database/DatabaseManager')
           this.dbManager = await DatabaseManager.create(
             this.app,
             runtime.dir,
@@ -2658,6 +3278,9 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
         } catch (error) {
           this.dbManagerInitPromise = null
           if (error instanceof PGLiteAbortedException) {
+            const { InstallerUpdateRequiredModal } = await import(
+              './components/modals/InstallerUpdateRequiredModal'
+            )
             new InstallerUpdateRequiredModal(this.app).open()
           }
           throw error
@@ -2694,8 +3317,8 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     onProgress?: (
       progress: import('./components/chat-view/QueryProgress').IndexProgress,
     ) => void
-  }): Promise<void> {
-    await this.getRagIndexService().runIndex(options)
+  }): Promise<ReconcileResult> {
+    return await this.getRagIndexService().runIndex(options)
   }
 
   /** Re-issue the previously failed run. Falls back to a full sync reconcile. */
@@ -2727,7 +3350,7 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
   }
 
   async getMcpManager(): Promise<McpManager> {
-    const manager = await this.getMcpCoordinator().getMcpManager()
+    const manager = await (await this.getMcpCoordinator()).getMcpManager()
     this.mcpManager = manager
     return manager
   }

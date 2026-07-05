@@ -12,12 +12,14 @@ import {
   type ParagraphNode,
   SerializedEditorState,
 } from 'lexical'
+import { FilePlus2 } from 'lucide-react'
 import { Notice } from 'obsidian'
 import {
   type CSSProperties,
-  type FocusEvent,
+  type DragEvent as ReactDragEvent,
   type MouseEvent as ReactMouseEvent,
   forwardRef,
+  memo,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -30,15 +32,17 @@ import { useApp } from '../../../contexts/app-context'
 import { useLanguage } from '../../../contexts/language-context'
 import { useSettings } from '../../../contexts/settings-context'
 import { getYoloSnippetsPath } from '../../../core/paths/yoloPaths'
-import { listLiteSkillEntries } from '../../../core/skills/liteSkills'
 import { isSkillEnabledForAssistant } from '../../../core/skills/skillPolicy'
 import { openSnippetsFileInVault } from '../../../core/snippets/snippetsFile'
+import { useLiteSkillEntries } from '../../../hooks/useLiteSkillEntries'
 import { ChatSelectedSkill } from '../../../types/chat'
 import { ChatModel } from '../../../types/chat-model.types'
 import {
   Mentionable,
   MentionableImage,
+  MentionableOffice,
   MentionablePDF,
+  MentionableTextAttachment,
   SerializedMentionable,
 } from '../../../types/mentionable'
 import {
@@ -53,12 +57,15 @@ import {
 } from '../../../utils/chat/mentionable'
 import { fileToMentionableImage } from '../../../utils/llm/image'
 import { chatModelSupportsVision } from '../../../utils/llm/model-modalities'
+import { fileToMentionableOffice } from '../../../utils/llm/office'
 import { fileToMentionablePDF } from '../../../utils/llm/pdf'
+import { fileToMentionableTextAttachment } from '../../../utils/llm/text-attachment'
 import ContextUsagePopover from '../ContextUsagePopover'
 import ContextUsageRing from '../ContextUsageRing'
 import { useSnippetEntries } from '../hooks/useSnippetEntries'
 import type { ContextBreakdownInputs } from '../useContextBreakdown'
 
+import { ChatMode, ChatModeSelect } from './ChatModeSelect'
 import ChatSkillBadge from './ChatSkillBadge'
 import { FileUploadButton } from './FileUploadButton'
 import LexicalContentEditable from './LexicalContentEditable'
@@ -78,6 +85,7 @@ import type { SlashCommand } from './plugins/mention/SkillSlashPlugin'
 import { NodeMutations } from './plugins/on-mutation/OnMutationPlugin'
 import { ReasoningSelect, supportsReasoning } from './ReasoningSelect'
 import { SubmitButton } from './SubmitButton'
+import { classifyUploadFiles } from './utils/file-upload'
 
 export type ChatUserInputRef = {
   focus: () => void
@@ -86,6 +94,8 @@ export type ChatUserInputRef = {
   replaceText: (text: string) => void
   submit: () => void
 }
+
+export type ChatUserInputControlLayout = 'composer-toolbar' | 'inline'
 
 export type ChatUserInputProps = {
   initialSerializedEditorState: SerializedEditorState | null
@@ -113,16 +123,22 @@ export type ChatUserInputProps = {
   compact?: boolean
   hideBadgeMentionables?: boolean
   onToggleCompact?: () => void
-  onBlur?: () => void
   currentAssistantId?: string
   onSelectAssistantForConversation?: (assistantId: string) => void
-  currentChatMode?: 'chat' | 'agent'
-  onSelectChatModeForConversation?: (mode: 'chat' | 'agent') => void
+  currentChatMode?: ChatMode
+  onSelectChatModeForConversation?: (mode: ChatMode) => void
+  chatMode?: ChatMode
+  onChatModeChange?: (mode: ChatMode) => void
+  yoloEnabled?: boolean
+  onYoloChange?: (enabled: boolean) => void
+  controlLayout?: ChatUserInputControlLayout
+  onControlPopoverOpenChange?: (isOpen: boolean) => void
   allowAgentModeOption?: boolean
   enableResize?: boolean
   onRunSlashCommand?: (command: SlashCommand) => void
   // 当父级正在执行 conversation run 时，发送按钮切换为停止按钮（圆形 + 方块）
   isGenerating?: boolean
+  canQueueWhileGenerating?: boolean
   onAbort?: () => void
   // 当输入为空、无 mentionable、无 skill 时，发送按钮以淡化态显示，不可点击
   submitDisabled?: boolean
@@ -147,12 +163,18 @@ const INLINE_MENTIONABLE_TYPES = [
   'folder',
   'block',
   'assistant-quote',
+  'web-selection',
   'model',
   'image',
 ]
 const DEFAULT_INPUT_HEIGHT = 80
 const MIN_INPUT_HEIGHT = 80
 const MAX_INPUT_HEIGHT = 520
+
+function isFileDragEvent(event: ReactDragEvent<HTMLDivElement>) {
+  const types = Array.from(event.dataTransfer.types ?? [])
+  return types.includes('Files')
+}
 
 const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
   (
@@ -177,15 +199,21 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
       compact = false,
       hideBadgeMentionables = false,
       onToggleCompact,
-      onBlur,
       currentAssistantId,
       onSelectAssistantForConversation,
       currentChatMode,
       onSelectChatModeForConversation,
+      chatMode,
+      onChatModeChange,
+      yoloEnabled = false,
+      onYoloChange,
+      controlLayout = 'composer-toolbar',
+      onControlPopoverOpenChange,
       allowAgentModeOption = true,
       enableResize = false,
       onRunSlashCommand,
       isGenerating = false,
+      canQueueWhileGenerating = true,
       onAbort,
       submitDisabled = false,
       contextUsage,
@@ -227,7 +255,7 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
     const containerRef = useRef<HTMLDivElement>(null)
     const [isEditorReady, setIsEditorReady] = useState(false)
     const suppressedDestroyedMentionableKeysRef = useRef<Set<string>>(new Set())
-    const suppressedDestroyedSkillIdsRef = useRef<Set<string>>(new Set())
+    const suppressedDestroyedSkillNamesRef = useRef<Set<string>>(new Set())
     const [inputText, setInputText] = useState('')
     const [resizedHeight, setResizedHeight] = useState<number | null>(
       rememberedInputHeight,
@@ -235,6 +263,8 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
     const resizedHeightRef = useRef<number | null>(rememberedInputHeight)
     const dragStartYRef = useRef(0)
     const dragStartHeightRef = useRef(DEFAULT_INPUT_HEIGHT)
+    const fileDragDepthRef = useRef(0)
+    const [isFileDragActive, setIsFileDragActive] = useState(false)
 
     const effectiveMentionables = useMemo(
       () => displayMentionables ?? mentionables,
@@ -269,11 +299,19 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
           .map((mentionable) => mentionable.modelId),
       [mentionables],
     )
+    const selectedSkillNames = useMemo(
+      () => effectiveSelectedSkills.map((skill) => skill.name),
+      [effectiveSelectedSkills],
+    )
 
+    const allSkillEntries = useLiteSkillEntries(app, { settings })
+    const availableAssistants = useMemo(
+      () => settings.assistants || [],
+      [settings.assistants],
+    )
     const availableSkills = useMemo(() => {
-      const assistants = settings.assistants || []
       const currentAssistant = currentAssistantId
-        ? (assistants.find(
+        ? (availableAssistants.find(
             (assistant) => assistant.id === currentAssistantId,
           ) ?? null)
         : null
@@ -282,16 +320,16 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
         return []
       }
 
-      const disabledSkillIds = settings.skills?.disabledSkillIds ?? []
-      return listLiteSkillEntries(app, { settings }).filter((skill) =>
+      const disabledSkillNames = settings.skills?.disabledSkillIds ?? []
+      return allSkillEntries.filter((skill) =>
         isSkillEnabledForAssistant({
           assistant: currentAssistant,
-          skillId: skill.id,
-          disabledSkillIds,
+          skillName: skill.name,
+          disabledSkillNames,
           defaultLoadMode: skill.mode,
         }),
       )
-    }, [app, currentAssistantId, settings])
+    }, [allSkillEntries, availableAssistants, currentAssistantId, settings])
 
     const availableSnippets = useSnippetEntries()
 
@@ -311,20 +349,6 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
       if (reasoningLevel) return reasoningLevel
       return getDefaultReasoningLevel(currentModel)
     }, [currentModel, reasoningLevel])
-
-    const handleBlur = (event: FocusEvent<HTMLDivElement>) => {
-      if (!onBlur) return
-      const nextTarget = event.relatedTarget as Node | null
-      if (
-        nextTarget &&
-        nextTarget instanceof HTMLElement &&
-        nextTarget.closest('.yolo-popover-surface')
-      ) {
-        return
-      }
-      if (nextTarget && event.currentTarget.contains(nextTarget)) return
-      onBlur()
-    }
 
     useEffect(() => {
       if (isEditorReady) return
@@ -383,221 +407,248 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
       }
     }, [])
 
-    useImperativeHandle(ref, () => ({
-      focus: () => {
-        contentEditableRef.current?.focus()
-      },
-      insertText: (text: string) => {
-        if (!editorRef.current) return
+    const handleSubmit = useCallback(() => {
+      const content = editorRef.current?.getEditorState()?.toJSON()
+      if (content) {
+        onSubmit(content)
+      }
+    }, [onSubmit])
 
-        editorRef.current.update(
-          () => {
-            const selection = $getSelection()
-            if ($isRangeSelection(selection)) {
-              selection.insertText(text)
-            } else {
-              // If no selection, insert at the end
+    useImperativeHandle(
+      ref,
+      () => ({
+        focus: () => {
+          contentEditableRef.current?.focus()
+        },
+        insertText: (text: string) => {
+          if (!editorRef.current) return
+
+          editorRef.current.update(
+            () => {
+              const selection = $getSelection()
+              if ($isRangeSelection(selection)) {
+                selection.insertText(text)
+              } else {
+                // If no selection, insert at the end
+                const root = $getRoot()
+                root.selectEnd()
+                const newSelection = $getSelection()
+                if ($isRangeSelection(newSelection)) {
+                  newSelection.insertText(text)
+                }
+              }
+            },
+            { discrete: true },
+          )
+
+          // Focus the editor after inserting
+          contentEditableRef.current?.focus()
+        },
+        appendText: (text: string) => {
+          if (!editorRef.current) return
+
+          editorRef.current.update(
+            () => {
               const root = $getRoot()
               root.selectEnd()
-              const newSelection = $getSelection()
-              if ($isRangeSelection(newSelection)) {
-                newSelection.insertText(text)
+              const selection = $getSelection()
+              if ($isRangeSelection(selection)) {
+                selection.insertText(text)
               }
-            }
-          },
-          { discrete: true },
-        )
-
-        // Focus the editor after inserting
-        contentEditableRef.current?.focus()
-      },
-      appendText: (text: string) => {
-        if (!editorRef.current) return
-
-        editorRef.current.update(
-          () => {
-            const root = $getRoot()
-            root.selectEnd()
-            const selection = $getSelection()
-            if ($isRangeSelection(selection)) {
-              selection.insertText(text)
-            }
-          },
-          { discrete: true },
-        )
-
-        contentEditableRef.current?.focus()
-      },
-      replaceText: (text: string) => {
-        if (!editorRef.current) return
-
-        editorRef.current.update(
-          () => {
-            const root = $getRoot()
-            root.clear()
-            const paragraph = $createParagraphNode()
-            if (text) {
-              paragraph.append($createTextNode(text))
-            }
-            root.append(paragraph)
-            paragraph.selectEnd()
-          },
-          { discrete: true },
-        )
-
-        contentEditableRef.current?.focus()
-      },
-      submit: () => {
-        handleSubmit()
-      },
-    }))
-
-    const handleMentionNodeMutation = (
-      mutations: NodeMutations<MentionNode>,
-    ) => {
-      const destroyedMentionableKeys: string[] = []
-      const addedMentionables: SerializedMentionable[] = []
-      let hasDanglingLightweightBlockToken = false
-      mutations.forEach((mutation) => {
-        const mentionable = mutation.node.getMentionable()
-        const mentionableKey = getMentionableKey(mentionable)
-
-        if (mutation.mutation === 'destroyed') {
-          if (
-            suppressedDestroyedMentionableKeysRef.current.has(mentionableKey)
-          ) {
-            suppressedDestroyedMentionableKeysRef.current.delete(mentionableKey)
-            return
-          }
-
-          const nodeWithSameMentionable = editorRef.current?.read(() =>
-            $nodesOfType(MentionNode).find(
-              (node) =>
-                getMentionableKey(node.getMentionable()) === mentionableKey,
-            ),
+            },
+            { discrete: true },
           )
 
-          if (!nodeWithSameMentionable) {
-            // remove mentionable only if it's not present in the editor state
-            destroyedMentionableKeys.push(mentionableKey)
-          }
-        } else if (mutation.mutation === 'created') {
-          if (
-            mentionable.type === 'block' &&
-            typeof mentionable.content !== 'string'
-          ) {
-            const existsInMentionables = mentionables.some(
-              (m) =>
-                getMentionableKey(serializeMentionable(m)) === mentionableKey,
-            )
-            if (!existsInMentionables) {
-              hasDanglingLightweightBlockToken = true
-            }
-            return
-          }
+          contentEditableRef.current?.focus()
+        },
+        replaceText: (text: string) => {
+          if (!editorRef.current) return
 
-          if (
-            mentionables.some(
-              (m) =>
-                getMentionableKey(serializeMentionable(m)) === mentionableKey,
-            ) ||
-            addedMentionables.some(
-              (m) => getMentionableKey(m) === mentionableKey,
-            )
-          ) {
-            // do nothing if mentionable is already added
-            return
-          }
-
-          addedMentionables.push(mentionable)
-        }
-      })
-
-      if (hasDanglingLightweightBlockToken) {
-        new Notice('Block reference pasted as text. Please reselect the block.')
-      }
-
-      if (destroyedMentionableKeys.length > 0 && onDeleteFromAll) {
-        destroyedMentionableKeys.forEach((mentionableKey) => {
-          const mentionable = effectiveMentionables.find(
-            (m) =>
-              getMentionableKey(serializeMentionable(m)) === mentionableKey,
+          editorRef.current.update(
+            () => {
+              const root = $getRoot()
+              root.clear()
+              const paragraph = $createParagraphNode()
+              if (text) {
+                paragraph.append($createTextNode(text))
+              }
+              root.append(paragraph)
+              paragraph.selectEnd()
+            },
+            { discrete: true },
           )
-          if (mentionable) {
-            onDeleteFromAll(mentionable)
+
+          contentEditableRef.current?.focus()
+        },
+        submit: () => {
+          handleSubmit()
+        },
+      }),
+      [handleSubmit],
+    )
+
+    const handleMentionNodeMutation = useCallback(
+      (mutations: NodeMutations<MentionNode>) => {
+        const destroyedMentionableKeys: string[] = []
+        const addedMentionables: SerializedMentionable[] = []
+        let hasDanglingLightweightBlockToken = false
+        mutations.forEach((mutation) => {
+          const mentionable = mutation.node.getMentionable()
+          const mentionableKey = getMentionableKey(mentionable)
+
+          if (mutation.mutation === 'destroyed') {
+            if (
+              suppressedDestroyedMentionableKeysRef.current.has(mentionableKey)
+            ) {
+              suppressedDestroyedMentionableKeysRef.current.delete(
+                mentionableKey,
+              )
+              return
+            }
+
+            const nodeWithSameMentionable = editorRef.current?.read(() =>
+              $nodesOfType(MentionNode).find(
+                (node) =>
+                  getMentionableKey(node.getMentionable()) === mentionableKey,
+              ),
+            )
+
+            if (!nodeWithSameMentionable) {
+              // remove mentionable only if it's not present in the editor state
+              destroyedMentionableKeys.push(mentionableKey)
+            }
+          } else if (mutation.mutation === 'created') {
+            if (
+              mentionable.type === 'block' &&
+              typeof mentionable.content !== 'string'
+            ) {
+              const existsInMentionables = mentionables.some(
+                (m) =>
+                  getMentionableKey(serializeMentionable(m)) === mentionableKey,
+              )
+              if (!existsInMentionables) {
+                hasDanglingLightweightBlockToken = true
+              }
+              return
+            }
+
+            if (
+              mentionables.some(
+                (m) =>
+                  getMentionableKey(serializeMentionable(m)) === mentionableKey,
+              ) ||
+              addedMentionables.some(
+                (m) => getMentionableKey(m) === mentionableKey,
+              )
+            ) {
+              // do nothing if mentionable is already added
+              return
+            }
+
+            addedMentionables.push(mentionable)
           }
         })
-      }
 
-      if (!onDeleteFromAll || addedMentionables.length > 0) {
-        setMentionables(
-          mentionables
-            .filter(
+        if (hasDanglingLightweightBlockToken) {
+          new Notice(
+            'Block reference pasted as text. Please reselect the block.',
+          )
+        }
+
+        if (destroyedMentionableKeys.length > 0 && onDeleteFromAll) {
+          destroyedMentionableKeys.forEach((mentionableKey) => {
+            const mentionable = effectiveMentionables.find(
               (m) =>
-                !destroyedMentionableKeys.includes(
-                  getMentionableKey(serializeMentionable(m)),
-                ),
+                getMentionableKey(serializeMentionable(m)) === mentionableKey,
             )
-            .concat(
-              addedMentionables
-                .map((m) => deserializeMentionable(m, app))
-                .filter((v) => !!v),
-            ),
-        )
-      }
-      // 默认保持收起状态，不自动展开新添加的徽章
-    }
+            if (mentionable) {
+              onDeleteFromAll(mentionable)
+            }
+          })
+        }
 
-    const handleSkillNodeMutation = (mutations: NodeMutations<SkillNode>) => {
-      if (!setSelectedSkills) {
-        return
-      }
+        if (!onDeleteFromAll || addedMentionables.length > 0) {
+          setMentionables(
+            mentionables
+              .filter(
+                (m) =>
+                  !destroyedMentionableKeys.includes(
+                    getMentionableKey(serializeMentionable(m)),
+                  ),
+              )
+              .concat(
+                addedMentionables
+                  .map((m) => deserializeMentionable(m, app))
+                  .filter((v) => !!v),
+              ),
+          )
+        }
+        // 默认保持收起状态，不自动展开新添加的徽章
+      },
+      [
+        app,
+        effectiveMentionables,
+        mentionables,
+        onDeleteFromAll,
+        setMentionables,
+      ],
+    )
 
-      const destroyedSkillIds: string[] = []
-      const addedSkills: ChatSelectedSkill[] = []
+    const handleSkillNodeMutation = useCallback(
+      (mutations: NodeMutations<SkillNode>) => {
+        if (!setSelectedSkills) {
+          return
+        }
 
-      mutations.forEach((mutation) => {
-        const skill = mutation.node.getSkill()
-        if (mutation.mutation === 'destroyed') {
-          if (suppressedDestroyedSkillIdsRef.current.has(skill.id)) {
-            suppressedDestroyedSkillIdsRef.current.delete(skill.id)
+        const destroyedSkillNames: string[] = []
+        const addedSkills: ChatSelectedSkill[] = []
+
+        mutations.forEach((mutation) => {
+          const skill = mutation.node.getSkill()
+          if (mutation.mutation === 'destroyed') {
+            if (suppressedDestroyedSkillNamesRef.current.has(skill.name)) {
+              suppressedDestroyedSkillNamesRef.current.delete(skill.name)
+              return
+            }
+
+            const nodeWithSameSkill = editorRef.current?.read(() =>
+              $nodesOfType(SkillNode).find(
+                (node) => node.getSkill().name === skill.name,
+              ),
+            )
+
+            if (!nodeWithSameSkill) {
+              destroyedSkillNames.push(skill.name)
+            }
             return
           }
 
-          const nodeWithSameSkill = editorRef.current?.read(() =>
-            $nodesOfType(SkillNode).find(
-              (node) => node.getSkill().id === skill.id,
-            ),
-          )
-
-          if (!nodeWithSameSkill) {
-            destroyedSkillIds.push(skill.id)
+          if (
+            effectiveSelectedSkills.some(
+              (selectedSkill) => selectedSkill.name === skill.name,
+            ) ||
+            addedSkills.some(
+              (selectedSkill) => selectedSkill.name === skill.name,
+            )
+          ) {
+            return
           }
+
+          addedSkills.push(skill)
+        })
+
+        if (destroyedSkillNames.length === 0 && addedSkills.length === 0) {
           return
         }
 
-        if (
-          effectiveSelectedSkills.some(
-            (selectedSkill) => selectedSkill.id === skill.id,
-          ) ||
-          addedSkills.some((selectedSkill) => selectedSkill.id === skill.id)
-        ) {
-          return
-        }
-
-        addedSkills.push(skill)
-      })
-
-      if (destroyedSkillIds.length === 0 && addedSkills.length === 0) {
-        return
-      }
-
-      setSelectedSkills(
-        effectiveSelectedSkills
-          .filter((skill) => !destroyedSkillIds.includes(skill.id))
-          .concat(addedSkills),
-      )
-    }
+        setSelectedSkills(
+          effectiveSelectedSkills
+            .filter((skill) => !destroyedSkillNames.includes(skill.name))
+            .concat(addedSkills),
+        )
+      },
+      [effectiveSelectedSkills, setSelectedSkills],
+    )
 
     useEffect(() => {
       const editor = editorRef.current
@@ -732,8 +783,8 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
 
       const skillsToMirror =
         mentionDisplayMode === 'inline' ? effectiveSelectedSkills : []
-      const skillsById = new Map(
-        skillsToMirror.map((skill) => [skill.id, skill] as const),
+      const skillsByName = new Map(
+        skillsToMirror.map((skill) => [skill.name, skill] as const),
       )
 
       const shouldMoveCursor =
@@ -743,9 +794,9 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
       editor.update(() => {
         $nodesOfType(SkillNode).forEach((node) => {
           const skill = node.getSkill()
-          if (skillsById.has(skill.id)) return
+          if (skillsByName.has(skill.name)) return
 
-          suppressedDestroyedSkillIdsRef.current.add(skill.id)
+          suppressedDestroyedSkillNamesRef.current.add(skill.name)
           const prevSibling = node.getPreviousSibling()
           if (
             prevSibling &&
@@ -768,8 +819,8 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
 
         if (skillsToMirror.length === 0) return
 
-        const existingIds = new Set(
-          $nodesOfType(SkillNode).map((node) => node.getSkill().id),
+        const existingNames = new Set(
+          $nodesOfType(SkillNode).map((node) => node.getSkill().name),
         )
         const root = $getRoot()
         let paragraphNode = root.getFirstChild()
@@ -783,7 +834,7 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
 
         let didInsert = false
         skillsToMirror.forEach((skill) => {
-          if (existingIds.has(skill.id)) return
+          if (existingNames.has(skill.name)) return
 
           const skillNode = $createSkillNode(skill.name, skill)
           const spacer = $createTextNode(' ')
@@ -948,26 +999,124 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
       [mentionableUnitLabels, mentionables, setMentionables],
     )
 
+    const handleCreateOfficeMentionables = useCallback(
+      (mentionableOffices: MentionableOffice[]) => {
+        const newMentionableOffices = mentionableOffices.filter(
+          (m) =>
+            !mentionables.some(
+              (mentionable) =>
+                getMentionableKey(serializeMentionable(mentionable)) ===
+                getMentionableKey(serializeMentionable(m)),
+            ),
+        )
+        if (newMentionableOffices.length === 0) return
+        const editor = editorRef.current
+        if (editor) {
+          editor.update(() => {
+            const nodesToInsert: LexicalNode[] = []
+            newMentionableOffices.forEach((mentionable) => {
+              nodesToInsert.push(
+                $createMentionNode(
+                  getMentionableName(mentionable, {
+                    unitLabels: mentionableUnitLabels,
+                  }),
+                  serializeMentionable(mentionable),
+                ),
+              )
+              nodesToInsert.push($createTextNode(' '))
+            })
+            const selection = $getSelection()
+            if (selection && $isRangeSelection(selection)) {
+              selection.insertNodes(nodesToInsert)
+              return
+            }
+
+            const root = $getRoot()
+            let paragraphNode = root.getFirstChild()
+            if (!paragraphNode || !$isParagraphNode(paragraphNode)) {
+              const created = $createParagraphNode()
+              root.append(created)
+              paragraphNode = created
+            }
+            const paragraph = paragraphNode as ParagraphNode
+            nodesToInsert.forEach((node) => {
+              paragraph.append(node)
+            })
+          })
+        }
+        setMentionables([...mentionables, ...newMentionableOffices])
+      },
+      [mentionableUnitLabels, mentionables, setMentionables],
+    )
+
+    const handleCreateTextAttachmentMentionables = useCallback(
+      (mentionableTextAttachments: MentionableTextAttachment[]) => {
+        const newMentionables = mentionableTextAttachments.filter(
+          (m) =>
+            !mentionables.some(
+              (mentionable) =>
+                getMentionableKey(serializeMentionable(mentionable)) ===
+                getMentionableKey(serializeMentionable(m)),
+            ),
+        )
+        if (newMentionables.length === 0) return
+        const editor = editorRef.current
+        if (editor) {
+          editor.update(() => {
+            const nodesToInsert: LexicalNode[] = []
+            newMentionables.forEach((mentionable) => {
+              nodesToInsert.push(
+                $createMentionNode(
+                  getMentionableName(mentionable, {
+                    unitLabels: mentionableUnitLabels,
+                  }),
+                  serializeMentionable(mentionable),
+                ),
+              )
+              nodesToInsert.push($createTextNode(' '))
+            })
+            const selection = $getSelection()
+            if (selection && $isRangeSelection(selection)) {
+              selection.insertNodes(nodesToInsert)
+              return
+            }
+
+            const root = $getRoot()
+            let paragraphNode = root.getFirstChild()
+            if (!paragraphNode || !$isParagraphNode(paragraphNode)) {
+              const created = $createParagraphNode()
+              root.append(created)
+              paragraphNode = created
+            }
+            const paragraph = paragraphNode as ParagraphNode
+            nodesToInsert.forEach((node) => {
+              paragraph.append(node)
+            })
+          })
+        }
+        setMentionables([...mentionables, ...newMentionables])
+      },
+      [mentionableUnitLabels, mentionables, setMentionables],
+    )
+
     const handleUploadFiles = useCallback(
       (files: File[]) => {
-        const imageFiles: File[] = []
-        const pdfFiles: File[] = []
-        const unsupported: File[] = []
-        for (const file of files) {
-          if (file.type.startsWith('image/')) {
-            imageFiles.push(file)
-          } else if (
-            file.type === 'application/pdf' ||
-            file.name.toLowerCase().endsWith('.pdf')
-          ) {
-            pdfFiles.push(file)
-          } else {
-            unsupported.push(file)
-          }
-        }
-        if (unsupported.length > 0) {
+        const {
+          imageFiles,
+          pdfFiles,
+          officeFiles,
+          textAttachmentFiles,
+          unsupportedFiles,
+        } = classifyUploadFiles(files)
+        if (unsupportedFiles.length > 0) {
           new Notice(
-            `Unsupported file type: ${unsupported.map((f) => f.name).join(', ')}`,
+            t(
+              'chat.unsupportedFileType',
+              'Unsupported file type: {names}',
+            ).replace(
+              '{names}',
+              unsupportedFiles.map((file) => file.name).join(', '),
+            ),
           )
         }
         if (imageFiles.length > 0) {
@@ -979,7 +1128,12 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
             })
             .catch((error) => {
               console.error('Failed to process uploaded images', error)
-              new Notice('Failed to process uploaded images')
+              new Notice(
+                t(
+                  'chat.processImagesFailed',
+                  'Failed to process uploaded images',
+                ),
+              )
             })
         }
         if (pdfFiles.length > 0) {
@@ -996,11 +1150,17 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
                 const name = pdfFiles[idx]?.name ?? 'PDF'
                 console.error(`Failed to extract PDF ${name}`, result.reason)
                 new Notice(
-                  `Failed to read PDF "${name}": ${
-                    result.reason instanceof Error
-                      ? result.reason.message
-                      : 'unknown error'
-                  }`,
+                  t(
+                    'chat.readPdfFailed',
+                    'Failed to read PDF "{name}": {error}',
+                  )
+                    .replace('{name}', name)
+                    .replace(
+                      '{error}',
+                      result.reason instanceof Error
+                        ? result.reason.message
+                        : 'unknown error',
+                    ),
                 )
               }
             })
@@ -1009,8 +1169,86 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
             }
           })
         }
+        if (officeFiles.length > 0) {
+          void Promise.allSettled(
+            officeFiles.map((file) => fileToMentionableOffice(file)),
+          ).then((results) => {
+            const successes: MentionableOffice[] = []
+            results.forEach((result, idx) => {
+              if (result.status === 'fulfilled') {
+                successes.push(result.value)
+              } else {
+                const name = officeFiles[idx]?.name ?? 'Office document'
+                console.error(
+                  `Failed to extract Office document ${name}`,
+                  result.reason,
+                )
+                new Notice(
+                  t(
+                    'chat.readOfficeFailed',
+                    'Failed to read Office document "{name}": {error}',
+                  )
+                    .replace('{name}', name)
+                    .replace(
+                      '{error}',
+                      result.reason instanceof Error
+                        ? result.reason.message
+                        : 'unknown error',
+                    ),
+                )
+              }
+            })
+            if (successes.length > 0) {
+              handleCreateOfficeMentionables(successes)
+            }
+          })
+        }
+        if (textAttachmentFiles.length > 0) {
+          void Promise.allSettled(
+            textAttachmentFiles.map((file) =>
+              fileToMentionableTextAttachment(file),
+            ),
+          ).then((results) => {
+            const successes: MentionableTextAttachment[] = []
+            results.forEach((result, idx) => {
+              if (result.status === 'fulfilled') {
+                successes.push(result.value)
+              } else {
+                const name = textAttachmentFiles[idx]?.name ?? 'text file'
+                console.error(
+                  `Failed to read text attachment ${name}`,
+                  result.reason,
+                )
+                new Notice(
+                  t(
+                    'chat.readTextAttachmentFailed',
+                    'Failed to read text file "{name}": {error}',
+                  )
+                    .replace('{name}', name)
+                    .replace(
+                      '{error}',
+                      result.reason instanceof Error
+                        ? result.reason.message
+                        : 'unknown error',
+                    ),
+                )
+              }
+            })
+            if (successes.length > 0) {
+              handleCreateTextAttachmentMentionables(successes)
+            }
+          })
+        }
       },
-      [handleCreateImageMentionables, handleCreatePdfMentionables],
+      [
+        app,
+        handleCreateImageMentionables,
+        handleCreateOfficeMentionables,
+        handleCreatePdfMentionables,
+        handleCreateTextAttachmentMentionables,
+        settings,
+        t,
+      ],
     )
 
     const handleSelectMentionableForBadge = useCallback(
@@ -1053,18 +1291,12 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
     )
 
     const handleSelectSkill = useCallback(
-      (skill: {
-        id: string
-        name: string
-        description: string
-        path: string
-      }) => {
+      (skill: { name: string; description: string; path: string }) => {
         if (!setSelectedSkills) {
           return
         }
 
         const nextSkill: ChatSelectedSkill = {
-          id: skill.id,
           name: skill.name,
           description: skill.description,
           path: skill.path,
@@ -1072,7 +1304,7 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
 
         if (
           effectiveSelectedSkills.some(
-            (selectedSkill) => selectedSkill.id === nextSkill.id,
+            (selectedSkill) => selectedSkill.name === nextSkill.name,
           )
         ) {
           return
@@ -1084,12 +1316,12 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
     )
 
     const handleDeleteSelectedSkill = useCallback(
-      (skillId: string) => {
+      (skillName: string) => {
         if (!setSelectedSkills) {
           return
         }
         setSelectedSkills(
-          effectiveSelectedSkills.filter((skill) => skill.id !== skillId),
+          effectiveSelectedSkills.filter((skill) => skill.name !== skillName),
         )
       },
       [effectiveSelectedSkills, setSelectedSkills],
@@ -1111,13 +1343,6 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
       contentEditableRef.current?.focus()
     }, [])
 
-    const handleSubmit = () => {
-      const content = editorRef.current?.getEditorState()?.toJSON()
-      if (content) {
-        onSubmit(content)
-      }
-    }
-
     const handleEditorBackgroundMouseDown = useCallback(
       (event: ReactMouseEvent<HTMLDivElement>) => {
         const editorRoot = contentEditableRef.current
@@ -1136,6 +1361,35 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
         })
       },
       [],
+    )
+
+    const initialEditorState = useMemo(() => {
+      if (!initialSerializedEditorState) {
+        return undefined
+      }
+
+      return (editor: LexicalEditor) => {
+        try {
+          editor.setEditorState(
+            editor.parseEditorState(initialSerializedEditorState),
+          )
+        } catch (error) {
+          // Defensive: a malformed serialized state shouldn't break the input box.
+          console.warn(
+            '[YOLO] Failed to restore chat input editor state',
+            error,
+          )
+        }
+      }
+    }, [initialSerializedEditorState])
+
+    const lexicalPlugins = useMemo(
+      () => ({
+        onEnter: {
+          onVaultChat: handleSubmit,
+        },
+      }),
+      [handleSubmit],
     )
 
     const clearResizeBodyStyles = useCallback(() => {
@@ -1234,6 +1488,58 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
       [compact, enableResize, persistResizedHeight],
     )
 
+    const clearFileDragState = useCallback(() => {
+      fileDragDepthRef.current = 0
+      setIsFileDragActive(false)
+    }, [])
+
+    const handleContainerDragEnter = useCallback(
+      (event: ReactDragEvent<HTMLDivElement>) => {
+        if (compact || !isFileDragEvent(event)) {
+          return
+        }
+
+        fileDragDepthRef.current += 1
+        setIsFileDragActive(true)
+      },
+      [compact],
+    )
+
+    const handleContainerDragOver = useCallback(
+      (event: ReactDragEvent<HTMLDivElement>) => {
+        if (compact || !isFileDragEvent(event)) {
+          return
+        }
+
+        event.preventDefault()
+        event.dataTransfer.dropEffect = 'copy'
+      },
+      [compact],
+    )
+
+    const handleContainerDragLeave = useCallback(
+      (event: ReactDragEvent<HTMLDivElement>) => {
+        if (compact || !isFileDragEvent(event)) {
+          return
+        }
+
+        fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1)
+        if (fileDragDepthRef.current === 0) {
+          setIsFileDragActive(false)
+        }
+      },
+      [compact],
+    )
+
+    const handleContainerDropCapture = useCallback(
+      (event: ReactDragEvent<HTMLDivElement>) => {
+        if (isFileDragEvent(event)) {
+          clearFileDragState()
+        }
+      },
+      [clearFileDragState],
+    )
+
     const handleContainerMouseDown = useCallback(
       (event: ReactMouseEvent<HTMLDivElement>) => {
         if (compact) {
@@ -1246,6 +1552,7 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
         }
 
         if (
+          target.closest('.yolo-chat-user-input-send-row') ||
           target.closest('.yolo-chat-user-input-controls') ||
           target.closest('button') ||
           target.closest('[role="button"]')
@@ -1274,10 +1581,78 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
       }
     }, [compact, enableResize, resizedHeight])
 
+    const renderChatModeControl = () =>
+      onChatModeChange && chatMode ? (
+        <ChatModeSelect
+          mode={chatMode}
+          onChange={onChatModeChange}
+          yoloEnabled={yoloEnabled}
+          onYoloChange={onYoloChange ?? (() => {})}
+          side="top"
+          sideOffset={8}
+        />
+      ) : null
+
+    const renderModelControl = () => (
+      <ModelSelect
+        modelId={modelId}
+        onChange={onModelChange}
+        onMenuOpenChange={onControlPopoverOpenChange}
+        align="center"
+        sideOffset={8}
+        popover={{
+          variant: 'default',
+          minWidth: 240,
+          maxWidth: 320,
+          maxHeight: 560,
+        }}
+      />
+    )
+
+    const renderReasoningControl = () =>
+      showReasoningSelect && supportsReasoning(currentModel) ? (
+        <ReasoningSelect
+          model={currentModel}
+          value={resolvedReasoningLevel}
+          onChange={(level) => onReasoningChange?.(level)}
+          onMenuOpenChange={onControlPopoverOpenChange}
+          side="top"
+          sideOffset={8}
+        />
+      ) : null
+
+    const renderContextUsageControl = () =>
+      contextUsage ? (
+        contextUsage.buildBreakdownInputs ? (
+          <ContextUsagePopover
+            promptTokens={contextUsage.promptTokens}
+            maxContextTokens={contextUsage.maxContextTokens}
+            label={contextUsage.label}
+            anchorRef={containerRef}
+            buildInputs={contextUsage.buildBreakdownInputs}
+          />
+        ) : (
+          <ContextUsageRing
+            promptTokens={contextUsage.promptTokens}
+            maxContextTokens={contextUsage.maxContextTokens}
+            label={contextUsage.label}
+          />
+        )
+      ) : null
+
+    const renderSubmitControl = () => (
+      <SubmitButton
+        onClick={() => handleSubmit()}
+        isGenerating={isGenerating}
+        canQueue={canQueueWhileGenerating}
+        onAbort={onAbort}
+        disabled={submitDisabled}
+      />
+    )
+
     return (
       <div
         className={`yolo-chat-user-input-wrapper${compact ? ' yolo-chat-user-input-wrapper--compact' : ''}`}
-        onBlur={handleBlur}
         role="presentation"
       >
         {enableResize && !compact && (
@@ -1293,9 +1668,9 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
             <div className="yolo-chat-user-input-files">
               {effectiveSelectedSkills.map((skill) => (
                 <ChatSkillBadge
-                  key={skill.id}
+                  key={skill.name}
                   skill={skill}
-                  onDelete={() => handleDeleteSelectedSkill(skill.id)}
+                  onDelete={() => handleDeleteSelectedSkill(skill.name)}
                 />
               ))}
             </div>
@@ -1325,6 +1700,7 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
           className="yolo-chat-user-input-container"
           ref={containerRef}
           data-resizable={enableResize && !compact ? 'true' : 'false'}
+          data-file-drag-active={isFileDragActive ? 'true' : 'false'}
           onClick={compact ? onToggleCompact : undefined}
           onKeyDown={
             compact
@@ -1337,10 +1713,20 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
               : undefined
           }
           onMouseDown={handleContainerMouseDown}
+          onDragEnter={handleContainerDragEnter}
+          onDragOver={handleContainerDragOver}
+          onDragLeave={handleContainerDragLeave}
+          onDropCapture={handleContainerDropCapture}
           role={compact ? 'button' : 'presentation'}
           tabIndex={compact ? 0 : undefined}
           style={containerStyle}
         >
+          {isFileDragActive && (
+            <div className="yolo-chat-user-input-drop-hint" aria-hidden="true">
+              <FilePlus2 size={24} />
+              <span>{t('chat.dropFilesHint', '松开以添加文件')}</span>
+            </div>
+          )}
           <div
             className="yolo-chat-user-input-editor"
             onMouseDown={handleEditorBackgroundMouseDown}
@@ -1394,34 +1780,17 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
               // violates Lexical's "root must never be empty" invariant and
               // produces a flood of `setEditorState` errors as soon as
               // selection / OnChangePlugin / mutations touch the editor.
-              initialEditorState={
-                initialSerializedEditorState
-                  ? (editor) => {
-                      try {
-                        editor.setEditorState(
-                          editor.parseEditorState(initialSerializedEditorState),
-                        )
-                      } catch (error) {
-                        // Defensive: a malformed serialized state shouldn't
-                        // break the input box. Fall back to Lexical's default
-                        // empty paragraph by leaving the editor untouched.
-                        console.warn(
-                          '[YOLO] Failed to restore chat input editor state',
-                          error,
-                        )
-                      }
-                    }
-                  : undefined
-              }
+              initialEditorState={initialEditorState}
               editorRef={editorRef}
               contentEditableRef={contentEditableRef}
               onChange={onChange}
               onTextContentChange={setInputText}
-              onEnter={() => handleSubmit()}
+              onEnter={handleSubmit}
               onFocus={onFocus}
               onMentionNodeMutation={handleMentionNodeMutation}
               onSkillNodeMutation={handleSkillNodeMutation}
               onCreateImageMentionables={handleCreateImageMentionables}
+              onPasteFiles={handleUploadFiles}
               mentionDisplayMode={mentionDisplayMode}
               onSelectMentionable={handleSelectMentionableForBadge}
               mentionMenuMode={
@@ -1430,7 +1799,7 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
                   ? 'entry'
                   : 'direct-search'
               }
-              assistants={settings.assistants || []}
+              assistants={availableAssistants}
               currentAssistantId={currentAssistantId}
               onSelectAssistant={onSelectAssistantForConversation}
               currentChatMode={currentChatMode}
@@ -1439,77 +1808,51 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
               models={enabledChatModels}
               selectedModelIds={selectedModelIds}
               skills={availableSkills}
-              selectedSkillIds={effectiveSelectedSkills.map(
-                (skill) => skill.id,
-              )}
+              selectedSkillNames={selectedSkillNames}
               onSelectSkill={handleSelectSkill}
               onRunSlashCommand={onRunSlashCommand}
               snippets={availableSnippets}
               onCreateSnippetsFile={handleCreateSnippetsFile}
               autoFocus={autoFocus}
-              plugins={{
-                onEnter: {
-                  onVaultChat: () => {
-                    handleSubmit()
-                  },
-                },
-              }}
+              plugins={lexicalPlugins}
             />
           </div>
 
-          {!compact && (
+          {!compact && controlLayout === 'inline' && (
             <div className="yolo-chat-user-input-controls">
               <div className="yolo-chat-user-input-controls__left">
                 <FileUploadButton onUpload={handleUploadFiles} />
-                <ModelSelect
-                  modelId={modelId}
-                  onChange={onModelChange}
-                  align="center"
-                  sideOffset={8}
-                  popover={{
-                    variant: 'default',
-                    minWidth: 240,
-                    maxWidth: 320,
-                    maxHeight: 560,
-                  }}
-                />
-                {showReasoningSelect && supportsReasoning(currentModel) && (
-                  <ReasoningSelect
-                    model={currentModel}
-                    value={resolvedReasoningLevel}
-                    onChange={(level) => onReasoningChange?.(level)}
-                    side="top"
-                    sideOffset={8}
-                  />
-                )}
+                {renderModelControl()}
+                {renderReasoningControl()}
               </div>
               <div className="yolo-chat-user-input-controls__right">
-                {contextUsage &&
-                  (contextUsage.buildBreakdownInputs ? (
-                    <ContextUsagePopover
-                      promptTokens={contextUsage.promptTokens}
-                      maxContextTokens={contextUsage.maxContextTokens}
-                      label={contextUsage.label}
-                      anchorRef={containerRef}
-                      buildInputs={contextUsage.buildBreakdownInputs}
-                    />
-                  ) : (
-                    <ContextUsageRing
-                      promptTokens={contextUsage.promptTokens}
-                      maxContextTokens={contextUsage.maxContextTokens}
-                      label={contextUsage.label}
-                    />
-                  ))}
-                <SubmitButton
-                  onClick={() => handleSubmit()}
-                  isGenerating={isGenerating}
-                  onAbort={onAbort}
-                  disabled={submitDisabled}
-                />
+                {renderContextUsageControl()}
+                {renderSubmitControl()}
+              </div>
+            </div>
+          )}
+
+          {!compact && controlLayout === 'composer-toolbar' && (
+            <div className="yolo-chat-user-input-send-row">
+              <FileUploadButton onUpload={handleUploadFiles} />
+              <div className="yolo-chat-user-input-send-row__right">
+                {renderContextUsageControl()}
+                {renderSubmitControl()}
               </div>
             </div>
           )}
         </div>
+        {!compact && controlLayout === 'composer-toolbar' && (
+          <div className="yolo-chat-user-input-toolbar">
+            <div className="yolo-chat-user-input-toolbar__left">
+              {renderChatModeControl()}
+            </div>
+            <div className="yolo-chat-user-input-toolbar__right">
+              {renderModelControl()}
+              {renderReasoningControl()}
+            </div>
+          </div>
+        )}
       </div>
     )
   },
@@ -1517,4 +1860,4 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
 
 ChatUserInput.displayName = 'ChatUserInput'
 
-export default ChatUserInput
+export default memo(ChatUserInput)

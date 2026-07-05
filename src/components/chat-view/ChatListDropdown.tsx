@@ -71,6 +71,7 @@ function ChatListItem({
   title,
   displayTitle,
   runSummary,
+  isCurrent,
   isFocused,
   shouldScrollIntoView,
   isEditing,
@@ -93,6 +94,7 @@ function ChatListItem({
   title: string
   displayTitle?: string
   runSummary?: AgentConversationRunSummary
+  isCurrent: boolean
   isFocused: boolean
   shouldScrollIntoView: boolean
   isEditing: boolean
@@ -170,24 +172,25 @@ function ChatListItem({
             isRetrying ? ' is-retrying' : ''
           }`}
         >
-          <span className="yolo-chat-list-dropdown-item-title-text">
-            {displayTitle ?? title}
-          </span>
-          {runSummary &&
-          (runSummary.isRunning || runSummary.isWaitingApproval) ? (
+          <div className="yolo-chat-list-dropdown-item-title-group">
+            <span className="yolo-chat-list-dropdown-item-title-text">
+              {displayTitle ?? title}
+            </span>
+            {isCurrent ? (
+              <span className="yolo-chat-list-dropdown-item-current-badge">
+                {t('sidebar.chatList.current', 'Current')}
+              </span>
+            ) : null}
+          </div>
+          {runSummary?.isActive ? (
             <span
               className={`yolo-chat-list-dropdown-item-status${
-                runSummary.isRunning ? ' is-running' : ' is-waiting'
+                runSummary.isWaitingApproval ? ' is-waiting' : ' is-running'
               }`}
               aria-label={
-                runSummary.isRunning
-                  ? 'Conversation running'
-                  : 'Waiting approval'
-              }
-              title={
-                runSummary.isRunning
-                  ? 'Conversation running'
-                  : 'Waiting approval'
+                runSummary.isWaitingApproval
+                  ? 'Waiting approval'
+                  : 'Conversation running'
               }
             />
           ) : null}
@@ -217,7 +220,6 @@ function ChatListItem({
             className="clickable-icon yolo-chat-list-dropdown-item-icon"
             disabled={isUpdatingTitle}
             aria-label={t('common.save', 'Save')}
-            title={t('common.save', 'Save')}
           >
             <Check />
           </button>
@@ -263,7 +265,6 @@ function ChatListItem({
                 }}
                 className="clickable-icon yolo-chat-list-dropdown-item-icon"
                 aria-label={t('common.edit', 'Edit')}
-                title={t('common.edit', 'Edit')}
                 tabIndex={isMoreMenuOpen ? undefined : -1}
               >
                 <Pencil size={16} />
@@ -280,7 +281,6 @@ function ChatListItem({
                   isRetrying ? ' is-pending' : ''
                 }`}
                 aria-label={t('sidebar.chatList.retryTitle', 'Retry title')}
-                title={t('sidebar.chatList.retryTitle', 'Retry title')}
                 aria-busy={isRetrying ? 'true' : undefined}
                 tabIndex={isMoreMenuOpen ? undefined : -1}
               >
@@ -297,10 +297,6 @@ function ChatListItem({
                 }}
                 className="clickable-icon yolo-chat-list-dropdown-item-icon"
                 aria-label={t(
-                  'sidebar.chatList.exportConversation',
-                  'Export conversation to vault',
-                )}
-                title={t(
                   'sidebar.chatList.exportConversation',
                   'Export conversation to vault',
                 )}
@@ -797,6 +793,7 @@ export function ChatListDropdown({
                   title={chat.title}
                   displayTitle={getDisplayTitle(chat)}
                   runSummary={runSummariesByConversationId.get(chat.id)}
+                  isCurrent={chat.id === currentConversationId}
                   isFocused={
                     focusedConversationId === chat.id && !isHoveringArchiveRow
                   }

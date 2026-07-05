@@ -18,7 +18,6 @@ import {
   FileIcon,
   FileText,
   FolderClosedIcon,
-  Infinity as InfinityIcon,
   MessageSquare,
 } from 'lucide-react'
 import {
@@ -51,6 +50,7 @@ import {
   serializeMentionable,
 } from '../../../../../utils/chat/mentionable'
 import { SearchableMentionable } from '../../../../../utils/fuzzy-search'
+import { CHAT_MODES, type ChatMode } from '../../ChatModeSelect'
 import { getMentionableIcon } from '../../utils/get-metionable-icon'
 import { MenuOption, MenuTextMatch } from '../shared/LexicalMenu'
 import {
@@ -131,7 +131,7 @@ type MentionEntryOptionType =
   | 'folder'
   | 'mode'
   | 'model'
-type MentionChatMode = 'chat' | 'agent'
+type MentionChatMode = ChatMode
 type MentionMenuTransitionDirection = 'none' | 'forward' | 'back'
 
 type MentionTypeaheadOptionPayload =
@@ -321,10 +321,7 @@ function MentionsTypeaheadMenuItem({
   } else if (option.payload.kind === 'mode') {
     iconNode =
       option.payload.mode === 'agent' ? (
-        <InfinityIcon
-          size={14}
-          className="yolo-smart-space-mention-option-icon"
-        />
+        <Bot size={14} className="yolo-smart-space-mention-option-icon" />
       ) : (
         <MessageSquare
           size={14}
@@ -611,18 +608,18 @@ export default function NewMentionsPlugin({
 
       if (entryType === 'mode') {
         const modeOptions: MentionChatMode[] = allowAgentModeOption
-          ? ['chat', 'agent']
-          : ['chat']
+          ? [...CHAT_MODES]
+          : ['ask']
         return modeOptions
           .map((mode) => {
             const label =
               mode === 'agent'
                 ? t('chatMode.agent', 'Agent')
-                : t('chatMode.chat', 'Chat')
+                : t('chatMode.ask', 'Ask')
             const subtitle =
               mode === 'agent'
                 ? t('chatMode.agentDesc', 'Enable tool calling capabilities')
-                : t('chatMode.chatDesc', 'Normal conversation mode')
+                : t('chatMode.askDesc', 'Ask, refine, create')
             return { mode, label, subtitle }
           })
           .filter((option) => {
@@ -639,7 +636,7 @@ export default function NewMentionsPlugin({
                 mode: option.mode,
                 label: option.label,
                 subtitle: option.subtitle,
-                isCurrent: option.mode === (currentChatMode ?? 'chat'),
+                isCurrent: option.mode === (currentChatMode ?? 'ask'),
               }),
           )
       }

@@ -47,6 +47,16 @@ export const JS_SANDBOX_FETCH_MIN_CONCURRENT = 1
 export const JS_SANDBOX_VAULT_READ_DEFAULT_MAX_KB = 10 * 1024
 export const JS_SANDBOX_VAULT_READ_HARD_MAX_KB = 1024 * 1024
 export const JS_SANDBOX_VAULT_READ_MIN_KB = 1
+export const JS_SANDBOX_VAULT_LIST_MAX_ENTRIES = 100_000
+// Full rendered page HTML can be as large as fetched response bodies. Keep the
+// same default and hard cap family so one browser page cannot dominate memory
+// or the model context by accident.
+export const JS_SANDBOX_BROWSER_READ_DEFAULT_MAX_KB = 10 * 1024
+export const JS_SANDBOX_BROWSER_READ_HARD_MAX_KB = 1024 * 1024
+export const JS_SANDBOX_BROWSER_READ_MIN_KB = 1
+export const JS_SANDBOX_DB_QUERY_DEFAULT_MAX_LIMIT = 20
+export const JS_SANDBOX_DB_QUERY_HARD_MAX_LIMIT = 100
+export const JS_SANDBOX_DB_QUERY_DEFAULT_REQUEST_LIMIT = 10
 
 type JsonRecord = Record<string, unknown>
 
@@ -55,6 +65,20 @@ export type JsSandboxBinaryReadResult = {
   mimeType: string
   byteLength: number
 }
+
+export type JsSandboxVaultListEntry =
+  | {
+      kind: 'dir'
+      path: string
+      name: string
+    }
+  | {
+      kind: 'file'
+      path: string
+      name: string
+      size: number
+      mtime: number
+    }
 
 export type JsSandboxFetchResponse = {
   ok: boolean
@@ -65,10 +89,20 @@ export type JsSandboxFetchResponse = {
   byteLength: number
 }
 
+export type JsSandboxBrowserReadHtmlResult = {
+  url: string
+  title: string
+  html: string
+  byteLength: number
+}
+
 export type JsSandboxProxyHandlers = {
+  vaultList?: (
+    path?: string,
+    options?: Record<string, unknown>,
+  ) => Promise<JsSandboxVaultListEntry[]>
   vaultReadText?: (path: string) => Promise<string | null>
   vaultReadBinary?: (path: string) => Promise<JsSandboxBinaryReadResult | null>
-  vaultReadConfig?: { maxKb: number }
   hostFetch?: (
     url: string,
     init?: Record<string, unknown>,
@@ -80,9 +114,12 @@ export type JsSandboxProxyHandlers = {
     maxResponseKb: number
   }
   dbQuery?: (
-    method: 'search' | 'find' | 'get',
+    method: 'search',
     params: Record<string, unknown>,
   ) => Promise<unknown>
+  browserReadHtml?: (
+    pageId: string,
+  ) => Promise<JsSandboxBrowserReadHtmlResult | null>
 }
 
 type JsSandboxCaps = {
@@ -90,6 +127,7 @@ type JsSandboxCaps = {
   allowVaultRead: boolean
   allowDbQuery: boolean
   allowExternalScripts: boolean
+  allowBrowserRead: boolean
 }
 
 type JsSandboxVariables = {
@@ -159,6 +197,7 @@ type JsSandboxToolCallResult =
 
 const JS_SANDBOX_WORKER_SCRIPT = String.raw`
 const CHANNEL = 'yolo-js-sandbox-v1'
+const HTML_PARSE_MAX_INPUT_BYTES = 2 * 1024 * 1024
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 
 function deepFreeze(value) {
@@ -314,7 +353,41 @@ function matrixMultiply(a, b, options) {
   )
 }
 
-function createSandboxUtils() {
+function getStringByteLength(value) {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(value).length
+  }
+  return value.length
+}
+
+function normalizeHtmlInput(markup) {
+  const html = String(markup ?? '')
+  const byteLength = getStringByteLength(html)
+  if (byteLength > HTML_PARSE_MAX_INPUT_BYTES) {
+    throw new Error(
+      '$utils.html input exceeds ' + HTML_PARSE_MAX_INPUT_BYTES +
+      ' bytes. Pass a smaller HTML fragment or narrow the fetched response first.'
+    )
+  }
+  return html
+}
+
+function createSandboxHtmlUtils() {
+  return {
+    extract(markup, options) {
+      return proxyCall('html_extract', { html: normalizeHtmlInput(markup), options })
+    },
+    select(markup, selector, options) {
+      return proxyCall('html_select', {
+        html: normalizeHtmlInput(markup),
+        selector,
+        options
+      })
+    }
+  }
+}
+
+function createSandboxUtils(options) {
   const json = {
     flatten(value) {
       return flattenJson(value, '', [])
@@ -458,10 +531,19 @@ function createSandboxUtils() {
     }
   }
 
-  return deepFreeze({ json, text, stats, matrix, date })
+  const utils = { json, text, stats, matrix, date }
+  if (options && options.includeHtml) {
+    // HTML parsing is exposed only when another capability can provide HTML
+    // (network fetch or open-browser-page reads). Keeping it conditional avoids
+    // advertising parser surface to agents that only have note snapshots.
+    utils.html = createSandboxHtmlUtils()
+  }
+
+  return deepFreeze(utils)
 }
 
-const SANDBOX_UTILS = createSandboxUtils()
+const SANDBOX_UTILS = createSandboxUtils({ includeHtml: false })
+const SANDBOX_UTILS_WITH_HTML = createSandboxUtils({ includeHtml: true })
 
 function disableAmbientCapabilities(allowScripts, allowFetch) {
   // allowScripts is the "full power" switch: once the model can pull in and
@@ -472,7 +554,7 @@ function disableAmbientCapabilities(allowScripts, allowFetch) {
   // libraries depend on them. This pairs with skipping
   // freezeBuiltinPrototypes() below: external-script mode is the explicit
   // high-risk compatibility tradeoff, not partial isolation. The host
-  // already forces approval for any agent that enables this flag.
+  // surfaces this risk explicitly when the capability is enabled.
   if (allowScripts) {
     return
   }
@@ -574,6 +656,8 @@ function buildScope(rawVars) {
   const caps = rawVars && rawVars._caps ? rawVars._caps : {}
   const vaultBase = rawVars ? rawVars.$vault ?? null : null
   const hostFetchAllowed = Boolean(caps.allowFetch || caps.allowExternalScripts)
+  const browserReadAllowed = Boolean(caps.allowBrowserRead)
+  const htmlUtilsAllowed = hostFetchAllowed || browserReadAllowed
 
   const scope = {
     $now: rawVars && typeof rawVars.$now === 'string'
@@ -587,7 +671,10 @@ function buildScope(rawVars) {
     $selection: rawVars ? rawVars.$selection ?? null : null,
     $vault: vaultBase ? {
       ...vaultBase,
-      readText: caps.allowVaultRead
+      list: caps.allowVaultRead
+        ? (path, options) => proxyCall('vault_list', { path, options })
+        : undefined,
+      readText: (caps.allowVaultRead || caps.allowDbQuery)
         ? (path) => proxyCall('vault_read_text', { path })
         : undefined,
       readBinary: caps.allowVaultRead
@@ -596,11 +683,12 @@ function buildScope(rawVars) {
     } : null,
     $links: Array.isArray(rawVars && rawVars.$links) ? rawVars.$links : [],
     $tags: Array.isArray(rawVars && rawVars.$tags) ? rawVars.$tags : [],
-    $utils: SANDBOX_UTILS,
+    $utils: htmlUtilsAllowed ? SANDBOX_UTILS_WITH_HTML : SANDBOX_UTILS,
     $db: caps.allowDbQuery ? {
-      search: (query, limit) => proxyCall('db_query', { method: 'search', query, limit }),
-      find: (keyword, limit) => proxyCall('db_query', { method: 'find', keyword, limit }),
-      get: (path) => proxyCall('db_query', { method: 'get', path })
+      search: (query, limit) => proxyCall('db_query', { method: 'search', query, limit })
+    } : undefined,
+    $browser: browserReadAllowed ? {
+      readHtml: (pageId) => proxyCall('browser_read_html', { pageId })
     } : undefined,
     $fetch: hostFetchAllowed ? hostFetch : undefined
   }
@@ -920,6 +1008,7 @@ self.addEventListener('message', async (event) => {
 const JS_SANDBOX_IFRAME_SCRIPT = String.raw`
 const CHANNEL = 'yolo-js-sandbox-v1'
 const WORKER_SCRIPT = ${JSON.stringify(JS_SANDBOX_WORKER_SCRIPT)}
+const HTML_PARSE_MAX_INPUT_BYTES = 2 * 1024 * 1024
 const workers = new Map()
 
 function postToParent(payload) {
@@ -935,6 +1024,255 @@ function cleanupWorker(reqId) {
   } catch {
     // ignore
   }
+}
+
+function clampInteger(value, fallback, min, max) {
+  const number = typeof value === 'number' && Number.isFinite(value)
+    ? Math.floor(value)
+    : fallback
+  return Math.min(max, Math.max(min, number))
+}
+
+function normalizeWhitespace(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim()
+}
+
+function truncateString(value, maxChars) {
+  const text = String(value || '')
+  const limit = Math.max(0, Math.floor(Number(maxChars) || 0))
+  if (text.length <= limit) return text
+  if (limit === 0) return ''
+  if (limit <= 3) return '.'.repeat(limit)
+  return Array.from(text).slice(0, limit - 3).join('') + '...'
+}
+
+function resolveHtmlUrl(value, baseUrl) {
+  const raw = String(value || '').trim()
+  if (!raw) return raw
+  if (typeof baseUrl !== 'string' || baseUrl.trim() === '') return raw
+  try {
+    return new URL(raw, baseUrl).href
+  } catch {
+    return raw
+  }
+}
+
+function getStringByteLength(value) {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(value).length
+  }
+  return value.length
+}
+
+function getPayloadOptions(payload) {
+  return payload && payload.options && typeof payload.options === 'object'
+    ? payload.options
+    : {}
+}
+
+function parseHtmlDocument(payload) {
+  if (typeof DOMParser !== 'function') {
+    throw new Error('DOMParser is not available in this JavaScript sandbox.')
+  }
+  const html = String(payload.html || '')
+  if (getStringByteLength(html) > HTML_PARSE_MAX_INPUT_BYTES) {
+    throw new Error(
+      '$utils.html input exceeds ' + HTML_PARSE_MAX_INPUT_BYTES +
+      ' bytes. Pass a smaller HTML fragment or narrow the fetched response first.'
+    )
+  }
+  return new DOMParser().parseFromString(html, 'text/html')
+}
+
+function collectElementAttrs(element, baseUrl) {
+  const attrs = Object.create(null)
+  for (const attr of Array.from(element.attributes || [])) {
+    attrs[attr.name] = truncateString(attr.value, 1000)
+  }
+  if (attrs.href) attrs.href = resolveHtmlUrl(attrs.href, baseUrl)
+  if (attrs.src) attrs.src = resolveHtmlUrl(attrs.src, baseUrl)
+  return attrs
+}
+
+function elementToSummary(element, options) {
+  const baseUrl = typeof options.baseUrl === 'string' ? options.baseUrl : ''
+  const textMaxChars = clampInteger(options.textMaxChars, 4000, 200, 20000)
+  const result = {
+    tag: element.tagName.toLowerCase(),
+    text: truncateString(normalizeWhitespace(element.textContent), textMaxChars),
+    attrs: collectElementAttrs(element, baseUrl)
+  }
+  if (options.includeHtml === true) {
+    result.html = truncateString(
+      element.outerHTML || '',
+      clampInteger(options.htmlMaxChars, 8000, 500, 50000)
+    )
+  }
+  return result
+}
+
+function getDocumentBaseUrl(document, options) {
+  const fallback = typeof options.baseUrl === 'string' ? options.baseUrl.trim() : ''
+  const base = document.querySelector('base[href]')
+  const baseHref = base ? String(base.getAttribute('href') || '').trim() : ''
+  if (!baseHref) return fallback
+  if (fallback) {
+    try {
+      return new URL(baseHref, fallback).href
+    } catch {
+      return fallback
+    }
+  }
+  try {
+    return new URL(baseHref).href
+  } catch {
+    return ''
+  }
+}
+
+function extractPageText(document, maxChars) {
+  const source = document.body || document.documentElement
+  if (!source) return ''
+  // Scripts/styles never execute through DOMParser, but removing noisy nodes
+  // gives models the page text they usually wanted from an HTML scrape. The
+  // parsed document is single-use, so mutate it instead of cloning the body.
+  source
+    .querySelectorAll('script,style,noscript,svg,canvas,template')
+    .forEach((node) => node.remove())
+  return truncateString(normalizeWhitespace(source.textContent), maxChars)
+}
+
+function collectItems(document, selector, limit, mapElement) {
+  const results = []
+  for (const element of document.querySelectorAll(selector)) {
+    const item = mapElement(element)
+    if (item) {
+      results.push(item)
+      if (results.length >= limit) break
+    }
+  }
+  return results
+}
+
+function extractHtmlPage(payload) {
+  const options = getPayloadOptions(payload)
+  const document = parseHtmlDocument(payload)
+  const baseUrl = getDocumentBaseUrl(document, options)
+  const maxItems = clampInteger(options.maxItems, 100, 1, 500)
+  const maxTextChars = clampInteger(options.maxTextChars, 20000, 1000, 100000)
+  const meta = Object.create(null)
+
+  for (const node of Array.from(
+    document.querySelectorAll('meta[name],meta[property]')
+  )) {
+    const key = node.getAttribute('name') || node.getAttribute('property')
+    const content = node.getAttribute('content')
+    if (key && content && meta[key] === undefined) {
+      meta[key] = truncateString(content, 2000)
+    }
+  }
+
+  const headings = collectItems(
+    document,
+    'h1,h2,h3,h4,h5,h6',
+    maxItems,
+    (node) => {
+      const text = truncateString(normalizeWhitespace(node.textContent), 1000)
+      return text
+        ? {
+            level: Number(node.tagName.slice(1)),
+            text
+          }
+        : null
+    }
+  )
+
+  const links = collectItems(document, 'a[href]', maxItems, (node) => {
+    const href = resolveHtmlUrl(node.getAttribute('href') || '', baseUrl)
+    return href
+      ? {
+          text: truncateString(normalizeWhitespace(node.textContent), 1000),
+          href
+        }
+      : null
+  })
+
+  const images = collectItems(document, 'img[src]', maxItems, (node) => {
+    const src = resolveHtmlUrl(node.getAttribute('src') || '', baseUrl)
+    return src
+      ? {
+          alt: truncateString(node.getAttribute('alt') || '', 1000),
+          src
+        }
+      : null
+  })
+
+  return {
+    title: normalizeWhitespace(document.querySelector('title')?.textContent),
+    lang: document.documentElement?.getAttribute('lang') || null,
+    text: extractPageText(document, maxTextChars),
+    meta,
+    headings,
+    links,
+    images
+  }
+}
+
+function selectHtmlElements(payload) {
+  const options = getPayloadOptions(payload)
+  const selector = typeof payload.selector === 'string' ? payload.selector : ''
+  if (!selector.trim()) {
+    throw new Error('selector must be a non-empty CSS selector.')
+  }
+  const document = parseHtmlDocument(payload)
+  const baseUrl = getDocumentBaseUrl(document, options)
+  const limit = clampInteger(options.limit, 50, 1, 200)
+  const results = []
+  for (const element of document.querySelectorAll(selector)) {
+    results.push(elementToSummary(element, { ...options, baseUrl }))
+    if (results.length >= limit) break
+  }
+  return results
+}
+
+function sendWorkerProxyResponse(entry, proxyId, value, error) {
+  entry.worker.postMessage({
+    channel: CHANNEL,
+    type: 'proxy_res',
+    proxyId,
+    value,
+    error
+  })
+}
+
+function handleLocalProxyRequest(entry, payload) {
+  if (payload.cap !== 'html_extract' && payload.cap !== 'html_select') {
+    return false
+  }
+  if (!entry.allowHtml) {
+    sendWorkerProxyResponse(
+      entry,
+      payload.proxyId,
+      undefined,
+      '$utils.html is not enabled'
+    )
+    return true
+  }
+  try {
+    const value =
+      payload.cap === 'html_extract'
+        ? extractHtmlPage(payload.payload || {})
+        : selectHtmlElements(payload.payload || {})
+    sendWorkerProxyResponse(entry, payload.proxyId, value)
+  } catch (error) {
+    sendWorkerProxyResponse(
+      entry,
+      payload.proxyId,
+      undefined,
+      error && error.message ? String(error.message) : String(error)
+    )
+  }
+  return true
 }
 
 function startRun(data) {
@@ -964,7 +1302,14 @@ function startRun(data) {
     return
   }
 
-  workers.set(data.reqId, { worker, token })
+  const caps = (data.vars && data.vars._caps) || {}
+  workers.set(data.reqId, {
+    worker,
+    token,
+    allowHtml: Boolean(
+      caps.allowFetch || caps.allowExternalScripts || caps.allowBrowserRead
+    )
+  })
 
   worker.onmessage = (event) => {
     const payload = event.data
@@ -979,6 +1324,9 @@ function startRun(data) {
     }
     // Proxy request from Worker → forward to parent host, keep worker alive.
     if (payload.type === 'proxy_req') {
+      if (handleLocalProxyRequest(entry, payload)) {
+        return
+      }
       postToParent({
         type: 'proxy_req',
         reqId: data.reqId,
@@ -1094,7 +1442,9 @@ export function formatJsSandboxToolText(
 ): string {
   let formatted = json
   try {
-    formatted = JSON.stringify(JSON.parse(json), null, 2)
+    // Keep tool results compact for the LLM context. The worker already
+    // returns JSON; re-stringify only to normalize valid JSON defensively.
+    formatted = JSON.stringify(JSON.parse(json))
   } catch {
     // The worker should only return JSON, but keep the formatter defensive.
   }
@@ -1110,16 +1460,12 @@ export function formatJsSandboxToolText(
   // Reserve a small slice for the truncation envelope so the JSON wrapper
   // itself stays within budget.
   const prefixBytes = Math.max(1024, Math.floor(maxBytes * 0.95))
-  return JSON.stringify(
-    {
-      warning: `Output exceeded ${maxBytes} bytes and was truncated.`,
-      truncated: true,
-      originalBytes: getByteLength(formatted),
-      jsonPrefix: formatted.slice(0, prefixBytes),
-    },
-    null,
-    2,
-  )
+  return JSON.stringify({
+    warning: `Output exceeded ${maxBytes} bytes and was truncated.`,
+    truncated: true,
+    originalBytes: getByteLength(formatted),
+    jsonPrefix: formatted.slice(0, prefixBytes),
+  })
 }
 
 export async function callJsSandboxTool({
@@ -1250,6 +1596,7 @@ async function buildJsSandboxVariables(
     allowVaultRead: config?.allowVaultRead ?? false,
     allowDbQuery: config?.allowDbQuery ?? false,
     allowExternalScripts: config?.allowExternalScripts ?? false,
+    allowBrowserRead: config?.allowBrowserRead ?? false,
   }
 
   return deepCloneJson({
@@ -1594,6 +1941,38 @@ class JsSandboxRunner {
   ): Promise<void> {
     const handlers = pending.proxyHandlers
     try {
+      if (cap === 'vault_list') {
+        if (!handlers?.vaultList) {
+          this.sendProxyResponse(
+            reqId,
+            proxyId,
+            undefined,
+            'vault read is not enabled',
+          )
+          return
+        }
+        const rawPath = payload.path
+        // Omitted path intentionally lists root; mistyped path values should
+        // fail closed instead of silently broadening the call to root.
+        if (rawPath !== undefined && typeof rawPath !== 'string') {
+          this.sendProxyResponse(
+            reqId,
+            proxyId,
+            undefined,
+            '$vault.list path must be a string.',
+          )
+          return
+        }
+        const path = rawPath
+        const options =
+          payload.options && typeof payload.options === 'object'
+            ? (payload.options as Record<string, unknown>)
+            : undefined
+        const result = await handlers.vaultList(path, options)
+        this.sendProxyResponse(reqId, proxyId, result)
+        return
+      }
+
       if (cap === 'vault_read_text') {
         if (!handlers?.vaultReadText) {
           this.sendProxyResponse(
@@ -1687,8 +2066,24 @@ class JsSandboxRunner {
           )
           return
         }
-        const method = payload.method as 'search' | 'find' | 'get'
+        const method = payload.method as 'search'
         const result = await handlers.dbQuery(method, payload)
+        this.sendProxyResponse(reqId, proxyId, result)
+        return
+      }
+
+      if (cap === 'browser_read_html') {
+        if (!handlers?.browserReadHtml) {
+          this.sendProxyResponse(
+            reqId,
+            proxyId,
+            undefined,
+            '$browser.readHtml is not enabled',
+          )
+          return
+        }
+        const pageId = typeof payload.pageId === 'string' ? payload.pageId : ''
+        const result = await handlers.browserReadHtml(pageId)
         this.sendProxyResponse(reqId, proxyId, result)
         return
       }

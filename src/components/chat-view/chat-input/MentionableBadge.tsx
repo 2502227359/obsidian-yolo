@@ -10,8 +10,11 @@ import {
   MentionableFolder,
   MentionableImage,
   MentionableModel,
+  MentionableOffice,
   MentionablePDF,
+  MentionableTextAttachment,
   MentionableUrl,
+  MentionableWebSelection,
 } from '../../../types/mentionable'
 import { getBlockMentionableCountInfo } from '../../../utils/chat/mentionable'
 
@@ -235,6 +238,52 @@ function UrlBadge({
   )
 }
 
+function WebSelectionBadge({
+  mentionable,
+  onDelete,
+  onClick,
+  isFocused,
+  showDeleteButton,
+}: {
+  mentionable: MentionableWebSelection
+  onDelete: () => void
+  onClick: () => void
+  isFocused: boolean
+  showDeleteButton?: boolean
+}) {
+  const Icon = getMentionableIcon(mentionable)
+  const { t } = useLanguage()
+  const info = getBlockMentionableCountInfo(mentionable.content)
+  const count = mentionable.contentCount ?? info.count
+  const unit = mentionable.contentUnit ?? info.unit
+  const unitLabel = t(`common.${unit}`, unit)
+  const title = mentionable.title.trim() || mentionable.url
+
+  return (
+    <BadgeBase
+      onDelete={onDelete}
+      onClick={onClick}
+      isFocused={isFocused}
+      showExpandButton={false}
+      showDeleteButton={showDeleteButton}
+      title={`${title}\n${mentionable.url}\n\n${mentionable.content}`}
+    >
+      <div className="yolo-chat-user-input-file-badge-name">
+        {Icon && (
+          <Icon
+            size={12}
+            className="yolo-chat-user-input-file-badge-name-icon"
+          />
+        )}
+        <span>{title}</span>
+      </div>
+      <div className="yolo-chat-user-input-file-badge-name-suffix">
+        {` (${count} ${unitLabel})`}
+      </div>
+    </BadgeBase>
+  )
+}
+
 function AssistantQuoteBadge({
   mentionable,
   onDelete,
@@ -330,6 +379,78 @@ function PdfBadge({
   showDeleteButton,
 }: {
   mentionable: MentionablePDF
+  onDelete: () => void
+  onClick: () => void
+  isFocused: boolean
+  showDeleteButton?: boolean
+}) {
+  const Icon = getMentionableIcon(mentionable)
+  return (
+    <BadgeBase
+      onDelete={onDelete}
+      onClick={onClick}
+      isFocused={isFocused}
+      showExpandButton={false}
+      showDeleteButton={showDeleteButton}
+      title={mentionable.name}
+    >
+      <div className="yolo-chat-user-input-file-badge-name">
+        {Icon && (
+          <Icon
+            size={12}
+            className="yolo-chat-user-input-file-badge-name-icon"
+          />
+        )}
+        <span>{mentionable.name}</span>
+      </div>
+    </BadgeBase>
+  )
+}
+
+function OfficeBadge({
+  mentionable,
+  onDelete,
+  onClick,
+  isFocused,
+  showDeleteButton,
+}: {
+  mentionable: MentionableOffice
+  onDelete: () => void
+  onClick: () => void
+  isFocused: boolean
+  showDeleteButton?: boolean
+}) {
+  const Icon = getMentionableIcon(mentionable)
+  return (
+    <BadgeBase
+      onDelete={onDelete}
+      onClick={onClick}
+      isFocused={isFocused}
+      showExpandButton={false}
+      showDeleteButton={showDeleteButton}
+      title={mentionable.name}
+    >
+      <div className="yolo-chat-user-input-file-badge-name">
+        {Icon && (
+          <Icon
+            size={12}
+            className="yolo-chat-user-input-file-badge-name-icon"
+          />
+        )}
+        <span>{mentionable.name}</span>
+      </div>
+    </BadgeBase>
+  )
+}
+
+function TextAttachmentBadge({
+  mentionable,
+  onDelete,
+  onClick,
+  isFocused,
+  showDeleteButton,
+}: {
+  mentionable: MentionableTextAttachment
   onDelete: () => void
   onClick: () => void
   isFocused: boolean
@@ -465,6 +586,16 @@ export default function MentionableBadge({
           showDeleteButton={showDeleteButton}
         />
       )
+    case 'web-selection':
+      return (
+        <WebSelectionBadge
+          mentionable={mentionable}
+          onDelete={onDelete}
+          onClick={onClick}
+          isFocused={isFocused}
+          showDeleteButton={showDeleteButton}
+        />
+      )
     case 'image':
       return (
         <ImageBadge
@@ -480,6 +611,26 @@ export default function MentionableBadge({
     case 'pdf':
       return (
         <PdfBadge
+          mentionable={mentionable}
+          onDelete={onDelete}
+          onClick={onClick}
+          isFocused={isFocused}
+          showDeleteButton={showDeleteButton}
+        />
+      )
+    case 'office':
+      return (
+        <OfficeBadge
+          mentionable={mentionable}
+          onDelete={onDelete}
+          onClick={onClick}
+          isFocused={isFocused}
+          showDeleteButton={showDeleteButton}
+        />
+      )
+    case 'text-attachment':
+      return (
+        <TextAttachmentBadge
           mentionable={mentionable}
           onDelete={onDelete}
           onClick={onClick}

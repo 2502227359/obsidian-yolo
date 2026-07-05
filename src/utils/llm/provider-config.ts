@@ -1,7 +1,11 @@
 import { YoloSettings } from '../../settings/schema/setting.types'
 import { ChatModel } from '../../types/chat-model.types'
 import { EmbeddingModel } from '../../types/embedding-model.types'
-import { LLMProvider, RequestTransportMode } from '../../types/provider.types'
+import {
+  LLMProvider,
+  RequestTransportMode,
+  ResponseStreamingMode,
+} from '../../types/provider.types'
 
 import { isBedrockMantleProvider, isNativeBedrockProvider } from './bedrock'
 
@@ -28,15 +32,27 @@ export function resolveEmbeddingModelProvider(
 
 export function getRequestTransportModeValue(
   additionalSettings: Record<string, unknown> | undefined,
+  isDesktop: boolean,
 ): RequestTransportMode {
   const mode = additionalSettings?.requestTransportMode
-  if (
-    mode === 'auto' ||
-    mode === 'browser' ||
-    mode === 'obsidian' ||
-    mode === 'node'
-  ) {
+  if (mode && typeof mode === 'object') {
+    const byPlatform = mode as Record<string, unknown>
+    const platformMode = isDesktop ? byPlatform.desktop : byPlatform.mobile
+    if (
+      platformMode === 'browser' ||
+      platformMode === 'obsidian' ||
+      (isDesktop && platformMode === 'node')
+    ) {
+      return platformMode
+    }
+  }
+
+  if (mode === 'browser' || mode === 'obsidian') {
     return mode
+  }
+
+  if (mode === 'node') {
+    return isDesktop ? 'node' : 'browser'
   }
 
   if (additionalSettings?.useObsidianRequestUrl === true) {
@@ -45,6 +61,17 @@ export function getRequestTransportModeValue(
 
   if (additionalSettings?.useObsidianRequestUrl === false) {
     return 'browser'
+  }
+
+  return isDesktop ? 'node' : 'browser'
+}
+
+export function getResponseStreamingMode(
+  additionalSettings: Record<string, unknown> | undefined,
+): ResponseStreamingMode {
+  const mode = additionalSettings?.responseStreamingMode
+  if (mode === 'auto' || mode === 'streaming' || mode === 'non-streaming') {
+    return mode
   }
 
   return 'auto'

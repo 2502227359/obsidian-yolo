@@ -19,6 +19,8 @@ import {
   ToolCallResponseStatus,
 } from '../../types/tool-call.types'
 import { WEB_OPS_GROUP_TOOL_NAME } from '../agent/builtinToolUiMeta'
+import type { PromptSourceWatcher } from '../agent/promptSourceWatcher'
+import type { SubagentParentContext } from '../agent/subagent/parent-context'
 import type { AgentRunContext } from '../agent/types'
 import type { RAGEngine } from '../rag/ragEngine'
 import {
@@ -49,6 +51,7 @@ const LOCAL_FS_SPLIT_TOOL_NAME_SET = new Set<string>(
 const LOCAL_MEMORY_SPLIT_TOOL_NAME_SET = new Set<string>(
   LOCAL_MEMORY_SPLIT_ACTION_TOOL_NAMES,
 )
+import type { McpRemoteTransportBackend } from './remoteTransport'
 import {
   getToolName,
   parseToolName,
@@ -79,6 +82,7 @@ export class McpManager {
   private readonly app: App
   private readonly openApplyReview: (state: ApplyViewState) => Promise<boolean>
   private readonly getRagEngine?: () => Promise<RAGEngine>
+  private readonly promptSourceWatcher?: PromptSourceWatcher
   private settings: YoloSettings
   private unsubscribeFromSettings: () => void
   private defaultEnv: Record<string, string>
@@ -127,9 +131,9 @@ export class McpManager {
   }
 
   private isLocalToolEnabled(toolName: string): boolean {
-    // Web search tools share a single `web_ops` group switch, but also need a
-    // configured provider to actually run. Keep this branch ahead of the
-    // direct-disabled early return so readiness is always evaluated.
+    // Web tools share a single `web_ops` group switch. `web_search` needs a
+    // configured provider, while `web_scrape` can fall back to the generic
+    // static-HTML scraper when no provider is configured.
     if (
       toolName === WEB_SEARCH_TOOL_NAME ||
       toolName === WEB_SCRAPE_TOOL_NAME
@@ -140,9 +144,12 @@ export class McpManager {
       const splitToolDisabled =
         this.settings.mcp.builtinToolOptions[toolName]?.disabled ?? false
       if (groupDisabled || splitToolDisabled) return false
-      // web_scrape is always available alongside web_search: providers
-      // without a specialized extract API fall back to a generic scraper.
-      if (!isWebSearchToolReady(this.settings.webSearch)) return false
+      if (
+        toolName === WEB_SEARCH_TOOL_NAME &&
+        !isWebSearchToolReady(this.settings.webSearch)
+      ) {
+        return false
+      }
       return true
     }
     const directDisabled =
@@ -173,6 +180,7 @@ export class McpManager {
     openApplyReview,
     registerSettingsListener,
     getRagEngine,
+    promptSourceWatcher,
   }: {
     app: App
     settings: YoloSettings
@@ -181,10 +189,12 @@ export class McpManager {
       listener: (settings: YoloSettings) => void,
     ) => () => void
     getRagEngine?: () => Promise<RAGEngine>
+    promptSourceWatcher?: PromptSourceWatcher
   }) {
     this.app = app
     this.openApplyReview = openApplyReview
     this.getRagEngine = getRagEngine
+    this.promptSourceWatcher = promptSourceWatcher
     this.settings = settings
     this.unsubscribeFromSettings = registerSettingsListener((newSettings) => {
       void this.handleSettingsUpdate(newSettings).catch((error) => {
@@ -262,6 +272,10 @@ export class McpManager {
    */
   public getJsSandboxSettings(): JsSandboxSettings {
     return getJsSandboxSettings(this.settings)
+  }
+
+  public getSettingsSnapshot(): YoloSettings {
+    return this.settings
   }
 
   public subscribeServersChange(callback: (servers: McpServerState[]) => void) {
@@ -441,14 +455,19 @@ export class McpManager {
     }
 
     const { Client } = await import('@modelcontextprotocol/sdk/client/index.js')
-    const client = new Client({ name, version: '1.0.0' })
+    const createClient = () => {
+      const nextClient = new Client({ name, version: '1.0.0' })
 
-    // Self-heal hook: fires when the underlying transport closes for any
-    // reason (including our own close() calls). The intentional-closes
-    // WeakSet inside the handler short-circuits planned teardowns.
-    client.onclose = () => {
-      this.handleUnexpectedServerClose(name, client)
+      // Self-heal hook: fires when the underlying transport closes for any
+      // reason (including our own close() calls). The intentional-closes
+      // WeakSet inside the handler short-circuits planned teardowns.
+      nextClient.onclose = () => {
+        this.handleUnexpectedServerClose(name, nextClient)
+      }
+
+      return nextClient
     }
+    let client = createClient()
 
     // The SDK only forwards `signal` to the initialize request, not to
     // `transport.start()`. Bind an abort listener that force-closes the client
@@ -471,43 +490,107 @@ export class McpManager {
       }
     }
 
+    let remoteTransportBackend: McpRemoteTransportBackend = 'chromium-fetch'
+
     try {
-      const transport = await this.createClientTransport(serverParams)
+      const transport = await this.createClientTransport(serverParams, {
+        httpBackend: remoteTransportBackend,
+      })
       await client.connect(transport, signal ? { signal } : undefined)
     } catch (error) {
-      signal?.removeEventListener('abort', abortListener)
       const remoteTransport = await this.loadRemoteTransportModule()
       const remoteTransportContext =
-        remoteTransport.getMcpRemoteTransportContext(serverParams)
-      console.error(
-        `[YOLO] Failed to connect to MCP server "${name}":`,
-        remoteTransportContext
-          ? remoteTransport.getMcpRemoteTransportDiagnostics(
-              remoteTransportContext,
+        remoteTransport.getMcpRemoteTransportContext(
+          serverParams,
+          remoteTransportBackend,
+        )
+
+      if (
+        !signal?.aborted &&
+        remoteTransport.shouldRetryMcpHttpWithJsonBackend({
+          params: serverParams,
+          error,
+        })
+      ) {
+        console.warn(
+          `[YOLO] MCP server "${name}" HTTP connection failed with Chromium fetch; retrying with Obsidian requestUrl JSON backend.`,
+          error,
+        )
+        await this.closeClient(client).catch(() => {
+          /* best-effort teardown */
+        })
+        client = createClient()
+        remoteTransportBackend = 'obsidian-request-url-json'
+
+        try {
+          const transport = await this.createClientTransport(serverParams, {
+            httpBackend: remoteTransportBackend,
+          })
+          await client.connect(transport, signal ? { signal } : undefined)
+        } catch (fallbackError) {
+          signal?.removeEventListener('abort', abortListener)
+          const fallbackRemoteTransportContext =
+            remoteTransport.getMcpRemoteTransportContext(
+              serverParams,
+              remoteTransportBackend,
             )
-          : { transport: serverParams.transport },
-        error,
-      )
-      return {
-        name,
-        config: serverConfig,
-        status: McpServerStatus.Error,
-        error: remoteTransportContext
-          ? remoteTransport.createMcpRemoteTransportError({
-              serverName: name,
-              action: 'connect',
-              context: remoteTransportContext,
-              error,
-            })
-          : new Error(
-              `Failed to connect to MCP server ${name}: ${error instanceof Error ? error.message : String(error)}`,
-            ),
+          console.error(
+            `[YOLO] Failed to connect to MCP server "${name}" with Obsidian requestUrl JSON backend:`,
+            fallbackRemoteTransportContext
+              ? remoteTransport.getMcpRemoteTransportDiagnostics(
+                  fallbackRemoteTransportContext,
+                )
+              : { transport: serverParams.transport },
+            fallbackError,
+          )
+          return {
+            name,
+            config: serverConfig,
+            status: McpServerStatus.Error,
+            error: fallbackRemoteTransportContext
+              ? remoteTransport.createMcpRemoteTransportError({
+                  serverName: name,
+                  action: 'connect',
+                  context: fallbackRemoteTransportContext,
+                  error: fallbackError,
+                })
+              : new Error(
+                  `Failed to connect to MCP server ${name}: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+                ),
+          }
+        }
+      } else {
+        signal?.removeEventListener('abort', abortListener)
+        console.error(
+          `[YOLO] Failed to connect to MCP server "${name}":`,
+          remoteTransportContext
+            ? remoteTransport.getMcpRemoteTransportDiagnostics(
+                remoteTransportContext,
+              )
+            : { transport: serverParams.transport },
+          error,
+        )
+        return {
+          name,
+          config: serverConfig,
+          status: McpServerStatus.Error,
+          error: remoteTransportContext
+            ? remoteTransport.createMcpRemoteTransportError({
+                serverName: name,
+                action: 'connect',
+                context: remoteTransportContext,
+                error,
+              })
+            : new Error(
+                `Failed to connect to MCP server ${name}: ${error instanceof Error ? error.message : String(error)}`,
+              ),
+        }
       }
     }
 
     try {
       const toolList = await client.listTools(
-        undefined,
+        {},
         signal ? { signal } : undefined,
       )
       signal?.removeEventListener('abort', abortListener)
@@ -528,7 +611,10 @@ export class McpManager {
       })
       const remoteTransport = await this.loadRemoteTransportModule()
       const remoteTransportContext =
-        remoteTransport.getMcpRemoteTransportContext(serverParams)
+        remoteTransport.getMcpRemoteTransportContext(
+          serverParams,
+          remoteTransportBackend,
+        )
       console.error(
         `[YOLO] Failed to list tools for MCP server "${name}":`,
         remoteTransportContext
@@ -558,6 +644,7 @@ export class McpManager {
 
   private async createClientTransport(
     serverParams: McpServerConfig['parameters'],
+    options: { httpBackend?: McpRemoteTransportBackend } = {},
   ) {
     switch (serverParams.transport) {
       case 'stdio': {
@@ -585,7 +672,10 @@ export class McpManager {
             env: this.defaultEnv ?? {},
           })
         return new StreamableHTTPClientTransport(new URL(serverParams.url), {
-          ...remoteTransportFactory.createHttpOptions(serverParams),
+          ...remoteTransportFactory.createHttpOptions(
+            serverParams,
+            options.httpBackend,
+          ),
         })
       }
       case 'sse': {
@@ -656,7 +746,7 @@ export class McpManager {
                 return []
               }
               try {
-                const toolList = await server.client.listTools()
+                const toolList = await server.client.listTools({})
                 return toolList.tools
                   .filter(
                     (tool) => !server.config.toolOptions[tool.name]?.disabled,
@@ -779,6 +869,8 @@ export class McpManager {
     requireReview = false,
     chatModelId,
     workspaceScope,
+    allowedSkillPaths,
+    subagentParentContext,
     runContext,
   }: {
     name: string
@@ -791,7 +883,9 @@ export class McpManager {
     requireReview?: boolean
     chatModelId?: string
     workspaceScope?: AssistantWorkspaceScope
+    allowedSkillPaths?: readonly string[]
     runContext?: AgentRunContext
+    subagentParentContext?: SubagentParentContext
   }): Promise<ToolCallResponse> {
     const toolAbortController = new AbortController()
     if (id !== undefined) {
@@ -834,7 +928,10 @@ export class McpManager {
           signal: compositeSignal,
           chatModelId,
           workspaceScope,
+          allowedSkillPaths,
           runContext,
+          subagentParentContext,
+          promptSourceWatcher: this.promptSourceWatcher,
         })
         if (localResult.status === ToolCallResponseStatus.Success) {
           return {
