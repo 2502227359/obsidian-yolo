@@ -1,5 +1,9 @@
 export type Language = 'en' | 'zh' | 'it'
 
+type TranslationBranch = {
+  [key: string]: string | TranslationBranch
+}
+
 export type TranslationKeys = {
   // Commands
   commands: {
@@ -51,6 +55,8 @@ export type TranslationKeys = {
     characters: string
     words: string
     wordsCharacters: string
+    rows?: string
+    columns?: string
     // additions
     default?: string
     modelDefault?: string
@@ -70,6 +76,8 @@ export type TranslationKeys = {
       searchPlaceholder?: string
       empty?: string
       current?: string
+      pinConversation?: string
+      unpinConversation?: string
       retryTitle?: string
       archived?: string
       hideArchived?: string
@@ -124,6 +132,8 @@ export type TranslationKeys = {
     mentionContextLabel?: string
   }
 
+  learning?: TranslationBranch
+
   // Settings
   settings: {
     title: string
@@ -133,6 +143,7 @@ export type TranslationKeys = {
       knowledge: string
       tools: string
       agent: string
+      learning: string
       others: string
     }
     supportYolo: {
@@ -160,6 +171,11 @@ export type TranslationKeys = {
       chatTitlePromptDesc: string
       tabCompletionSystemPrompt?: string
       tabCompletionSystemPromptDesc?: string
+    }
+    learning: {
+      generationTitle: string
+      generationModel: string
+      generationModelDesc: string
     }
     chatPreferences: {
       title: string
@@ -324,6 +340,8 @@ export type TranslationKeys = {
       fsEditReviewToggleDesc?: string
       safetyControls?: string
       safetyControlsDesc?: string
+      builtinFsEditOpsLabel?: string
+      builtinFsEditOpsDesc?: string
       builtinFsFileOpsLabel?: string
       builtinFsFileOpsDesc?: string
       builtinMemoryOpsLabel?: string
@@ -663,15 +681,6 @@ export type TranslationKeys = {
       geminiOAuthDisconnectedHelp?: string
       geminiOAuthProject?: string
       geminiOAuthStreamingNotice?: string
-      qwenOAuthTitle?: string
-      qwenOAuthConnect?: string
-      qwenOAuthDisconnect?: string
-      qwenOAuthConnecting?: string
-      qwenOAuthLoadingStatus?: string
-      qwenOAuthConnected?: string
-      qwenOAuthExpires?: string
-      qwenOAuthDisconnectedHelp?: string
-      qwenOAuthStreamingNotice?: string
     }
     models: {
       title: string
@@ -1542,6 +1551,7 @@ export type TranslationKeys = {
         fs_search?: string
         fs_read?: string
         fs_edit?: string
+        fs_edit_ops?: string
         fs_file_ops?: string
         memory_add?: string
         memory_update?: string
@@ -1574,6 +1584,7 @@ export type TranslationKeys = {
       noParameters?: string
       result?: string
       error?: string
+      rejectionReason?: string
       allow?: string
       reject?: string
       abort?: string
@@ -1698,6 +1709,10 @@ export type TranslationKeys = {
     backgroundStatusPanelEmpty?: string
     backgroundTasksRunning?: string
     backgroundTasksNeedAttention?: string
+    learningTasksRunning?: string
+    learningReviewLabel?: string
+    learningReviewTitle?: string
+    learningReviewDetail?: string
     ragAutoUpdateRunning?: string
     ragAutoUpdateRunningDetail?: string
     ragAutoUpdateFailed?: string
@@ -1825,13 +1840,15 @@ export type TranslationKeys = {
     low?: string
     medium?: string
     high?: string
-    extraHigh?: string
+    xhigh?: string
+    max?: string
     offDesc?: string
     autoDesc?: string
     lowDesc?: string
     mediumDesc?: string
     highDesc?: string
-    extraHighDesc?: string
+    xhighDesc?: string
+    maxDesc?: string
   }
 
   // Config import / export

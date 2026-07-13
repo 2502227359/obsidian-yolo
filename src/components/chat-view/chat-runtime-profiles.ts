@@ -1,3 +1,5 @@
+import { FILE_EDIT_GROUP_TOOL_NAME } from '../../core/agent/builtinToolUiMeta'
+import type { ToolCapabilityMode } from '../../core/agent/tool-capability-prompt'
 import type { AgentRuntimeLoopConfig } from '../../core/agent/types'
 import { getLocalFileToolServerName } from '../../core/mcp/localFileTools'
 import { getToolName } from '../../core/mcp/tool-name-utils'
@@ -18,6 +20,7 @@ export const DEFAULT_AGENT_MAX_AUTO_ITERATIONS = 100
 
 export const CHAT_BLOCKED_TOOL_NAMES: readonly string[] = [
   getToolName(getLocalFileToolServerName(), 'fs_file_ops'),
+  getToolName(getLocalFileToolServerName(), FILE_EDIT_GROUP_TOOL_NAME),
   getToolName(getLocalFileToolServerName(), 'fs_edit'),
   getToolName(getLocalFileToolServerName(), 'fs_write'),
   getToolName(getLocalFileToolServerName(), 'fs_delete'),
@@ -33,7 +36,7 @@ export type ChatModeRuntime = {
   toolPreferences: Assistant['toolPreferences']
   toolServerPreferences: Assistant['toolServerPreferences']
   bypassToolApproval: boolean
-  runtimeModePrompt?: string
+  toolCapabilityMode: ToolCapabilityMode
 }
 
 export type ChatModeRuntimeInput = {
@@ -78,10 +81,6 @@ export function resolveChatModeRuntime({
       ? assistant?.toolServerPreferences
       : undefined,
     bypassToolApproval: isAgentMode && yoloEnabled,
-    runtimeModePrompt: isAgentMode
-      ? undefined
-      : `<runtime_mode>
-You are currently in Ask mode. Some action tools are unavailable in this mode, including file modification, terminal command execution, and task-state writing tools. If the user asks you to use these capabilities, explain that they need to switch to Agent mode.
-</runtime_mode>`,
+    toolCapabilityMode: isAgentMode ? 'agent' : 'ask',
   }
 }

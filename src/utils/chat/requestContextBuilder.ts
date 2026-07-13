@@ -29,6 +29,7 @@ import {
 } from '../../core/skills/skillPolicy'
 import { readPromptSnapshotEntries } from '../../database/json/chat/promptSnapshotStore'
 import type { YoloSettings } from '../../settings/schema/setting.types'
+import type { AssistantWorkspaceScope } from '../../types/assistant.types'
 import type {
   ChatAssistantMessage,
   ChatConversationCompactionLike,
@@ -1062,19 +1063,29 @@ export class RequestContextBuilder {
       (m): m is MentionableWebSelection => m.type === 'web-selection',
     )
     const blockPrompt = blocks
-      .map(({ file, content, startLine, pageNumber }) => {
-        const pageTag = pageNumber !== undefined ? ` (page ${pageNumber})` : ''
-        const header = `${file.path}${pageTag}`
-        if (pageNumber !== undefined) {
-          // PDF block: skip line numbering (startLine/endLine are 0)
-          return `\`\`\`${header}\n${content}\n\`\`\`\n`
-        }
-        const numberedContent = this.addLineNumbersToContent({
-          content,
-          startLine,
-        })
-        return `\`\`\`${header}\n${numberedContent}\n\`\`\`\n`
-      })
+      .map(
+        ({ file, content, startLine, endLine, pageNumber, contentFormat }) => {
+          const pageTag =
+            pageNumber !== undefined ? ` (page ${pageNumber})` : ''
+          const header = `${file.path}${pageTag}`
+          if (pageNumber !== undefined) {
+            // PDF block: skip line numbering (startLine/endLine are 0)
+            return `\`\`\`${header}\n${content}\n\`\`\`\n`
+          }
+          if (contentFormat === 'markdown-table') {
+            const lineTag =
+              startLine === endLine
+                ? `line ${startLine}`
+                : `lines ${startLine}-${endLine}`
+            return `${file.path} (${lineTag}, table selection)\n\n\`\`\`md\n${content}\n\`\`\`\n`
+          }
+          const numberedContent = this.addLineNumbersToContent({
+            content,
+            startLine,
+          })
+          return `\`\`\`${header}\n${numberedContent}\n\`\`\`\n`
+        },
+      )
       .join('')
     const assistantQuotePrompt = this.buildAssistantQuotePrompt(assistantQuotes)
     const webSelectionPrompt = this.buildWebSelectionPrompt(webSelections)
@@ -1294,7 +1305,9 @@ ${message.annotations
           toolMessages.push({
             role: 'tool',
             tool_call: toolCall.request,
-            content: `Tool call ${toolCall.request.id} is rejected`,
+            content: toolCall.response.reason
+              ? `Tool call ${toolCall.request.id} was rejected: ${toolCall.response.reason}`
+              : `Tool call ${toolCall.request.id} is rejected`,
           })
           break
         case ToolCallResponseStatus.Success: {
@@ -1483,19 +1496,29 @@ ${message.annotations
       (m): m is MentionableWebSelection => m.type === 'web-selection',
     )
     const blockPrompt = blocks
-      .map(({ file, content, startLine, pageNumber }) => {
-        const pageTag = pageNumber !== undefined ? ` (page ${pageNumber})` : ''
-        const header = `${file.path}${pageTag}`
-        if (pageNumber !== undefined) {
-          // PDF block: skip line numbering (startLine/endLine are 0)
-          return `\`\`\`${header}\n${content}\n\`\`\`\n`
-        }
-        const numberedContent = this.addLineNumbersToContent({
-          content,
-          startLine,
-        })
-        return `\`\`\`${header}\n${numberedContent}\n\`\`\`\n`
-      })
+      .map(
+        ({ file, content, startLine, endLine, pageNumber, contentFormat }) => {
+          const pageTag =
+            pageNumber !== undefined ? ` (page ${pageNumber})` : ''
+          const header = `${file.path}${pageTag}`
+          if (pageNumber !== undefined) {
+            // PDF block: skip line numbering (startLine/endLine are 0)
+            return `\`\`\`${header}\n${content}\n\`\`\`\n`
+          }
+          if (contentFormat === 'markdown-table') {
+            const lineTag =
+              startLine === endLine
+                ? `line ${startLine}`
+                : `lines ${startLine}-${endLine}`
+            return `${file.path} (${lineTag}, table selection)\n\n\`\`\`md\n${content}\n\`\`\`\n`
+          }
+          const numberedContent = this.addLineNumbersToContent({
+            content,
+            startLine,
+          })
+          return `\`\`\`${header}\n${numberedContent}\n\`\`\`\n`
+        },
+      )
       .join('')
     const assistantQuotePrompt = this.buildAssistantQuotePrompt(assistantQuotes)
     const webSelectionPrompt = this.buildWebSelectionPrompt(webSelections)
@@ -1880,6 +1903,17 @@ ${entries}
       })
     }
 
+    const workspaceScopeContent = this.buildWorkspaceScopeSection(
+      currentAssistant?.workspaceScope,
+    )
+    if (workspaceScopeContent) {
+      sections.push({
+        bucket: 'rules',
+        id: 'rules.workspace-scope',
+        content: workspaceScopeContent,
+      })
+    }
+
     const projectInstructionsContent = await getProjectInstructionsSection(
       this.app,
       currentAssistant?.enableProjectInstructions === true,
@@ -1894,6 +1928,25 @@ ${entries}
     }
 
     return sections
+  }
+
+  private buildWorkspaceScopeSection(
+    scope: AssistantWorkspaceScope | undefined,
+  ): string {
+    if (!scope?.enabled) return ''
+
+    const include = scope.include.map((path) => path.trim()).filter(Boolean)
+    const exclude = scope.exclude.map((path) => path.trim()).filter(Boolean)
+    if (include.length === 0 && exclude.length === 0) return ''
+
+    return `<workspace_scope>
+- Included paths: ${include.length > 0 ? include.join(', ') : 'all vault paths'}
+- Excluded paths: ${exclude.length > 0 ? exclude.join(', ') : 'none'}
+- All file paths must be vault-relative.
+- Each listed folder includes itself and all descendants.
+- Excluded paths take precedence over included paths.
+- Do not attempt to access paths outside this scope. If the task requires an out-of-scope path, tell the user about the workspace restriction.
+</workspace_scope>`
   }
 
   /**
@@ -2071,7 +2124,8 @@ ${customInstruction}
     hasOnDemandTools: boolean,
   ): string {
     let section = `- Format your responses in Markdown.
-- Always reply in the same language as the user's message.`
+- Always reply in the same language as the user's message.
+- Only use tools exposed in this request. Never simulate unavailable tool calls or claim an action succeeded without a successful tool result.`
 
     if (hasTools) {
       section += `

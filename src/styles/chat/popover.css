@@ -720,6 +720,20 @@
   border-top-color: color-mix(in srgb, var(--color-red) 82%, white 8%);
 }
 
+.yolo-background-activity-status-bar-ring.is-review {
+  order: -1;
+  border: 0;
+  border-radius: 0;
+  color: var(--interactive-accent);
+  animation: none;
+}
+
+.yolo-background-activity-status-bar-ring.is-review svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 2;
+}
+
 .yolo-agent-status-bar-label,
 .yolo-background-activity-status-bar-label {
   min-width: 0;
@@ -868,6 +882,20 @@
   border-top-color: color-mix(in srgb, var(--color-red) 82%, white 8%);
 }
 
+.yolo-background-activity-status-panel-item-indicator.is-review {
+  order: -1;
+  border: 0;
+  border-radius: 0;
+  color: var(--interactive-accent);
+  animation: none;
+}
+
+.yolo-background-activity-status-panel-item-indicator.is-review svg {
+  width: 12px;
+  height: 12px;
+  stroke-width: 2;
+}
+
 input[type='text'].yolo-chat-list-dropdown-item-title-input {
   width: 100%;
   font-size: var(--font-ui-smaller);
@@ -1006,6 +1034,13 @@ button.yolo-chat-list-dropdown-archive-toggle:focus-visible
     width: var(--icon-xs);
     stroke-width: var(--icon-stroke);
   }
+}
+
+body.is-mobile .yolo-chat-list-dropdown-item-actions:empty {
+  width: 86px;
+  min-height: 26px;
+  flex-shrink: 0;
+  pointer-events: none;
 }
 
 .yolo-chat-list-inline-actions {
@@ -1183,6 +1218,23 @@ button.yolo-chat-list-dropdown-archive-toggle:focus-visible
 
 .yolo-code-block-content {
   margin: 0;
+}
+
+.yolo-code-block-actions {
+  display: flex;
+  justify-content: flex-end;
+  font-size: var(--font-smallest);
+  margin-top: var(--size-4-3);
+  margin-right: calc(-1 * var(--size-4-2));
+  margin-bottom: calc(-1 * var(--size-4-2));
+}
+
+.yolo-code-block-action-button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--size-4-1);
+  font-size: var(--font-small);
+  color: var(--text-color) !important;
 }
 
 .yolo-code-block-obsidian-markdown {
@@ -2450,4 +2502,76 @@ button.yolo-chat-input-model-select {
   .yolo-context-breakdown__list-skeleton {
     animation: none !important;
   }
+}
+
+.yolo-chat-list-dropdown-item {
+  touch-action: manipulation;
+  -webkit-touch-callout: none;
+}
+
+.yolo-chat-list-ctx-menu {
+  position: absolute;
+  z-index: 210;
+  width: 176px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  padding: 4px;
+  box-shadow: var(--shadow-s);
+  opacity: 0;
+  transform: scale(0.9);
+  transform-origin: top center;
+  pointer-events: none;
+  transition:
+    opacity 0.15s ease,
+    transform 0.15s ease;
+}
+
+.yolo-chat-list-ctx-menu.is-open {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+}
+
+.yolo-chat-list-ctx-menu button {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  height: auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+  line-height: var(--line-height-tight);
+  font-weight: var(--font-normal);
+  padding: 7px 9px;
+  border-radius: var(--radius-s);
+  text-align: left;
+}
+
+.yolo-chat-list-ctx-menu button svg {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+}
+
+.yolo-chat-list-ctx-menu button:active {
+  background: var(--background-modifier-hover);
+}
+
+.yolo-chat-list-ctx-menu button.danger {
+  color: var(--color-red);
+}
+
+.yolo-chat-list-ctx-menu hr {
+  border: none;
+  border-top: 1px solid var(--background-modifier-border);
+  margin: 3px 2px;
 }

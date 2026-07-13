@@ -14,6 +14,7 @@ import { McpManager } from '../mcp/mcpManager'
 
 import type { CitationRegistry } from './citationRegistry'
 import type { AutoContextCompactionChatOptions } from './compaction'
+import type { ToolCapabilityMode } from './tool-capability-prompt'
 
 export type AgentRunContext = {
   citationRegistry: CitationRegistry
@@ -79,7 +80,7 @@ export type AgentRuntimeRunInput = {
   }
   allowedSkillPaths?: string[]
   contextualInjections?: ContextualInjection[]
-  runtimeModePrompt?: string
+  toolCapabilityMode?: ToolCapabilityMode
   geminiTools?: {
     useWebSearch?: boolean
     useUrlContext?: boolean
@@ -138,7 +139,7 @@ export type AgentWorkerInbound =
       type: 'tool_result'
       runId: string
       hasPendingTools: boolean
-      forceStopReason?: 'repeated_tool_failure'
+      forceStopReason?: 'repeated_tool_failure' | 'repeated_read_call'
     }
   | {
       type: 'abort'
@@ -162,6 +163,7 @@ export type AgentWorkerOutbound =
         | 'completed'
         | 'max_iterations'
         | 'repeated_tool_failure'
+        | 'repeated_read_call'
         | 'aborted'
     }
   | {
