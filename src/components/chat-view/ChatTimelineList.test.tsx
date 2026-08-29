@@ -11,14 +11,13 @@ import { renderToStaticMarkup } from 'react-dom/server'
 
 import type { ChatTimelineItem } from '../../types/chat-timeline'
 
-import { ChatTimelineList } from './ChatTimelineList'
+import { ChatTimelineList, getVisibleUserMessageIds } from './ChatTimelineList'
 
 function makeUserItem(id: string): ChatTimelineItem {
   return {
     kind: 'user-message',
     id,
     renderKey: id,
-    estimatedHeight: 80,
     messageId: id,
     revision: 1,
   }
@@ -58,6 +57,7 @@ describe('ChatTimelineList windowed timeline', () => {
     expect(html).toContain('data-key="m-0"')
     expect(html).toContain('data-key="m-11"')
     expect(html).not.toContain('mock-virtuoso')
+    expect(html).toContain('yolo-chat-timeline-content')
   })
 
   it('renders a spacer div at the tail', () => {
@@ -69,8 +69,19 @@ describe('ChatTimelineList windowed timeline', () => {
     expect(html).toContain('yolo-chat-timeline-bottom-spacer')
     expect(html).toContain('height:120px')
     const spacerIndex = html.indexOf('yolo-chat-timeline-bottom-spacer')
+    const liveEdgeIndex = html.indexOf('yolo-chat-live-edge-sentinel')
     const lastRowIndex = html.lastIndexOf('data-key="b"')
     expect(spacerIndex).toBeGreaterThan(lastRowIndex)
+    expect(liveEdgeIndex).toBeGreaterThan(spacerIndex)
+  })
+
+  it('always renders a live-edge sentinel at the true timeline end', () => {
+    const html = renderList({ items: [makeUserItem('a')] })
+
+    expect(html).toContain('yolo-chat-live-edge-sentinel')
+    expect(html.indexOf('yolo-chat-live-edge-sentinel')).toBeGreaterThan(
+      html.lastIndexOf('data-key="a"'),
+    )
   })
 
   it('omits the spacer when height is 0', () => {
@@ -82,15 +93,17 @@ describe('ChatTimelineList windowed timeline', () => {
     expect(html).not.toContain('yolo-chat-timeline-bottom-spacer')
   })
 
-  it('renders load sentinels for unloaded history edges', () => {
+  it('renders nothing for unloaded history in either direction', () => {
     const html = renderList({
       items: [makeUserItem('a')],
       hasEarlierMessages: true,
       hasNewerMessages: true,
     })
 
-    expect(html).toContain('Load earlier messages')
-    expect(html).toContain('Load newer messages')
+    expect(html).not.toContain('yolo-chat-history-window-sentinel')
+    expect(html).not.toContain('Load earlier messages')
+    expect(html).not.toContain('Load newer messages')
+    expect(html).not.toContain('role="status"')
   })
 
   it('uses messageId for user scroll anchors', () => {
@@ -99,5 +112,46 @@ describe('ChatTimelineList windowed timeline', () => {
     })
 
     expect(html).toContain('data-yolo-user-anchor-id="user-anchor"')
+  })
+})
+
+describe('getVisibleUserMessageIds', () => {
+  const anchors = [
+    { messageId: 'first', top: -300 },
+    { messageId: 'second', top: 240 },
+    { messageId: 'third', top: 680 },
+  ]
+
+  it('keeps a turn visible while its assistant response intersects the viewport', () => {
+    expect(
+      getVisibleUserMessageIds({
+        anchors,
+        contentBottom: 900,
+        viewportTop: 0,
+        viewportBottom: 200,
+      }),
+    ).toEqual(['first'])
+  })
+
+  it('returns every turn crossed by the viewport', () => {
+    expect(
+      getVisibleUserMessageIds({
+        anchors,
+        contentBottom: 900,
+        viewportTop: 200,
+        viewportBottom: 300,
+      }),
+    ).toEqual(['first', 'second'])
+  })
+
+  it('does not extend the last turn beyond the rendered conversation content', () => {
+    expect(
+      getVisibleUserMessageIds({
+        anchors,
+        contentBottom: 900,
+        viewportTop: 910,
+        viewportBottom: 1000,
+      }),
+    ).toEqual([])
   })
 })

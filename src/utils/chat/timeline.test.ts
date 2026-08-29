@@ -1,12 +1,19 @@
 import type {
-  AssistantToolMessageGroup,
+  ChatAssistantMessage,
   ChatSubagentResultMessage,
   ChatTerminalCommandResultMessage,
   ChatToolMessage,
 } from '../../types/chat'
 import { ToolCallResponseStatus } from '../../types/tool-call.types'
 
-import { buildMessageTimelineItems } from './timeline'
+import { buildChatTimelineItems, buildMessageTimelineItems } from './timeline'
+
+const makeAssistantMessage = (id: string): ChatAssistantMessage => ({
+  role: 'assistant',
+  id,
+  content: id,
+  metadata: { generationState: 'completed' },
+})
 
 function makeToolMessage({
   id,
@@ -38,18 +45,6 @@ function makeToolMessage({
       },
     })),
   }
-}
-
-function getAssistantGroupEstimate(group: AssistantToolMessageGroup): number {
-  const item = buildMessageTimelineItems({
-    groupedChatMessages: [group],
-  })[0]
-
-  if (!item || item.kind !== 'assistant-group') {
-    throw new Error('Expected assistant-group timeline item')
-  }
-
-  return item.estimatedHeight
 }
 
 describe('buildMessageTimelineItems', () => {
@@ -93,24 +88,152 @@ describe('buildMessageTimelineItems', () => {
 
     expect(items).toEqual([])
   })
+})
 
-  it('estimates collapsed tool cards by count instead of response payload size', () => {
-    const smallPayloadEstimate = getAssistantGroupEstimate([
-      makeToolMessage({
-        id: 'small-tool',
-        toolCallCount: 12,
-        responseText: 'ok',
+describe('buildChatTimelineItems', () => {
+  it('keeps the logical group id when creating the default render slice', () => {
+    const assistant = makeAssistantMessage('assistant-1')
+
+    const items = buildChatTimelineItems({
+      groupedChatMessages: [[assistant]],
+      compactionDividerAnchorMessageIds: [],
+      latestCompaction: null,
+    })
+    const assistantItem = items.find((item) => item.kind === 'assistant-group')
+
+    expect(assistantItem).toMatchObject({
+      groupId: assistant.id,
+      renderKey: `${assistant.id}-slice-0`,
+      messageIds: [assistant.id],
+    })
+  })
+
+  it('shares one logical group id across compaction render slices', () => {
+    const firstAssistant = makeAssistantMessage('assistant-1')
+    const tool = makeToolMessage({
+      id: 'tool-1',
+      toolCallCount: 1,
+      responseText: 'ok',
+    })
+    const secondAssistant = makeAssistantMessage('assistant-2')
+
+    const items = buildChatTimelineItems({
+      groupedChatMessages: [[firstAssistant, tool, secondAssistant]],
+      compactionDividerAnchorMessageIds: [tool.id],
+      latestCompaction: null,
+    })
+    const assistantItems = items.filter(
+      (item) => item.kind === 'assistant-group',
+    )
+
+    expect(assistantItems).toHaveLength(2)
+    expect(assistantItems.map((item) => item.groupId)).toEqual([
+      firstAssistant.id,
+      firstAssistant.id,
+    ])
+    expect(assistantItems.map((item) => item.renderKey)).toEqual([
+      `${firstAssistant.id}-slice-0`,
+      `${firstAssistant.id}-slice-1`,
+    ])
+  })
+
+  it('keeps multiple independent compaction events at the same anchor', () => {
+    const assistant = makeAssistantMessage('assistant-1')
+
+    const items = buildChatTimelineItems({
+      groupedChatMessages: [[assistant]],
+      compactionDividerAnchorMessageIds: [assistant.id],
+      compactionDividers: [
+        {
+          id: 'compact-1-divider',
+          anchorMessageId: assistant.id,
+          compaction: null,
+        },
+        {
+          id: 'compact-2-divider',
+          anchorMessageId: assistant.id,
+          compaction: null,
+        },
+      ],
+      latestCompaction: null,
+    })
+
+    expect(
+      items
+        .filter((item) => item.kind === 'compaction-divider')
+        .map((item) => item.id),
+    ).toEqual(['compact-1-divider', 'compact-2-divider'])
+    expect(
+      items
+        .filter((item) => item.kind === 'assistant-group')
+        .flatMap((item) => item.messageIds),
+    ).toEqual([assistant.id])
+  })
+
+  it('inserts a session-fallback divider at its anchor with its own copy', () => {
+    const assistant = makeAssistantMessage('assistant-1')
+
+    const items = buildChatTimelineItems({
+      groupedChatMessages: [[assistant]],
+      compactionDividerAnchorMessageIds: [],
+      latestCompaction: null,
+      sessionFallbackDividers: [
+        {
+          id: 'fallback-1-divider',
+          anchorMessageId: assistant.id,
+          title: 'Switched to default',
+          description: 'The original agent "work" is unavailable.',
+        },
+      ],
+    })
+
+    const fallbackItems = items.filter(
+      (item) => item.kind === 'session-fallback-divider',
+    )
+    expect(fallbackItems).toEqual([
+      expect.objectContaining({
+        id: 'fallback-1-divider',
+        anchorMessageId: assistant.id,
+        title: 'Switched to default',
+        description: 'The original agent "work" is unavailable.',
       }),
     ])
-    const largePayloadEstimate = getAssistantGroupEstimate([
-      makeToolMessage({
-        id: 'large-tool',
-        toolCallCount: 12,
-        responseText: 'x'.repeat(80_000),
-      }),
-    ])
+  })
 
-    expect(largePayloadEstimate).toBe(smallPayloadEstimate)
-    expect(largePayloadEstimate).toBeLessThan(1000)
+  it('splits an assistant render slice at a session-fallback anchor', () => {
+    const firstAssistant = makeAssistantMessage('assistant-1')
+    const tool = makeToolMessage({
+      id: 'tool-1',
+      toolCallCount: 1,
+      responseText: 'ok',
+    })
+    const secondAssistant = makeAssistantMessage('assistant-2')
+
+    const items = buildChatTimelineItems({
+      groupedChatMessages: [[firstAssistant, tool, secondAssistant]],
+      compactionDividerAnchorMessageIds: [],
+      latestCompaction: null,
+      sessionFallbackDividers: [
+        {
+          id: 'fallback-1-divider',
+          anchorMessageId: tool.id,
+          title: 'Switched to default',
+          description: 'The original agent "work" is unavailable.',
+        },
+      ],
+    })
+
+    const assistantItems = items.filter(
+      (item) => item.kind === 'assistant-group',
+    )
+    expect(assistantItems).toHaveLength(2)
+    const dividerIndex = items.findIndex(
+      (item) => item.kind === 'session-fallback-divider',
+    )
+    expect(dividerIndex).toBeGreaterThan(0)
+    expect(items[dividerIndex - 1]).toMatchObject({
+      kind: 'assistant-group',
+      messageIds: [firstAssistant.id, tool.id],
+    })
   })
 })

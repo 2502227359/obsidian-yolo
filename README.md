@@ -13,7 +13,7 @@
     <img src="https://img.shields.io/github/v/release/Lapis0x0/obsidian-yolo?style=flat-square&color=00b894" alt="Latest Release">
   </a>
   <a href="https://github.com/Lapis0x0/obsidian-yolo/releases">
-    <img src="https://img.shields.io/github/downloads/Lapis0x0/obsidian-yolo/total?style=flat-square&color=0984e3" alt="Downloads">
+    <img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FLapis0x0%2Fobsidian-yolo%2Fdownload-metrics%2Fbadge.json&style=flat-square" alt="Downloads">
   </a>
   <a href="https://github.com/Lapis0x0/obsidian-yolo/blob/main/LICENSE">
     <img src="https://img.shields.io/github/license/Lapis0x0/obsidian-yolo?style=flat-square&color=636e72" alt="License">
@@ -21,35 +21,64 @@
 </p>
 
 <p align="center">
-  <b>English</b> | <a href="./README_zh-CN.md">简体中文</a> | <a href="./README_it.md">Italiano</a>
+  <b>English</b> | <a href="./README_zh-CN.md">简体中文</a> | <a href="./README_it.md">Italiano</a> | <a href="./README_es.md">Español</a>
 </p>
 
+<p align="center">
+  <a href="https://discord.gg/d8EHm48ppU">
+    <img src="https://img.shields.io/badge/Discord-Join_the_community-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Join the Discord community">
+  </a>
+</p>
+
+## Sponsors
+
+<table>
+<tr>
+<td width="200" align="center" valign="middle">
+  <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=obsidian-yolo">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://www.atlascloud.ai/logo-white.svg">
+      <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" width="163">
+    </picture>
+  </a>
+</td>
+<td valign="middle">
+  <b><a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=obsidian-yolo">Atlas Cloud</a></b> gives developers one unified API for building with language, image, and video AI. Connect once to explore 300+ curated models across every modality—without maintaining separate integrations for each provider. From LLM-powered agents to image and video generation, Atlas Cloud makes it easier to experiment, compare models, and bring multimodal AI into production.
+  <br><br>
+  <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=obsidian-yolo"><b>Explore Atlas Cloud →</b></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://www.atlascloud.ai/console/coding-plan"><b>View the Coding Plan →</b></a>
+</td>
+</tr>
+<tr>
+<td width="200" align="center" valign="middle">
+  <a href="https://go.apimart.ai/gh-obsidian-yolo">
+    <img src="./assets/sponsor-apimart.png" alt="APIMart" width="163">
+  </a>
+</td>
+<td valign="middle">
+  Thanks to <b><a href="https://go.apimart.ai/gh-obsidian-yolo">APIMart</a></b> for sponsoring this project! APIMart is a low-cost API platform for AI image &amp; video generation — GPT-Image-2 from $0.006/image, 160+ images per dollar. One async API covers both image and video: submit a task, get an ID, fetch results via polling or callback. Batch tens of thousands of images without timeouts, switch models without changing code. Pay-as-you-go with no monthly fee — sign up here to get started.
+  <br><br>
+  <a href="https://go.apimart.ai/gh-obsidian-yolo"><b>Sign up for APIMart →</b></a>
+</td>
+</tr>
+</table>
+
 ## What's New
+
+- **`1.6`**
+  - **On-device local embedding models and multiple knowledge bases**: index without any API key, split and manage knowledge bases independently, and let the Agent auto-pick the right one by name.
+  - **CLI chat**: on desktop, drive the Claude Code, Codex, Hermes, or Pi CLI you're already signed into from the same chat surface.
+  - **The new Learning Mode**: turn any topic and reference material into a personalized learning project with structured outlines, knowledge points, flashcards, and an interactive knowledge map, backed by FSRS spaced repetition and Anki `.apkg` import for sustainable long-term review.
 
 - **`1.5`**: Introduces a new Agent runtime that turns AI from Q&A into active collaboration—with full tool calling, MCP, Skills, desktop Bash, subagents, and web search—plus smarter long-session context and memory, refreshed hybrid RAG, focus/PDF awareness, and multi-window chat with background Agents.
 
 ## Highlights
 
-### 🤖 Agent Mode
-
-YOLO's Agent mode lets LLMs go beyond just "Q&A machines" — they can actually operate on your Vault.
-
-| Tool Calling + MCP | Custom Skills |
+| A Complete Agent Experience \| Use Codex / Claude Code Inside Obsidian | Turn Vault Knowledge into Lasting Mastery |
 |:--:|:--:|
-| ![Agent Tools](./assets/agenttools.gif) | ![Agent Skills](./assets/agentskills.gif) |
-| Freely configure toolchains so Agents can read, write, edit, and organize your files directly | Encapsulate experience and SOPs into reusable skills, invoke with a single sentence — let the Agent work your way |
-
-| Multi-Window Chat | Quick Ask |
-|:--:|:--:|
-| ![Chat Window](./assets/chatwindow.gif) | ![Quick Ask](./assets/Quickask.gif) |
-| Handle different tasks and contexts in parallel across multiple chat windows, making multitasking feel more natural | Trigger with a character (default `@`) to open an inline assistant for Q&A, editing, and continuation, making document editing seamless |
-
-### 🧠 Knowledge Base Q&A + ✍️ Smart Space
-
-| Knowledge Base Q&A | Smart Space |
-|:--:|:--:|
-| ![RAG Vault](./assets/ragvault.gif) | ![Smart Space](./assets/Smartspace.gif) |
-| Turn your entire Vault into the AI's knowledge base, powered by RAG to answer with context from your notes instead of generic output | Summon anywhere to freely continue your creative flow with smooth content generation |
+| ![Agent Tools](./assets/agenttools.gif) | ![Learning Mode](./assets/learning-mode.gif) |
+| Go beyond answers. YOLO understands and works directly with your Vault, calls tools and MCP servers, and uses Skills to get real work done your way. On desktop, switch in one click to the Claude Code or Codex you are already signed in to and let them work directly in your Vault. | Turn topics and source material into a personal learning system, then use flashcards and FSRS-powered review to move from saved notes to lasting knowledge. |
 
 ## Features
 
@@ -57,13 +86,16 @@ Beyond the core capabilities above, YOLO also provides:
 
 | Feature | Description |
 |---------|-------------|
-| 💬 Sidebar Chat | Seamless LLM conversation with context injection, preset prompts, Markdown smart parsing |
+| 🖥️ CLI Agent (Desktop) | Reuse the Claude Code / Codex you are already signed in to locally, and chat with the CLI agent right inside Obsidian |
+| 🔌 External Agent Support | Connect MCP clients such as Hermes and OpenClaw to YOLO's Vault search, or delegate tasks to a configured YOLO Agent |
+| ⚡ Quick Ask | Ask, edit, and continue writing without leaving the editor |
+| 🔎 Vault RAG | Retrieve across your Vault for answers grounded in your own notes |
+| 🪟 Multi-Window Chat | Run different tasks and contexts in parallel across independent chat windows |
 | 🧠 Memory System | Lets YOLO remember preferences, habits, and long-term context for more consistent conversations |
 | 🪡 Cursor Chat | One-click context addition, conversation at your fingertips |
 | ⌨️ Tab Completion | Real-time AI-powered completion for smoother, more natural writing |
 | 🎛️ Multi-Model Support | OpenAI, Claude, Gemini, DeepSeek and other mainstream models, freely switch |
 | 🌍 i18n | Native multi-language support |
-| 🧩 Experimental Features | Learning Mode, sub-Agents, explore personalized workflows |
 
 ## Quick Start
 
@@ -88,18 +120,12 @@ See Quick Start above.
 > [!WARNING]
 > YOLO cannot coexist with [Smart Composer](https://github.com/glowingjade/obsidian-smart-composer). Please disable or uninstall Smart Composer before using YOLO.
 
-## Mobile Support Note
-
-Due to the capability gap between Obsidian mobile and desktop, YOLO cannot fully match the desktop feature set and overall experience on mobile in the short term. With limited personal maintenance bandwidth, I can currently only guarantee that YOLO remains usable on mobile, not that every feature will reach desktop-level parity.
-
-If you use YOLO on mobile, you may still encounter unavailable features, inconsistent behavior, or incomplete adaptations for some workflows. Please keep that expectation in mind.
-
 ## Roadmap
 
 - [x] Better and stronger Vault AI search
 - [x] Background Agent (long-running task automation)
 - [x] Multi-Agent orchestration (via subagents)
-- [ ] Learning Mode — a dedicated study view
+- [x] Learning Mode — a dedicated study view
 - [ ] Annotation Mode — real-time AI annotations and suggestions on notes
 - [ ] Built-in assistant — a corner-pinned helper for config/agents, with auto-compaction and scheduled tasks
 - [ ] Better AI whiteboard
@@ -144,6 +170,10 @@ Special thanks to [Kilo Code](https://kilo.ai) for their sponsorship. Kilo is an
 If you find YOLO valuable, consider supporting the project:
 
 <p align="center">
+  <a href="https://buymeacoffee.com/lapis0x0" target="_blank">
+    <img src="https://img.shields.io/badge/Buy Me a Coffee-Support Developer-FFDD00?style=for-the-badge" alt="Buy Me a Coffee">
+  </a>
+  &nbsp;
   <a href="https://afdian.com/a/lapis0x0" target="_blank">
     <img src="https://img.shields.io/badge/爱发电-Support Developer-fd6c9e?style=for-the-badge" alt="爱发电">
   </a>
@@ -161,4 +191,4 @@ Development logs are regularly updated on the [blog](https://www.lapis.cafe).
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Lapis0x0/obsidian-yolo&type=Date)](https://star-history.com/#Lapis0x0/obsidian-yolo&Type=Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=Lapis0x0/obsidian-yolo&type=Date)](https://star-history.dera.page/#Lapis0x0/obsidian-yolo&type=date)

@@ -1,31 +1,10 @@
 import type { YoloSettings } from '../../settings/schema/setting.types'
 import type { McpTool } from '../../types/mcp.types'
 
-import { expandAllowedToolNames, selectAllowedTools } from './tool-selection'
-
-describe('expandAllowedToolNames', () => {
-  it('expands file editing and file path operation groups separately', () => {
-    const expanded = expandAllowedToolNames([
-      'yolo_local__fs_edit_ops',
-      'yolo_local__fs_file_ops',
-    ])
-
-    expect(expanded).toBeDefined()
-    expect(expanded?.has('yolo_local__fs_edit')).toBe(true)
-    expect(expanded?.has('yolo_local__fs_write')).toBe(true)
-    expect(expanded?.has('yolo_local__fs_delete')).toBe(true)
-    expect(expanded?.has('yolo_local__fs_create_dir')).toBe(true)
-    expect(expanded?.has('yolo_local__fs_move')).toBe(true)
-  })
-
-  it('does not expand the file path operation group to fs_write', () => {
-    const expanded = expandAllowedToolNames(['yolo_local__fs_file_ops'])
-
-    expect(expanded?.has('yolo_local__fs_write')).toBe(false)
-    expect(expanded?.has('yolo_local__fs_edit')).toBe(false)
-    expect(expanded?.has('yolo_local__fs_delete')).toBe(true)
-  })
-})
+import {
+  applyDynamicToolDescriptions,
+  selectAllowedTools,
+} from './tool-selection'
 
 describe('selectAllowedTools', () => {
   it('keeps full schemas for tools left in always mode', async () => {
@@ -47,9 +26,9 @@ describe('selectAllowedTools', () => {
         server__tool_a: {
           enabled: true,
           approvalMode: 'full_access',
-          disclosureMode: 'always',
         },
       },
+      toolServerPreferences: { server: { disclosureMode: 'always' } },
     })
 
     expect(result.requestTools?.map((tool) => tool.function.name)).toEqual([
@@ -96,8 +75,8 @@ describe('selectAllowedTools', () => {
       mcp: {
         servers: [],
         enableToolDisclosure: false,
-        builtinToolOptions: {
-          delegate_subagent: {
+        builtinCapabilityOptions: {
+          subagent_delegation: {
             allowedModelIds: ['openai/gpt-4.1-mini'],
             preferredModelId: 'openai/gpt-4.1-mini',
           },
@@ -111,7 +90,6 @@ describe('selectAllowedTools', () => {
       toolPreferences: {
         yolo_local__delegate_subagent: {
           enabled: true,
-          disclosureMode: 'always',
         },
       },
       settings,
@@ -148,8 +126,9 @@ describe('selectAllowedTools', () => {
       availableTools,
       allowedToolNames: ['server__tool_a'],
       toolPreferences: {
-        server__tool_a: { enabled: true, disclosureMode: 'on_demand' },
+        server__tool_a: { enabled: true },
       },
+      toolServerPreferences: { server: { disclosureMode: 'on_demand' } },
       apiType: 'anthropic',
     })
 
@@ -183,8 +162,9 @@ describe('selectAllowedTools', () => {
       availableTools,
       allowedToolNames: ['server__tool_a'],
       toolPreferences: {
-        server__tool_a: { enabled: true, disclosureMode: 'on_demand' },
+        server__tool_a: { enabled: true },
       },
+      toolServerPreferences: { server: { disclosureMode: 'on_demand' } },
       apiType: 'gemini',
     })
 
@@ -218,8 +198,9 @@ describe('selectAllowedTools', () => {
       allowedToolNames: ['server__tool_a'],
       enableToolDisclosure: false,
       toolPreferences: {
-        server__tool_a: { enabled: true, disclosureMode: 'on_demand' },
+        server__tool_a: { enabled: true },
       },
+      toolServerPreferences: { server: { disclosureMode: 'on_demand' } },
     })
 
     expect(result.requestTools?.map((tool) => tool.function.name)).toEqual([
@@ -247,9 +228,9 @@ describe('selectAllowedTools', () => {
       toolPreferences: {
         server__tool_a: {
           enabled: true,
-          disclosureMode: 'always',
         },
       },
+      toolServerPreferences: { server: { disclosureMode: 'always' } },
     })
 
     expect(result.requestTools?.map((tool) => tool.function.name)).toEqual([
@@ -346,7 +327,10 @@ describe('selectAllowedTools', () => {
       availableTools,
       allowedToolNames: ['server__tool_a'],
       toolPreferences: {
-        server__tool_a: { enabled: true, disclosureMode: 'on_demand' as const },
+        server__tool_a: { enabled: true },
+      },
+      toolServerPreferences: {
+        server: { disclosureMode: 'on_demand' as const },
       },
       apiType: 'anthropic' as const,
     }
@@ -357,5 +341,54 @@ describe('selectAllowedTools', () => {
     expect(JSON.stringify(before.requestTools)).toEqual(
       JSON.stringify(after.requestTools),
     )
+  })
+})
+
+describe('applyDynamicToolDescriptions', () => {
+  const knowledgeBases = [
+    {
+      id: 'kb-1',
+      name: '读书笔记',
+      description: '书摘与书评',
+      include: [],
+      exclude: [],
+    },
+    { id: 'kb-2', name: 'Work', description: '', include: [], exclude: [] },
+  ]
+  const settings = { knowledgeBases } as unknown as YoloSettings
+  const tools: McpTool[] = [
+    {
+      name: 'yolo_local__bash',
+      description: 'static',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'yolo_local__js_eval',
+      description: 'static',
+      inputSchema: { type: 'object', properties: {} },
+    },
+  ]
+
+  it('lists the configured knowledge bases in bash and js_eval descriptions', () => {
+    const [bash, jsEval] = applyDynamicToolDescriptions(tools, {
+      jsSandboxSettings: { allowDbQuery: true },
+      settings,
+    })
+    for (const tool of [bash, jsEval]) {
+      expect(tool.description).toContain('- 读书笔记 - 书摘与书评')
+      expect(tool.description).toContain('- Work')
+    }
+    expect(bash.description).toContain('--kb')
+    expect(jsEval.description).toContain(
+      '$db.search(query, limit?, knowledgeBase?)',
+    )
+  })
+
+  it('tells the model when no knowledge base exists', () => {
+    const [bash] = applyDynamicToolDescriptions(tools, {
+      jsSandboxSettings: {},
+      settings: { knowledgeBases: [] } as unknown as YoloSettings,
+    })
+    expect(bash.description).toContain('No knowledge bases are configured')
   })
 })

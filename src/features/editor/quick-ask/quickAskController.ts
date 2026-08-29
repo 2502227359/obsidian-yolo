@@ -20,6 +20,7 @@ import type {
   QuickAskSelectionScope,
   QuickAskShowOptions,
 } from './quickAsk.types'
+import { QUICK_ASK_CURSOR_MARKER } from './quickAsk.types'
 
 type QuickAskWidgetPayload = {
   pos: number
@@ -34,9 +35,8 @@ type QuickAskWidgetPayload = {
     initialMentionables?: Mentionable[]
     initialMode?: QuickAskLaunchMode
     initialInput?: string
-    editContextText?: string
-    editSelectionFrom?: { line: number; ch: number }
     selectionScope?: QuickAskSelectionScope
+    isRewriteEntry?: boolean
     selectionAnchor?: { from: number; to: number }
     autoSend?: boolean
     initialAssistantId?: string
@@ -56,13 +56,10 @@ type QuickAskControllerDeps = {
   getActiveMarkdownView: () => MarkdownView | null
   getEditorView: (editor: Editor) => EditorView | null
   getActiveFileTitle: () => string
-  closeSmartSpace: (restoreFocus?: boolean) => void
 }
 
 const DEFAULT_QUICK_ASK_CONTEXT_BEFORE_CHARS = 5000
 const DEFAULT_QUICK_ASK_CONTEXT_AFTER_CHARS = 2000
-export const QUICK_ASK_CURSOR_MARKER = '<<CURSOR>>'
-
 const quickAskWidgetEffect = StateEffect.define<QuickAskWidgetPayload | null>()
 
 const quickAskOverlayPlugin = ViewPlugin.fromClass(
@@ -127,6 +124,12 @@ export class QuickAskController {
 
   constructor(private readonly deps: QuickAskControllerDeps) {}
 
+  private focusExistingQuickAsk(): boolean {
+    return (
+      this.quickAskWidgetState !== null && QuickAskOverlay.focusCurrentInput()
+    )
+  }
+
   close(restoreFocus = true) {
     // Destroy PDF instance if present
     if (this.pdfQuickAskInstance) {
@@ -171,7 +174,13 @@ export class QuickAskController {
   }
 
   show(editor: Editor, view: EditorView) {
-    this.showWithOptions(editor, view)
+    if (this.focusExistingQuickAsk()) return
+
+    void this.showWithOptionsAfterWarmup(editor, view, undefined, true).catch(
+      (error: unknown) => {
+        console.error('[YOLO] Failed to open Quick Ask:', error)
+      },
+    )
   }
 
   showWithAutoSend(
@@ -210,8 +219,11 @@ export class QuickAskController {
     editor: Editor,
     view: EditorView,
     options?: QuickAskShowOptions,
+    focusExisting = false,
   ): Promise<void> {
     await this.deps.plugin.warmupAgentService()
+
+    if (focusExisting && this.focusExistingQuickAsk()) return
 
     const selection = view.state.selection.main
     const pos = selection.head
@@ -247,16 +259,13 @@ export class QuickAskController {
     const initialMentionables = options?.initialMentionables
     const initialMode = options?.initialMode
     const initialInput = options?.initialInput
-    const editContextText = options?.editContextText
-    const editSelectionFrom = options?.editSelectionFrom
     const selectionScope = options?.selectionScope
+    const isRewriteEntry = options?.isRewriteEntry
     const autoSend = options?.autoSend
     const initialAssistantId = options?.initialAssistantId
 
     // Close any existing Quick Ask panel (CM or PDF)
     this.close(false)
-    // Also close Smart Space if open
-    this.deps.closeSmartSpace(false)
 
     const close = (restoreFocus = true) => {
       const isCurrentView =
@@ -311,9 +320,8 @@ export class QuickAskController {
             initialMentionables,
             initialMode,
             initialInput,
-            editContextText,
-            editSelectionFrom,
             selectionScope,
+            isRewriteEntry,
             selectionAnchor,
             autoSend,
             initialAssistantId,
@@ -324,7 +332,7 @@ export class QuickAskController {
     })
 
     this.quickAskWidgetState = { view, pos, close }
-    this.deferSelectionHighlightTakeover(view, ++this.highlightTakeoverToken)
+    this.takeOverSelectionHighlight(view, ++this.highlightTakeoverToken)
   }
 
   /**
@@ -376,9 +384,8 @@ export class QuickAskController {
       return
     }
 
-    // Close any existing Quick Ask (CM or PDF) and Smart Space
+    // Close any existing Quick Ask (CM or PDF)
     this.close(false)
-    this.deps.closeSmartSpace(false)
 
     const capabilities: QuickAskCapabilities = {
       edit: false,
@@ -450,7 +457,7 @@ export class QuickAskController {
     }
   }
 
-  private deferSelectionHighlightTakeover(view: EditorView, token: number) {
+  private takeOverSelectionHighlight(view: EditorView, token: number) {
     if (
       !(
         this.deps.getSettings().continuationOptions.persistSelectionHighlight ??
@@ -460,32 +467,25 @@ export class QuickAskController {
       return
     }
 
-    window.requestAnimationFrame(() => {
-      window.requestAnimationFrame(() => {
-        if (token !== this.highlightTakeoverToken) {
-          return
-        }
+    if (
+      token !== this.highlightTakeoverToken ||
+      this.quickAskWidgetState?.view !== view
+    ) {
+      return
+    }
 
-        const selection = view.state.selection.main
-        if (
-          selection.empty ||
-          view.hasFocus ||
-          this.quickAskWidgetState?.view !== view
-        ) {
-          return
-        }
+    const selection = view.state.selection.main
+    if (selection.empty) return
 
-        const id = `quickask:${crypto.randomUUID()}`
-        this.currentHighlightId = id
-        selectionHighlightController.addHighlight(
-          view,
-          id,
-          { from: selection.from, to: selection.to },
-          'sync',
-          'quickask',
-        )
-      })
-    })
+    const id = `quickask:${crypto.randomUUID()}`
+    this.currentHighlightId = id
+    selectionHighlightController.addHighlight(
+      view,
+      id,
+      { from: selection.from, to: selection.to },
+      'sync',
+      'quickask',
+    )
   }
 
   createTriggerExtension(): Extension {

@@ -1,4 +1,8 @@
-import type { AssistantToolPreference } from '../../types/assistant.types'
+import type { ChatContextPolicy } from '../../components/chat-view/chat-runtime-profiles'
+import type {
+  AssistantToolPreference,
+  AssistantToolServerPreference,
+} from '../../types/assistant.types'
 import type {
   ChatConversationCompactionLike,
   ChatMessage,
@@ -140,8 +144,13 @@ export const estimateContextBreakdown = async ({
   allowedToolNames,
   enableToolDisclosure,
   toolPreferences,
+  toolServerPreferences,
   contextualInjections,
   toolCapabilityMode,
+  modePersonaPrompt,
+  modePersonaModuleId,
+  moduleChatModeId,
+  contextPolicy,
 }: {
   requestContextBuilder: RequestContextBuilder
   mcpManager: McpManager
@@ -155,8 +164,13 @@ export const estimateContextBreakdown = async ({
   allowedToolNames?: string[]
   enableToolDisclosure?: boolean
   toolPreferences?: Record<string, AssistantToolPreference>
+  toolServerPreferences?: Record<string, AssistantToolServerPreference>
   contextualInjections?: ContextualInjection[]
   toolCapabilityMode?: ToolCapabilityMode
+  modePersonaPrompt?: string
+  modePersonaModuleId?: string
+  moduleChatModeId?: string
+  contextPolicy?: ChatContextPolicy
 }): Promise<ContextBreakdown> => {
   const availableTools = enableTools
     ? await mcpManager.listAvailableTools({
@@ -174,9 +188,11 @@ export const estimateContextBreakdown = async ({
     availableTools,
     allowedToolNames,
     toolPreferences,
+    toolServerPreferences,
     apiType,
     enableToolDisclosure,
     jsSandboxSettings: mcpManager.getJsSandboxSettings(),
+    settings: mcpManager.getSettingsSnapshot(),
   })
 
   const runtimeModePrompt = buildToolCapabilityPrompt({
@@ -193,6 +209,10 @@ export const estimateContextBreakdown = async ({
     compaction,
     contextualInjections,
     runtimeModePrompt,
+    modePersonaPrompt,
+    modePersonaModuleId,
+    moduleChatModeId,
+    contextPolicy,
     requestTools,
     // Token breakdown only: reuse a frozen snapshot if present, never create one.
     systemPromptSnapshotMode: 'reuse',

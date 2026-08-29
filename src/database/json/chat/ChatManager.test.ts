@@ -30,7 +30,7 @@ const mockApp = {
   vault: mockVault,
 } as unknown as App
 
-const CHATS_DIR = 'YOLO/.yolo_json_db/chats'
+const CHATS_DIR = 'YOLO/data/chats'
 
 function createFakeFs(initial: Record<string, string>) {
   const files = new Map<string, string>(Object.entries(initial))
@@ -203,9 +203,58 @@ describe('ChatManager', () => {
       const result = await manager.listChats()
 
       expect(result[0].title).toBe('Cached title')
+      expect(result[0].origin).toBe('user')
       expect(adapter.read).not.toHaveBeenCalledWith(
         `${CHATS_DIR}/v1_${idA}.json`,
       )
+    })
+
+    test('persists an explicit conversation origin in the chat index', async () => {
+      const { app, files } = createFakeFs({})
+      const manager = new ChatManager(app)
+
+      const conversation = await manager.createChat({
+        id: idA,
+        title: 'External task',
+        origin: 'external-agent',
+      })
+      const result = await manager.listChats()
+
+      expect(conversation.origin).toBe('external-agent')
+      expect(result).toHaveLength(1)
+      expect(result[0]).toMatchObject({
+        id: idA,
+        origin: 'external-agent',
+      })
+      expect(
+        JSON.parse(files.get(`${CHATS_DIR}/chat_index.json`) as string),
+      ).toEqual([
+        expect.objectContaining({ id: idA, origin: 'external-agent' }),
+      ])
+    })
+
+    test('persists a YOLO-owned CLI binding in the stable history index', async () => {
+      const { app, files } = createFakeFs({})
+      const manager = new ChatManager(app)
+      const cliSession = {
+        runtimeId: 'codex' as const,
+        nativeSessionId: 'thread-1',
+        sessionPathHint: '/native/thread-1.jsonl',
+      }
+
+      await manager.createChat({
+        id: idA,
+        title: 'CLI conversation',
+        messages: [],
+        cliSession,
+      })
+
+      await expect(manager.listChats()).resolves.toEqual([
+        expect.objectContaining({ id: idA, cliSession }),
+      ])
+      expect(
+        JSON.parse(files.get(`${CHATS_DIR}/chat_index.json`) as string),
+      ).toEqual([expect.objectContaining({ id: idA, cliSession })])
     })
 
     test('surfaces a placeholder instead of rejecting on a corrupt file', async () => {
@@ -249,6 +298,47 @@ describe('ChatManager', () => {
       const result = await manager.listChats()
 
       expect(result.map((entry) => entry.id)).toEqual([idB, idA])
+    })
+  })
+
+  describe('updateChat write elision', () => {
+    const idA = '123e4567-e89b-12d3-a456-426614174000'
+
+    test('skips the write when the update changes nothing but updatedAt', async () => {
+      // A no-op write still marks the conversation file and the index dirty
+      // for whatever syncs the vault, so it must not reach the adapter.
+      const conversation = makeConversation(idA, 'Stable chat', 1000)
+      const { app, adapter } = createFakeFs({
+        [`${CHATS_DIR}/v1_${idA}.json`]: JSON.stringify(conversation),
+      })
+      const manager = new ChatManager(app)
+      adapter.write.mockClear()
+
+      const result = await manager.updateChat(idA, {
+        messages: conversation.messages,
+      })
+
+      expect(adapter.write).not.toHaveBeenCalled()
+      expect(result?.updatedAt).toBe(1000)
+    })
+
+    test('writes when the content actually changes', async () => {
+      const conversation = makeConversation(idA, 'Stable chat', 1000)
+      const { app, adapter } = createFakeFs({
+        [`${CHATS_DIR}/v1_${idA}.json`]: JSON.stringify(conversation),
+      })
+      const manager = new ChatManager(app)
+      adapter.write.mockClear()
+
+      const result = await manager.updateChat(idA, { title: 'Renamed chat' })
+
+      expect(result?.title).toBe('Renamed chat')
+      expect(adapter.write.mock.calls.map(([filePath]) => filePath)).toEqual(
+        expect.arrayContaining([
+          `${CHATS_DIR}/v1_${idA}.json`,
+          `${CHATS_DIR}/chat_index.json`,
+        ]),
+      )
     })
   })
 })

@@ -1,5 +1,4 @@
 import type { CSSProperties, ReactNode, RefObject } from 'react'
-import type { FollowOutput } from 'react-virtuoso'
 
 import type { ChatTimelineItem } from '../../types/chat-timeline'
 
@@ -7,27 +6,28 @@ import {
   ChatTimelineList,
   type ChatTimelineRenderContext,
   type ChatTimelineRenderVersion,
+  type UserMessageViewportState,
 } from './ChatTimelineList'
+import type { ScrollController } from './scroll/scrollController'
 
 type SharedConversationSurfaceProps<TItem extends ChatTimelineItem> = {
   items: TItem[]
   conversationId?: string
   scrollContainerRef: RefObject<HTMLElement>
   onScrollContainerChange?: (element: HTMLElement | null) => void
+  onBottomSentinelChange?: (element: HTMLElement | null) => void
+  scrollController?: ScrollController
   renderItem: (
     item: TItem,
     index: number,
     context?: ChatTimelineRenderContext,
   ) => ReactNode
   renderVersion?: ChatTimelineRenderVersion<TItem>
-  followOutput?: FollowOutput
-  onAtBottomStateChange?: (atBottom: boolean) => void
   virtualizationThreshold?: number
   forceRenderItemIds?: string[]
   overscanPx?: number
-  atBottomThreshold?: number
   onVirtualizationChange?: (isVirtualized: boolean) => void
-  onActiveUserMessageChange?: (messageId: string | null) => void
+  onUserMessageViewportChange?: (state: UserMessageViewportState) => void
   windowNavigationKey?: number
   windowNavigationTargetMessageId?: string | null
   onRenderStateChange?: (state: {
@@ -39,8 +39,8 @@ type SharedConversationSurfaceProps<TItem extends ChatTimelineItem> = {
   hasNewerMessages?: boolean
   onLoadEarlier?: () => void
   onLoadNewer?: () => void
-  loadEarlierLabel?: string
-  loadNewerLabel?: string
+  onGrowWindowToFillViewport?: () => void
+  historyWindowKey?: string
   scrollContainerClassName?: string
   scrollContainerStyle?: CSSProperties
   containerClassName?: string
@@ -56,16 +56,15 @@ export function SharedConversationSurface<TItem extends ChatTimelineItem>({
   conversationId,
   scrollContainerRef,
   onScrollContainerChange,
+  onBottomSentinelChange,
+  scrollController,
   renderItem,
   renderVersion,
-  followOutput,
-  onAtBottomStateChange,
   virtualizationThreshold,
   forceRenderItemIds,
   overscanPx,
-  atBottomThreshold,
   onVirtualizationChange,
-  onActiveUserMessageChange,
+  onUserMessageViewportChange,
   windowNavigationKey,
   windowNavigationTargetMessageId,
   onRenderStateChange,
@@ -73,8 +72,8 @@ export function SharedConversationSurface<TItem extends ChatTimelineItem>({
   hasNewerMessages,
   onLoadEarlier,
   onLoadNewer,
-  loadEarlierLabel,
-  loadNewerLabel,
+  onGrowWindowToFillViewport,
+  historyWindowKey,
   scrollContainerClassName,
   scrollContainerStyle,
   containerClassName,
@@ -90,16 +89,15 @@ export function SharedConversationSurface<TItem extends ChatTimelineItem>({
       conversationId={conversationId}
       scrollContainerRef={scrollContainerRef}
       onScrollContainerChange={onScrollContainerChange}
+      onBottomSentinelChange={onBottomSentinelChange}
+      scrollController={scrollController}
       renderItem={renderItem}
       renderVersion={renderVersion}
-      followOutput={followOutput}
-      onAtBottomStateChange={onAtBottomStateChange}
       virtualizationThreshold={virtualizationThreshold}
       forceRenderItemIds={forceRenderItemIds}
       overscanPx={overscanPx}
-      atBottomThreshold={atBottomThreshold}
       onVirtualizationChange={onVirtualizationChange}
-      onActiveUserMessageChange={onActiveUserMessageChange}
+      onUserMessageViewportChange={onUserMessageViewportChange}
       windowNavigationKey={windowNavigationKey}
       windowNavigationTargetMessageId={windowNavigationTargetMessageId}
       onRenderStateChange={onRenderStateChange}
@@ -107,8 +105,8 @@ export function SharedConversationSurface<TItem extends ChatTimelineItem>({
       hasNewerMessages={hasNewerMessages}
       onLoadEarlier={onLoadEarlier}
       onLoadNewer={onLoadNewer}
-      loadEarlierLabel={loadEarlierLabel}
-      loadNewerLabel={loadNewerLabel}
+      onGrowWindowToFillViewport={onGrowWindowToFillViewport}
+      historyWindowKey={historyWindowKey}
       scrollContainerClassName={scrollContainerClassName}
       scrollContainerStyle={scrollContainerStyle}
       bottomSpacerHeight={bottomSpacerHeight}

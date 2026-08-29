@@ -6,6 +6,7 @@ import { Platform } from 'obsidian'
 import { v4 as uuidv4 } from 'uuid'
 
 import {
+  AssistantToolApprovalMode,
   AssistantToolPreference,
   AssistantToolServerPreference,
   AssistantWorkspaceScope,
@@ -34,6 +35,7 @@ import { estimateJsonTokens } from '../../utils/llm/contextTokenEstimate'
 import { captureLLMDebugOperation } from '../llm/debugCapture'
 import {
   ASK_USER_QUESTION_TOOL_NAME,
+  BASH_TOOL_NAME,
   LOAD_TOOL_SCHEMAS_LOCAL_TOOL_NAME,
   TERMINAL_COMMAND_TOOL_NAME,
   getLocalFileToolServerName,
@@ -61,14 +63,11 @@ import {
   getAssistantToolDisclosureMode,
   isAssistantToolEnabled,
 } from './tool-preferences'
-import {
-  expandAllowedToolNames,
-  isLoadToolSchemasToolName,
-} from './tool-selection'
+import { isLoadToolSchemasToolName } from './tool-selection'
 import { GEMINI_STUB_ARGS_JSON_FIELD, isGeminiStubApiType } from './tool-stub'
-import type { AgentRunContext } from './types'
 import {
   buildAllowedSkillPathSet,
+  describePathDenial,
   findPathOutsideScope,
 } from './workspaceScope'
 
@@ -138,6 +137,8 @@ const validateLocalWriteArgs = ({
         errors.push(
           'Use exactly one edit locator: oldText, or startLine with endLine; do not combine them.',
         )
+      } else if (!hasOldText && !hasStartLine && !hasEndLine) {
+        errors.push('Missing edit locator.')
       } else if (!hasOldText) {
         requireIntegerField({ args, field: 'startLine', errors })
         requireIntegerField({ args, field: 'endLine', errors })
@@ -162,7 +163,7 @@ const getRequiredLocalWriteArgumentNames = (toolName: string): string[] => {
     case 'fs_write':
       return ['path', 'content']
     case 'fs_edit':
-      return ['path', 'newText', 'oldText or startLine/endLine']
+      return ['path', 'newText']
     case 'fs_delete':
     case 'fs_create_dir':
       return ['path']
@@ -221,6 +222,7 @@ const formatToolArgumentDiagnostics = ({
           ).sort()
         : []
   const requiredNames = requiredParameterNames ?? []
+  const isFsEdit = getLocalWriteToolShortName(request.name) === 'fs_edit'
   const repairSummary = repairActions?.length
     ? repairActions.join('; ')
     : diagnostics?.repairActions?.length
@@ -236,7 +238,12 @@ const formatToolArgumentDiagnostics = ({
       ? ['Validation errors:', ...validationErrors.map((error) => `- ${error}`)]
       : []),
     `Provided parameter names: ${providedNames.length > 0 ? providedNames.join(', ') : '<none>'}.`,
-    `Required parameter names: ${requiredNames.length > 0 ? requiredNames.join(', ') : '<unknown>'}.`,
+    `${isFsEdit ? 'Always required parameter names' : 'Required parameter names'}: ${requiredNames.length > 0 ? requiredNames.join(', ') : '<unknown>'}.`,
+    ...(isFsEdit
+      ? [
+          'Edit locator requirement: provide exactly one of oldText, or startLine together with endLine.',
+        ]
+      : []),
     `Raw args length: ${rawArgsLength}.`,
     `Raw args head: ${rawArgsHead}`,
     `finishReason: ${diagnostics?.finishReason ?? '<unknown>'}.`,
@@ -250,6 +257,17 @@ export class AgentToolGateway {
   private readonly toolsEnabled: boolean
   private readonly allowedToolNames?: Set<string>
   private readonly toolPreferences?: Record<string, AssistantToolPreference>
+  /**
+   * Per-capability enabled/approval state for built-in tools (D9,
+   * docs/plans/2026-08-15-tool-registry/phase2-migration.md D9). Sibling to
+   * `toolPreferences`, which since that migration only carries remote MCP
+   * tool state — every call below that resolves a *built-in* tool's approval
+   * mode or enablement must pass both.
+   */
+  private readonly builtinCapabilityPreferences?: Record<
+    string,
+    AssistantToolPreference
+  >
   private readonly toolServerPreferences?: Record<
     string,
     AssistantToolServerPreference
@@ -258,12 +276,13 @@ export class AgentToolGateway {
   private readonly workspaceScope?: AssistantWorkspaceScope
   private readonly allowedSkillPaths?: readonly string[]
   private readonly apiType?: LLMProviderApiType | null
-  private readonly runContext?: AgentRunContext
   private readonly subagentParentContext?: SubagentParentContext
   private readonly isSubagentChildRun: boolean
   private readonly toolApprovalConversationId?: string
   private readonly blockedCommandPrefixes: readonly string[] | null
   private readonly bypassToolApproval: boolean
+  private readonly bashReadOnly: boolean
+  private readonly moduleToolApprovalPolicies?: ReadonlyMap<string, boolean>
   private readonly ajv: AjvInstance
   private readonly schemaValidatorCache = new Map<
     string,
@@ -280,35 +299,42 @@ export class AgentToolGateway {
       toolsEnabled?: boolean
       allowedToolNames?: string[]
       toolPreferences?: Record<string, AssistantToolPreference>
+      builtinCapabilityPreferences?: Record<string, AssistantToolPreference>
       toolServerPreferences?: Record<string, AssistantToolServerPreference>
       enableToolDisclosure?: boolean
       workspaceScope?: AssistantWorkspaceScope
       allowedSkillPaths?: string[]
       apiType?: LLMProviderApiType | null
-      runContext?: AgentRunContext
       subagentParentContext?: SubagentParentContext
       isSubagentChildRun?: boolean
       toolApprovalConversationId?: string
       blockedCommandPrefixes?: string[]
       bypassToolApproval?: boolean
+      bashReadOnly?: boolean
+      moduleToolApprovalPolicies?: ReadonlyMap<string, boolean>
     },
   ) {
     this.toolsEnabled = options?.toolsEnabled ?? true
+    // Post-D9, `allowedToolNames` is always already a fully-expanded list of
+    // real tool FQNs (see `tool-selection.ts`'s `selectAllowedTools` for the
+    // same reasoning) — no virtual group name expansion needed here.
     this.allowedToolNames = options?.allowedToolNames
-      ? expandAllowedToolNames(options.allowedToolNames)
+      ? new Set(options.allowedToolNames)
       : undefined
     this.toolPreferences = options?.toolPreferences
+    this.builtinCapabilityPreferences = options?.builtinCapabilityPreferences
     this.toolServerPreferences = options?.toolServerPreferences
     this.enableToolDisclosure = options?.enableToolDisclosure ?? true
     this.workspaceScope = options?.workspaceScope
     this.allowedSkillPaths = options?.allowedSkillPaths
     this.apiType = options?.apiType
-    this.runContext = options?.runContext
     this.subagentParentContext = options?.subagentParentContext
     this.isSubagentChildRun = options?.isSubagentChildRun ?? false
     this.toolApprovalConversationId = options?.toolApprovalConversationId
     this.blockedCommandPrefixes = options?.blockedCommandPrefixes ?? null
     this.bypassToolApproval = options?.bypassToolApproval ?? false
+    this.bashReadOnly = options?.bashReadOnly ?? false
+    this.moduleToolApprovalPolicies = options?.moduleToolApprovalPolicies
     // `strict: false` keeps ajv tolerant of MCP tool schemas that include
     // vendor-specific keywords or non-canonical types. `allErrors` lists every
     // violation in the error message so the model has enough signal to retry;
@@ -320,6 +346,9 @@ export class AgentToolGateway {
   private async getServerToolTokenBudgets(): Promise<
     ReadonlyMap<string, number>
   > {
+    if (!this.enableToolDisclosure) {
+      return new Map()
+    }
     if (this.serverToolTokenBudgets) {
       return this.serverToolTokenBudgets
     }
@@ -337,6 +366,13 @@ export class AgentToolGateway {
           try {
             serverName = parseToolName(tool.name).serverName
           } catch {
+            continue
+          }
+          if (
+            serverName === getLocalFileToolServerName() ||
+            this.toolServerPreferences?.[serverName]?.disclosureMode !==
+              undefined
+          ) {
             continue
           }
           const bucket = serverToolsMap.get(serverName) ?? []
@@ -374,6 +410,7 @@ export class AgentToolGateway {
       getAssistantToolDisclosureMode(
         {
           toolPreferences: this.toolPreferences,
+          toolServerPreferences: this.toolServerPreferences,
           enabledToolNames: this.allowedToolNames
             ? [...this.allowedToolNames]
             : undefined,
@@ -689,6 +726,49 @@ export class AgentToolGateway {
     })
   }
 
+  /**
+   * Fixes the module chat mode approval/execution snapshot onto a tool call
+   * request at creation time — see `ToolCallRequest.metadata.approvalPolicy`
+   * / `.executionConstraints`. A no-op (returns `request` unchanged) for
+   * every non-module-chat-mode run, since `moduleToolApprovalPolicies` is
+   * only ever set by `resolveModuleChatModeRuntime`.
+   *
+   * `approvalPolicy` is written only for tools the mode itself declared
+   * (i.e. present as a key in `moduleToolApprovalPolicies`) — host tools
+   * granted via the mode's capability tier (bash, fs_edit, ...) are not in
+   * that map and keep following the normal approval resolution.
+   * `executionConstraints.bashReadOnly` is written for every bash-identity
+   * call in a module chat mode run, regardless of whether it's a mode tool.
+   */
+  private attachModuleChatModeSnapshot(
+    request: ToolCallRequest,
+  ): ToolCallRequest {
+    if (!this.moduleToolApprovalPolicies) {
+      return request
+    }
+    const requiresApproval = this.moduleToolApprovalPolicies.get(request.name)
+    const approvalPolicy: 'auto' | 'always-require-user' | undefined =
+      requiresApproval === undefined
+        ? undefined
+        : requiresApproval
+          ? 'always-require-user'
+          : 'auto'
+    const executionConstraints = this.isBashToolCall(request.name)
+      ? { bashReadOnly: this.bashReadOnly }
+      : undefined
+    if (approvalPolicy === undefined && executionConstraints === undefined) {
+      return request
+    }
+    return {
+      ...request,
+      metadata: {
+        ...request.metadata,
+        ...(approvalPolicy !== undefined ? { approvalPolicy } : {}),
+        ...(executionConstraints !== undefined ? { executionConstraints } : {}),
+      },
+    }
+  }
+
   createToolMessage({
     toolCallRequests,
     conversationId,
@@ -705,7 +785,9 @@ export class AgentToolGateway {
     branchLabel?: string
   }): ChatToolMessage {
     const preparedRequests = toolCallRequests.map((request) =>
-      this.prepareFinalToolCallRequest(request),
+      this.prepareFinalToolCallRequest(
+        this.attachModuleChatModeSnapshot(request),
+      ),
     )
     const normalizedToolCallRequests = preparedRequests.map(
       (prepared) => prepared.request,
@@ -789,7 +871,7 @@ export class AgentToolGateway {
     if (pathOutsideScope !== null) {
       return {
         status: ToolCallResponseStatus.Rejected,
-        reason: `Path "${pathOutsideScope}" is outside this agent's workspace scope. Do not attempt to bypass this restriction. If the task requires this path, tell the user that it is outside the configured workspace scope.`,
+        reason: `${describePathDenial('out-of-scope', pathOutsideScope)} Do not attempt to bypass this restriction. If the task requires this path, tell the user that it is outside the configured workspace scope.`,
       }
     }
 
@@ -825,6 +907,20 @@ export class AgentToolGateway {
         }
       }
       return { status: ToolCallResponseStatus.AwaitingUserInput }
+    }
+
+    // Module chat mode tools carry a persisted approval policy fixed at
+    // creation time (see `attachModuleChatModeSnapshot`). It fully replaces
+    // the normal approval resolution below — in particular it is NOT
+    // affected by `bypassToolApproval` (YOLO) or the mcpManager "always
+    // allow this conversation" list, which only `shouldAutoExecuteTool`
+    // consults. This is what makes `requiresApproval: true` an unconditional
+    // per-call confirmation gate.
+    const approvalPolicy = request.metadata?.approvalPolicy
+    if (approvalPolicy !== undefined) {
+      return approvalPolicy === 'auto'
+        ? { status: ToolCallResponseStatus.Running }
+        : { status: ToolCallResponseStatus.PendingApproval }
     }
 
     if (this.shouldAutoExecuteTool({ request, conversationId })) {
@@ -970,8 +1066,13 @@ export class AgentToolGateway {
           debugTraceId,
           workspaceScope: this.workspaceScope,
           allowedSkillPaths: this.allowedSkillPaths,
-          runContext: this.runContext,
           subagentParentContext: this.subagentParentContext,
+          bashApprovalMode: this.isBashToolCall(entry.toolCall.request.name)
+            ? this.resolveApprovalMode(entry.toolCall.request.name)
+            : undefined,
+          bashReadOnly: this.isBashToolCall(entry.toolCall.request.name)
+            ? this.bashReadOnly
+            : undefined,
         }).then((response) => ({ entries: [entry], responses: [response] })),
       )
     }
@@ -1009,7 +1110,6 @@ export class AgentToolGateway {
             debugTraceId,
             workspaceScope: this.workspaceScope,
             allowedSkillPaths: this.allowedSkillPaths,
-            runContext: this.runContext,
             subagentParentContext: this.subagentParentContext,
           }).then((response) => ({ entries: [entry], responses: [response] })),
         )
@@ -1040,7 +1140,6 @@ export class AgentToolGateway {
           debugTraceId,
           workspaceScope: this.workspaceScope,
           allowedSkillPaths: this.allowedSkillPaths,
-          runContext: this.runContext,
           subagentParentContext: this.subagentParentContext,
         }).then((response) => ({
           entries,
@@ -1164,7 +1263,6 @@ export class AgentToolGateway {
             debugTraceId,
             workspaceScope: this.workspaceScope,
             allowedSkillPaths: this.allowedSkillPaths,
-            runContext: this.runContext,
             subagentParentContext: this.subagentParentContext,
           }),
         )
@@ -1410,8 +1508,8 @@ export class AgentToolGateway {
         data: {
           type: 'text',
           text:
-            `Applied ${count} operation${plural} to ${path} as part of a batched fs_edit. ` +
-            `The first fs_edit call in this batch carries the unified diff.`,
+            `Processed ${count} operation${plural} for ${path} as part of a batched fs_edit. ` +
+            `The first fs_edit call carries the unified review outcome; do not assume this operation was accepted independently.`,
         },
       }
     })
@@ -1435,6 +1533,38 @@ export class AgentToolGateway {
     return this.mcpManager.abortToolCall(id)
   }
 
+  /**
+   * The bash tool's effective approval tier for this run. `bypassToolApproval`
+   * (the conversation-wide YOLO switch) always wins over the per-tool
+   * setting, same as every other tool.
+   */
+  private resolveApprovalMode(toolName: string): AssistantToolApprovalMode {
+    if (this.bypassToolApproval) return 'full_access'
+    return getAssistantToolApprovalMode(
+      {
+        toolPreferences: this.toolPreferences,
+        builtinCapabilityPreferences: this.builtinCapabilityPreferences,
+        toolServerPreferences: this.toolServerPreferences,
+        enabledToolNames: this.allowedToolNames
+          ? [...this.allowedToolNames]
+          : undefined,
+      },
+      toolName,
+    )
+  }
+
+  private isBashToolCall(toolName: string): boolean {
+    try {
+      const parsed = parseToolName(toolName)
+      return (
+        parsed.serverName === getLocalFileToolServerName() &&
+        parsed.toolName === BASH_TOOL_NAME
+      )
+    } catch {
+      return false
+    }
+  }
+
   private shouldAutoExecuteTool({
     request,
     conversationId,
@@ -1450,28 +1580,14 @@ export class AgentToolGateway {
       return false
     }
 
-    if (this.bypassToolApproval) {
-      return this.mcpManager.isToolExecutionAllowed({
-        requestToolName: request.name,
-        conversationId: this.toolApprovalConversationId ?? conversationId,
-        requestArgs,
-        requireAutoExecution: true,
-      })
-    }
-
-    const approvalMode = getAssistantToolApprovalMode(
-      {
-        toolPreferences: this.toolPreferences,
-        toolServerPreferences: this.toolServerPreferences,
-        enabledToolNames: this.allowedToolNames
-          ? [...this.allowedToolNames]
-          : undefined,
-      },
-      request.name,
-    )
+    const approvalMode = this.resolveApprovalMode(request.name)
     const requireAutoExecution =
       approvalMode === 'full_access' ||
-      this.isReadonlyTerminalCommandToolCall(requestArgs, request.name)
+      this.isReadonlyTerminalCommandToolCall(requestArgs, request.name) ||
+      // 'dangerous_only' never pauses the whole bash call up front — only
+      // rm/mv pause, mid-script, via the dangerous-operation gate inside the
+      // dispatch itself (see localFileTools.ts's bash case).
+      (approvalMode === 'dangerous_only' && this.isBashToolCall(request.name))
 
     return this.mcpManager.isToolExecutionAllowed({
       requestToolName: request.name,
@@ -1548,6 +1664,7 @@ export class AgentToolGateway {
         getAssistantToolApprovalMode(
           {
             toolPreferences: this.toolPreferences,
+            builtinCapabilityPreferences: this.builtinCapabilityPreferences,
             toolServerPreferences: this.toolServerPreferences,
             enabledToolNames: this.allowedToolNames
               ? [...this.allowedToolNames]
@@ -1582,9 +1699,28 @@ export class AgentToolGateway {
       return false
     }
 
+    if (!this.toolPreferences && !this.builtinCapabilityPreferences) {
+      // Non-Agent modes (`resolveChatModeRuntime`) deliberately supply no
+      // preference maps, so `allowedToolNames` — already derived from the
+      // assistant's enabled capabilities before the run started, minus
+      // `CHAT_BLOCKED_TOOL_NAMES` — is the only authoritative source, and
+      // the membership test above has already consulted it.
+      //
+      // Re-deriving enablement below would resolve every built-in against
+      // its capability's `defaultEnabled` instead of the grant it just
+      // passed, because `isAssistantToolEnabled` routes recognized built-in
+      // short names through `builtinCapabilityPreferences` and ignores
+      // `enabledToolNames` entirely (D9). That silently rejects every call
+      // to an enabled-but-default-off capability (`js_sandbox`, both
+      // context tools, `subagent_delegation`) in Ask / Quick Ask, while
+      // `selectAllowedTools` still advertises it to the model.
+      return true
+    }
+
     return isAssistantToolEnabled(
       {
         toolPreferences: this.toolPreferences,
+        builtinCapabilityPreferences: this.builtinCapabilityPreferences,
         enabledToolNames: [...this.allowedToolNames],
       },
       toolName,

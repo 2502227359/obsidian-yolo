@@ -1,4 +1,8 @@
-import type { AssistantToolPreference } from '../../types/assistant.types'
+import type { ChatContextPolicy } from '../../components/chat-view/chat-runtime-profiles'
+import type {
+  AssistantToolPreference,
+  AssistantToolServerPreference,
+} from '../../types/assistant.types'
 import type {
   ChatConversationCompactionLike,
   ChatMessage,
@@ -29,8 +33,13 @@ export const estimateContinuationRequestContextTokens = async ({
   allowedToolNames,
   enableToolDisclosure,
   toolPreferences,
+  toolServerPreferences,
   contextualInjections,
   toolCapabilityMode,
+  modePersonaPrompt,
+  modePersonaModuleId,
+  moduleChatModeId,
+  contextPolicy,
 }: {
   requestContextBuilder: RequestContextBuilder
   mcpManager: McpManager
@@ -44,8 +53,13 @@ export const estimateContinuationRequestContextTokens = async ({
   allowedToolNames?: string[]
   enableToolDisclosure?: boolean
   toolPreferences?: Record<string, AssistantToolPreference>
+  toolServerPreferences?: Record<string, AssistantToolServerPreference>
   contextualInjections?: ContextualInjection[]
   toolCapabilityMode?: ToolCapabilityMode
+  modePersonaPrompt?: string
+  modePersonaModuleId?: string
+  moduleChatModeId?: string
+  contextPolicy?: ChatContextPolicy
 }): Promise<number> => {
   const availableTools = enableTools
     ? await mcpManager.listAvailableTools({
@@ -65,9 +79,11 @@ export const estimateContinuationRequestContextTokens = async ({
     availableTools,
     allowedToolNames,
     toolPreferences,
+    toolServerPreferences,
     apiType,
     enableToolDisclosure,
     jsSandboxSettings: mcpManager.getJsSandboxSettings(),
+    settings: mcpManager.getSettingsSnapshot(),
   })
 
   const runtimeModePrompt = buildToolCapabilityPrompt({
@@ -84,6 +100,10 @@ export const estimateContinuationRequestContextTokens = async ({
     compaction,
     contextualInjections,
     runtimeModePrompt,
+    modePersonaPrompt,
+    modePersonaModuleId,
+    moduleChatModeId,
+    contextPolicy,
     // Token estimate only: never create/freeze the snapshot ahead of the real request.
     systemPromptSnapshotMode: 'reuse',
   })

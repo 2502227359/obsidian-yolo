@@ -1,8 +1,16 @@
 import { App, Keymap, MarkdownRenderer, finishRenderMath } from 'obsidian'
-import { memo, useCallback, useEffect, useRef } from 'react'
+import {
+  type ReactNode,
+  memo,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from 'react'
 
 import { useApp } from '../../contexts/app-context'
 import { useChatView } from '../../contexts/chat-view-context'
+import { useLanguage } from '../../contexts/language-context'
 import { CitationSource } from '../../core/agent/citationRegistry'
 import { openMarkdownFile, openPdfFileAtPage } from '../../utils/obsidian'
 
@@ -11,12 +19,13 @@ import {
   copySelectedLatex,
   syncRenderedLatexSelection,
 } from './latex-copy'
+import { setupMermaidViewers } from './MermaidViewer'
 
 type ObsidianMarkdownProps = {
   content: string
   scale?: 'xs' | 'sm' | 'base'
-  animateIncrementalText?: boolean
   citationSources?: CitationSource[]
+  initialFallback?: ReactNode
 }
 
 // Strict scheme match so we don't collide with web-search citation URLs like
@@ -96,71 +105,6 @@ function yieldToBrowser(): Promise<void> {
   })
 }
 
-function getAppendedTextLength(
-  previousContent: string,
-  nextContent: string,
-): number {
-  if (!previousContent || nextContent.length <= previousContent.length) {
-    return 0
-  }
-
-  return nextContent.startsWith(previousContent)
-    ? nextContent.length - previousContent.length
-    : 0
-}
-
-function highlightTrailingFreshText(
-  containerEl: HTMLElement,
-  appendedTextLength: number,
-) {
-  if (appendedTextLength <= 0) {
-    return
-  }
-
-  const textNodes: Text[] = []
-  const walker = (containerEl.ownerDocument ?? document).createTreeWalker(
-    containerEl,
-    NodeFilter.SHOW_TEXT,
-  )
-  let currentNode = walker.nextNode()
-
-  while (currentNode) {
-    if (currentNode instanceof Text && currentNode.textContent) {
-      textNodes.push(currentNode)
-    }
-    currentNode = walker.nextNode()
-  }
-
-  let remainingLength = appendedTextLength
-  for (
-    let index = textNodes.length - 1;
-    index >= 0 && remainingLength > 0;
-    index--
-  ) {
-    const textNode = textNodes[index]
-    const textContent = textNode.textContent ?? ''
-    if (!textContent) {
-      continue
-    }
-
-    const wrapLength = Math.min(remainingLength, textContent.length)
-    const wrapStartIndex = textContent.length - wrapLength
-    const trailingNode =
-      wrapStartIndex > 0 ? textNode.splitText(wrapStartIndex) : textNode
-    const trailingParent = trailingNode.parentNode
-    if (!trailingParent) {
-      remainingLength -= wrapLength
-      continue
-    }
-
-    const freshTextSpan = document.createElement('span')
-    freshTextSpan.className = 'yolo-stream-fresh-text'
-    trailingParent.replaceChild(freshTextSpan, trailingNode)
-    freshTextSpan.appendChild(trailingNode)
-    remainingLength -= wrapLength
-  }
-}
-
 /**
  * Renders Obsidian Markdown content using the Obsidian MarkdownRenderer.
  *
@@ -171,16 +115,20 @@ function highlightTrailingFreshText(
 const ObsidianMarkdown = memo(function ObsidianMarkdown({
   content,
   scale = 'base',
-  animateIncrementalText = false,
   citationSources,
+  initialFallback,
 }: ObsidianMarkdownProps) {
   const app = useApp()
   const chatView = useChatView()
+  const { t } = useLanguage()
   const containerRef = useRef<HTMLDivElement>(null)
-  const previousContentRef = useRef('')
   const renderTokenRef = useRef(0)
   const citationSourcesRef = useRef(citationSources)
   citationSourcesRef.current = citationSources
+  const hasInitialFallback = initialFallback !== undefined
+  const [initialRenderComplete, setInitialRenderComplete] = useState(
+    () => !hasInitialFallback,
+  )
 
   const renderMarkdown = useCallback(async () => {
     const containerEl = containerRef.current
@@ -189,17 +137,13 @@ const ObsidianMarkdown = memo(function ObsidianMarkdown({
     }
 
     const renderContent = content
-    const appendedTextLength = animateIncrementalText
-      ? getAppendedTextLength(previousContentRef.current, renderContent)
-      : 0
-
     const renderToken = ++renderTokenRef.current
     const sourcePath = app.workspace.getActiveFile()?.path ?? ''
-    // Two-phase render kicks in for static messages with LaTeX. Streaming
-    // messages re-render very frequently and don't benefit from a fast first
-    // pass — they go straight to single-pass real rendering.
-    const useTwoPhase =
-      !animateIncrementalText && LATEX_DELIMITER_PATTERN.test(renderContent)
+    // Two-phase render kicks in for messages with LaTeX. Streaming never lands
+    // here — TransitioningMarkdown keeps it on StreamingMarkdown until the
+    // buffer drains — so this component only ever renders settled content.
+    const hasLatex = LATEX_DELIMITER_PATTERN.test(renderContent)
+    const useTwoPhase = !hasInitialFallback && hasLatex
 
     const swapInto = (
       staging: HTMLDivElement,
@@ -271,28 +215,46 @@ const ObsidianMarkdown = memo(function ObsidianMarkdown({
     }
 
     swapInto(staging, true)
-    highlightTrailingFreshText(containerRef.current, appendedTextLength)
-
-    previousContentRef.current = renderContent
 
     // Flush MathJax stylesheet so queued LaTeX renders to its final size.
     // Without this, math elements can stay collapsed and the row's first
     // measured height (e.g. 68px for a long bubble) gets persisted into the
     // height cache, poisoning future scroll-space estimates.
     //
-    // Gated on `useTwoPhase`: messages without LaTeX have nothing of ours
+    // Gated on `hasLatex`: messages without LaTeX have nothing of ours
     // queued, so flushing is pointless — and Obsidian's `finishRenderMath`
     // touches its MathJax bundle without checking whether it's been
     // lazy-loaded yet, throwing `MathJax is not defined` when called before
     // any math has rendered (common right after plugin/app startup).
-    if (useTwoPhase) {
+    if (hasLatex) {
       await finishRenderMath()
     }
-  }, [animateIncrementalText, app, content, chatView])
+
+    if (
+      hasInitialFallback &&
+      renderToken === renderTokenRef.current &&
+      containerRef.current
+    ) {
+      setInitialRenderComplete(true)
+    }
+  }, [app, chatView, content, hasInitialFallback, t])
 
   useEffect(() => {
     void renderMarkdown()
   }, [renderMarkdown])
+
+  useEffect(() => {
+    const containerEl = containerRef.current
+    if (!containerEl) {
+      return
+    }
+
+    return setupMermaidViewers(
+      app,
+      containerEl,
+      t('chat.mermaidControls.open', 'Open diagram viewer'),
+    )
+  }, [app, t])
 
   // Re-bind citation handlers when sources arrive after the initial render
   // (sources are appended to metadata only once the stream completes, so the
@@ -325,11 +287,30 @@ const ObsidianMarkdown = memo(function ObsidianMarkdown({
     }
   }, [])
 
-  return (
+  const renderedMarkdown = (
     <div
       ref={containerRef}
-      className={`markdown-rendered yolo-markdown-rendered yolo-scale-${scale}`}
+      className={`markdown-rendered yolo-markdown-rendered yolo-scale-${scale}${hasInitialFallback ? ' yolo-markdown-handoff-final' : ''}`}
+      aria-hidden={hasInitialFallback && !initialRenderComplete}
     />
+  )
+
+  if (!hasInitialFallback) {
+    return renderedMarkdown
+  }
+
+  return (
+    <div
+      className={`yolo-markdown-handoff ${initialRenderComplete ? 'is-complete' : 'is-pending'}`}
+    >
+      <div
+        className="yolo-markdown-handoff-fallback"
+        aria-hidden={initialRenderComplete}
+      >
+        {initialFallback}
+      </div>
+      {renderedMarkdown}
+    </div>
   )
 })
 
@@ -417,19 +398,16 @@ function ObsidianCodeBlock({
   content,
   language,
   scale = 'sm',
-  animateIncrementalText = false,
 }: {
   content: string
   language?: string
   scale?: 'xs' | 'sm' | 'base'
-  animateIncrementalText?: boolean
 }) {
   return (
     <div className="yolo-obsidian-code-block">
       <ObsidianMarkdown
         content={`\`\`\`${language ?? ''}\n${content}\n\`\`\``}
         scale={scale}
-        animateIncrementalText={animateIncrementalText}
       />
     </div>
   )

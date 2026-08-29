@@ -11,7 +11,7 @@ import {
   ProviderPickerCategory,
 } from '../../../constants/provider-catalog'
 import { useLanguage } from '../../../contexts/language-context'
-import YoloPlugin from '../../../main'
+import type YoloPlugin from '../../../main'
 import {
   LLMProviderPresetType,
   getDefaultApiTypeForPresetType,
@@ -203,7 +203,7 @@ function ProviderPickerComponent({
                   <span className="yolo-pp-badge yolo-pp-badge--mute">
                     {t(
                       'settings.providers.pickerCustomDesc',
-                      'Manually enter base URL and API key',
+                      'Base URL + API key',
                     )}
                   </span>
                 </div>
@@ -248,6 +248,11 @@ function ProviderPickerComponent({
                             'Native protocol',
                           )}
                     </span>
+                    {catalog.sponsor && (
+                      <span className="yolo-pp-badge yolo-pp-badge--rose">
+                        {t('settings.providers.badgeSponsor', 'Sponsor')}
+                      </span>
+                    )}
                     {catalog.oauth && (
                       <span className="yolo-pp-badge yolo-pp-badge--teal">
                         {t('settings.providers.badgeOAuth', 'OAuth')}

@@ -14,7 +14,16 @@ vendor/
 # They should be uploaded to GitHub releases instead.
 main.js
 meta.json
-main.css
+worker-meta.json
+styles.css
+
+# Runtime component assets (e.g. embedding-engine's onnxruntime-web wasm
+# binaries) are large, reproducible build outputs copied from node_modules —
+# never commit them. `dist/entry.js` and `registry.json` (which records each
+# asset's byteSize/sha256) stay tracked; distribution mirrors/uploads the
+# actual bytes at release time. See scripts/build-runtime-components.mjs and
+# scripts/distribution.mjs.
+runtime-components/*/dist/assets/
 
 # Exclude sourcemaps
 *.map
@@ -25,7 +34,6 @@ data.json
 # Exclude macOS Finder (System Explorer) View States
 .DS_Store
 CLAUDE.local.md
-AGENTS.md
 temporary
 TODO.md
 

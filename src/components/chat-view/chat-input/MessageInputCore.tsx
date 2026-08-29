@@ -57,6 +57,10 @@ import { fileToMentionableTextAttachment } from '../../../utils/llm/text-attachm
 import { ChatMode } from './ChatModeSelect'
 import LexicalContentEditable from './LexicalContentEditable'
 import {
+  setLexicalStateFromExternalState,
+  updateLexicalFromExternalState,
+} from './lexicalExternalState'
+import {
   $createMentionNode,
   $isMentionNode,
   MentionNode,
@@ -72,7 +76,9 @@ import { classifyUploadFiles } from './utils/file-upload'
 
 export type MessageInputCoreRef = {
   focus: () => void
+  focusEnd: () => void
   insertText: (text: string) => void
+  insertSkill: (skill: ChatSelectedSkill) => void
   appendText: (text: string) => void
   replaceText: (text: string) => void
   submit: () => void
@@ -107,6 +113,7 @@ export type MessageInputCoreProps = {
 
   enableAttachments?: boolean
   currentModel?: ChatModel | null
+  skipImageModelCapabilityCheck?: boolean
 
   mentionMenuMode?: 'direct-search' | 'entry'
   assistants?: Assistant[]
@@ -120,6 +127,7 @@ export type MessageInputCoreProps = {
   snippets?: SnippetEntry[]
   onCreateSnippetsFile?: () => void
   onRunSlashCommand?: (command: SlashCommand) => void
+  nativeSlashCommands?: SlashCommand[]
   onMentionMenuToggle?: (isOpen: boolean) => void
   mentionMenuPlacement?: 'top' | 'bottom'
   mentionMenuContainerRef?: RefObject<HTMLElement>
@@ -163,6 +171,7 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
 
       enableAttachments = true,
       currentModel = null,
+      skipImageModelCapabilityCheck = false,
 
       mentionMenuMode,
       assistants,
@@ -176,6 +185,7 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
       snippets,
       onCreateSnippetsFile,
       onRunSlashCommand,
+      nativeSlashCommands,
       onMentionMenuToggle,
       mentionMenuPlacement,
       mentionMenuContainerRef,
@@ -194,6 +204,25 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
         columns: t('common.columns', 'columns'),
       }),
       [t],
+    )
+    const getInlineMentionName = useCallback(
+      (mentionable: Mentionable, assistantQuoteNumber?: number) => {
+        if (
+          (mentionable.type === 'assistant-quote' ||
+            (mentionable.type === 'block' &&
+              mentionable.annotationNumber !== undefined)) &&
+          assistantQuoteNumber !== undefined
+        ) {
+          return t('chat.assistantQuote.inputLabel', '批注{index}').replace(
+            '{index}',
+            String(assistantQuoteNumber),
+          )
+        }
+        return getMentionableName(mentionable, {
+          unitLabels: mentionableUnitLabels,
+        })
+      },
+      [mentionableUnitLabels, t],
     )
 
     const editorRef = useRef<LexicalEditor | null>(null)
@@ -263,6 +292,7 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
       (mentionableImages: MentionableImage[]) => {
         if (
           mentionableImages.length > 0 &&
+          !skipImageModelCapabilityCheck &&
           !chatModelSupportsVision(currentModel)
         ) {
           const modelLabel =
@@ -319,7 +349,14 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
         }
         setMentionables([...mentionables, ...newMentionableImages])
       },
-      [currentModel, mentionableUnitLabels, mentionables, setMentionables, t],
+      [
+        currentModel,
+        mentionableUnitLabels,
+        mentionables,
+        setMentionables,
+        skipImageModelCapabilityCheck,
+        t,
+      ],
     )
 
     const handleCreatePdfMentionables = useCallback(
@@ -633,6 +670,12 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
         focus: () => {
           contentEditableRef.current?.focus()
         },
+        focusEnd: () => {
+          const editor = editorRef.current
+          if (!editor) return
+          contentEditableRef.current?.focus()
+          editor.update(() => $getRoot().selectEnd(), { discrete: true })
+        },
         insertText: (text: string) => {
           if (!editorRef.current) return
 
@@ -655,6 +698,30 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
           )
 
           // Focus the editor after inserting
+          contentEditableRef.current?.focus()
+        },
+        insertSkill: (skill: ChatSelectedSkill) => {
+          if (!editorRef.current) return
+
+          editorRef.current.update(
+            () => {
+              const skillNode = $createSkillNode(skill.name, skill)
+              const spacer = $createTextNode(' ')
+              const selection = $getSelection()
+              if ($isRangeSelection(selection)) {
+                selection.insertNodes([skillNode, spacer])
+              } else {
+                const root = $getRoot()
+                root.selectEnd()
+                const newSelection = $getSelection()
+                if ($isRangeSelection(newSelection)) {
+                  newSelection.insertNodes([skillNode, spacer])
+                }
+              }
+            },
+            { discrete: true },
+          )
+
           contentEditableRef.current?.focus()
         },
         appendText: (text: string) => {
@@ -871,13 +938,41 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
 
       const mirrorTypes =
         mentionDisplayMode === 'inline' ? INLINE_MENTIONABLE_TYPES : []
-      const mentionablesToMirror = inlineMentionables.filter((m) =>
-        mirrorTypes.includes(m.type),
+      const reservedAssistantQuoteNumbers = new Set(
+        inlineMentionables.flatMap((mentionable) =>
+          (mentionable.type === 'assistant-quote' ||
+            mentionable.type === 'block') &&
+          mentionable.annotationNumber !== undefined
+            ? [mentionable.annotationNumber]
+            : [],
+        ),
       )
-      const mentionablesByKey = new Map(
-        mentionablesToMirror.map((mentionable) => [
-          getMentionableKey(serializeMentionable(mentionable)),
+      let fallbackAssistantQuoteNumber = 0
+      const getFallbackAssistantQuoteNumber = () => {
+        do {
+          fallbackAssistantQuoteNumber += 1
+        } while (
+          reservedAssistantQuoteNumbers.has(fallbackAssistantQuoteNumber)
+        )
+        reservedAssistantQuoteNumbers.add(fallbackAssistantQuoteNumber)
+        return fallbackAssistantQuoteNumber
+      }
+      const mentionablesToMirror = inlineMentionables
+        .filter((mentionable) => mirrorTypes.includes(mentionable.type))
+        .map((mentionable) => ({
           mentionable,
+          assistantQuoteNumber:
+            mentionable.type === 'assistant-quote'
+              ? (mentionable.annotationNumber ??
+                getFallbackAssistantQuoteNumber())
+              : mentionable.type === 'block'
+                ? mentionable.annotationNumber
+                : undefined,
+        }))
+      const mentionablesByKey = new Map(
+        mentionablesToMirror.map((entry) => [
+          getMentionableKey(serializeMentionable(entry.mentionable)),
+          entry,
         ]),
       )
 
@@ -885,14 +980,14 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
         contentEditableRef.current ===
         (contentEditableRef.current?.ownerDocument ?? document).activeElement
 
-      editor.update(() => {
+      updateLexicalFromExternalState(editor, contentEditableRef.current, () => {
         const mirrorTypeSet = new Set(INLINE_MENTIONABLE_TYPES)
         $nodesOfType(MentionNode).forEach((node) => {
           const mentionable = node.getMentionable()
           if (!mirrorTypeSet.has(mentionable.type)) return
           const mentionableKey = getMentionableKey(mentionable)
-          const desiredMentionable = mentionablesByKey.get(mentionableKey)
-          if (!desiredMentionable) {
+          const desiredEntry = mentionablesByKey.get(mentionableKey)
+          if (!desiredEntry) {
             suppressedDestroyedMentionableKeysRef.current.add(mentionableKey)
             const prevSibling = node.getPreviousSibling()
             if (
@@ -914,6 +1009,13 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
             node.remove()
             return
           }
+
+          node.updateMentionName(
+            getInlineMentionName(
+              desiredEntry.mentionable,
+              desiredEntry.assistantQuoteNumber,
+            ),
+          )
         })
 
         if (mentionablesToMirror.length === 0) return
@@ -936,26 +1038,26 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
           $isRangeSelection(cursorSelection) && cursorSelection.isCollapsed()
 
         let didInsert = false
-        mentionablesToMirror.forEach((mentionable) => {
-          const serialized = serializeMentionable(mentionable)
-          const mentionableKey = getMentionableKey(serialized)
-          if (existingKeys.has(mentionableKey)) return
+        mentionablesToMirror.forEach(
+          ({ mentionable, assistantQuoteNumber: quoteNumber }) => {
+            const serialized = serializeMentionable(mentionable)
+            const mentionableKey = getMentionableKey(serialized)
+            if (existingKeys.has(mentionableKey)) return
 
-          const mentionNode = $createMentionNode(
-            getMentionableName(mentionable, {
-              unitLabels: mentionableUnitLabels,
-            }),
-            serialized,
-          )
-          const spacer = $createTextNode(' ')
-          if (canInsertAtCursor) {
-            cursorSelection.insertNodes([mentionNode, spacer])
-          } else {
-            paragraph.append(mentionNode)
-            paragraph.append(spacer)
-          }
-          didInsert = true
-        })
+            const mentionNode = $createMentionNode(
+              getInlineMentionName(mentionable, quoteNumber),
+              serialized,
+            )
+            const spacer = $createTextNode(' ')
+            if (canInsertAtCursor) {
+              cursorSelection.insertNodes([mentionNode, spacer])
+            } else {
+              paragraph.append(mentionNode)
+              paragraph.append(spacer)
+            }
+            didInsert = true
+          },
+        )
 
         if (!shouldMoveCursor) return
         const selection = $getSelection()
@@ -988,8 +1090,8 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
     }, [
       inlineMentionables,
       isEditorReady,
+      getInlineMentionName,
       mentionDisplayMode,
-      mentionableUnitLabels,
     ])
 
     useEffect(() => {
@@ -1008,7 +1110,7 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
         contentEditableRef.current ===
         (contentEditableRef.current?.ownerDocument ?? document).activeElement
 
-      editor.update(() => {
+      updateLexicalFromExternalState(editor, contentEditableRef.current, () => {
         $nodesOfType(SkillNode).forEach((node) => {
           const skill = node.getSkill()
           if (skillsByName.has(skill.name)) return
@@ -1202,7 +1304,9 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
 
       try {
         if (!initialSerializedEditorState) {
-          editor.update(
+          updateLexicalFromExternalState(
+            editor,
+            contentEditableRef.current,
             () => {
               const root = $getRoot()
               root.clear()
@@ -1212,7 +1316,9 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
           )
           return
         }
-        editor.setEditorState(
+        setLexicalStateFromExternalState(
+          editor,
+          contentEditableRef.current,
           editor.parseEditorState(initialSerializedEditorState),
         )
       } catch (error) {
@@ -1241,6 +1347,9 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
           onChange={onChange}
           onTextContentChange={onTextContentChange}
           onEnter={handleSubmit}
+          enterKeyCreatesNewline={
+            settings.chatOptions.enterKeyCreatesNewline ?? false
+          }
           onFocus={onFocus}
           onKeyDown={onKeyDown}
           onMentionNodeMutation={handleMentionNodeMutation}
@@ -1269,6 +1378,7 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
           selectedSkillNames={enableSkills ? selectedSkillNames : undefined}
           onSelectSkill={enableSkills ? handleSelectSkill : undefined}
           onRunSlashCommand={onRunSlashCommand}
+          nativeSlashCommands={nativeSlashCommands}
           snippets={snippets}
           onCreateSnippetsFile={onCreateSnippetsFile}
           onMentionMenuToggle={onMentionMenuToggle}

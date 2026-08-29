@@ -9,19 +9,19 @@ import { ChatViewProvider } from '../../../contexts/chat-view-context'
 import { LanguageProvider } from '../../../contexts/language-context'
 import { McpProvider } from '../../../contexts/mcp-context'
 import { PluginProvider } from '../../../contexts/plugin-context'
-import { RAGProvider } from '../../../contexts/rag-context'
 import { SettingsProvider } from '../../../contexts/settings-context'
 import type { QuickAskAnchor } from '../../../features/editor/quick-ask/quickAsk.anchor'
 import type {
   QuickAskLaunchMode,
   QuickAskSelectionScope,
 } from '../../../features/editor/quick-ask/quickAsk.types'
-import YoloPlugin from '../../../main'
+import type YoloPlugin from '../../../main'
 import type { Mentionable } from '../../../types/mentionable'
 import {
   clearDynamicStyleClass,
   updateDynamicStyleClass,
 } from '../../../utils/dom/dynamicStyleManager'
+import type { MessageInputCoreRef } from '../../chat-view/chat-input/MessageInputCore'
 
 import { QuickAskPanel } from './QuickAskPanel'
 
@@ -47,9 +47,8 @@ type QuickAskOverlayOptions = {
   initialMentionables?: Mentionable[]
   initialMode?: QuickAskLaunchMode
   initialInput?: string
-  editContextText?: string
-  editSelectionFrom?: { line: number; ch: number }
   selectionScope?: QuickAskSelectionScope
+  isRewriteEntry?: boolean
   autoSend?: boolean
   initialAssistantId?: string
   onClose: () => void
@@ -61,6 +60,7 @@ export class QuickAskOverlay {
 
   private root: Root | null = null
   private overlayContainer: HTMLDivElement | null = null
+  private popoverPortalHost: HTMLDivElement | null = null
   private cleanupListeners: (() => void) | null = null
   private cleanupCallbacks: (() => void)[] = []
   private overlayHost: HTMLElement | null = null
@@ -71,6 +71,8 @@ export class QuickAskOverlay {
   private dockAnimationTimeout: number | null = null
   private containerRef: React.RefObject<HTMLDivElement> =
     React.createRef<HTMLDivElement>()
+  private messageInputRef: React.RefObject<MessageInputCoreRef> =
+    React.createRef<MessageInputCoreRef>()
   private hasBlockingOverlay = false
   private hasUserDragged = false
   private isDockedTopRight = false
@@ -137,6 +139,10 @@ export class QuickAskOverlay {
       clearDynamicStyleClass(this.overlayContainer)
     }
     this.overlayContainer = null
+    if (this.popoverPortalHost?.parentNode) {
+      this.popoverPortalHost.parentNode.removeChild(this.popoverPortalHost)
+    }
+    this.popoverPortalHost = null
     const overlayRoot = QuickAskOverlay.overlayRoot
     if (overlayRoot && overlayRoot.childElementCount === 0) {
       const host = overlayRoot.parentElement
@@ -178,6 +184,20 @@ export class QuickAskOverlay {
     return false
   }
 
+  static focusCurrentInput(): boolean {
+    const instance = QuickAskOverlay.currentInstance
+    if (!instance || instance.isClosing) return false
+
+    if (instance.messageInputRef.current) {
+      instance.messageInputRef.current.focus()
+    } else {
+      window.requestAnimationFrame(() => {
+        instance.messageInputRef.current?.focus()
+      })
+    }
+    return true
+  }
+
   private closeWithAnimation = () => {
     if (this.isClosing) return
     this.isClosing = true
@@ -186,6 +206,14 @@ export class QuickAskOverlay {
     // Add closing animation class
     if (this.overlayContainer) {
       this.overlayContainer.classList.add('closing')
+    }
+    // Popovers (model/mode/reasoning/assistant/continue-preset menus) are
+    // portaled to popoverPortalHost, outside overlayContainer's subtree, so
+    // they don't inherit its fade-out — mirror the class here so an open
+    // menu fades in lockstep instead of hanging static until the hard
+    // unmount below.
+    if (this.popoverPortalHost) {
+      this.popoverPortalHost.classList.add('closing')
     }
 
     // Wait for animation to complete before actually closing
@@ -205,6 +233,20 @@ export class QuickAskOverlay {
     overlayRoot.appendChild(overlayContainer)
     this.overlayContainer = overlayContainer
 
+    // Dedicated Portal target for the panel's Radix popovers. Kept as an
+    // independent sibling of overlayContainer rather than nested inside it:
+    // overlayContainer's fade-in keyframe has a `forwards` fill, so it
+    // carries a permanent non-none `transform` at rest — and any ancestor
+    // with a transform becomes the containing block for `position: fixed`
+    // descendants, which would silently break Floating UI's viewport-relative
+    // popover positioning. Its own opacity-only closing animation (toggled
+    // alongside overlayContainer's in closeWithAnimation) keeps it visually
+    // in sync without touching transform.
+    const popoverPortalHost = document.createElement('div')
+    popoverPortalHost.className = 'yolo-quick-ask-popover-portal'
+    overlayRoot.appendChild(popoverPortalHost)
+    this.popoverPortalHost = popoverPortalHost
+
     const { capabilities } = this.options
 
     this.root = createRoot(overlayContainer)
@@ -222,62 +264,61 @@ export class QuickAskOverlay {
           >
             <LanguageProvider>
               <AppProvider app={this.options.plugin.app}>
-                <RAGProvider
-                  getRAGEngine={() => this.options.plugin.getRAGEngine()}
+                <McpProvider
+                  getMcpManager={() => this.options.plugin.getMcpManager()}
                 >
-                  <McpProvider
-                    getMcpManager={() => this.options.plugin.getMcpManager()}
-                  >
-                    {capabilities.edit ? (
-                      <QuickAskPanel
-                        plugin={this.options.plugin}
-                        capabilities={{ edit: true }}
-                        editor={capabilities.editor}
-                        view={capabilities.view}
-                        contextText={this.options.contextText}
-                        fileTitle={this.options.fileTitle}
-                        sourceFilePath={this.options.sourceFilePath}
-                        initialPrompt={this.options.initialPrompt}
-                        initialMentionables={this.options.initialMentionables}
-                        initialMode={this.options.initialMode}
-                        initialInput={this.options.initialInput}
-                        editContextText={this.options.editContextText}
-                        editSelectionFrom={this.options.editSelectionFrom}
-                        selectionScope={this.options.selectionScope}
-                        autoSend={this.options.autoSend}
-                        initialAssistantId={this.options.initialAssistantId}
-                        onClose={this.closeWithAnimation}
-                        containerRef={this.containerRef}
-                        onOverlayStateChange={this.handleOverlayStateChange}
-                        onDragOffset={this.handleDragOffset}
-                        onResize={this.handleResize}
-                        onDockToTopRight={this.handleDockToTopRight}
-                      />
-                    ) : (
-                      <QuickAskPanel
-                        plugin={this.options.plugin}
-                        capabilities={{ edit: false }}
-                        editor={null}
-                        view={null}
-                        contextText={this.options.contextText}
-                        fileTitle={this.options.fileTitle}
-                        sourceFilePath={this.options.sourceFilePath}
-                        initialPrompt={this.options.initialPrompt}
-                        initialMentionables={this.options.initialMentionables}
-                        initialMode={this.options.initialMode}
-                        initialInput={this.options.initialInput}
-                        autoSend={this.options.autoSend}
-                        initialAssistantId={this.options.initialAssistantId}
-                        onClose={this.closeWithAnimation}
-                        containerRef={this.containerRef}
-                        onOverlayStateChange={this.handleOverlayStateChange}
-                        onDragOffset={this.handleDragOffset}
-                        onResize={this.handleResize}
-                        onDockToTopRight={this.handleDockToTopRight}
-                      />
-                    )}
-                  </McpProvider>
-                </RAGProvider>
+                  {capabilities.edit ? (
+                    <QuickAskPanel
+                      plugin={this.options.plugin}
+                      capabilities={{ edit: true }}
+                      editor={capabilities.editor}
+                      view={capabilities.view}
+                      contextText={this.options.contextText}
+                      fileTitle={this.options.fileTitle}
+                      sourceFilePath={this.options.sourceFilePath}
+                      initialPrompt={this.options.initialPrompt}
+                      initialMentionables={this.options.initialMentionables}
+                      initialMode={this.options.initialMode}
+                      initialInput={this.options.initialInput}
+                      selectionScope={this.options.selectionScope}
+                      isRewriteEntry={this.options.isRewriteEntry}
+                      autoSend={this.options.autoSend}
+                      initialAssistantId={this.options.initialAssistantId}
+                      onClose={this.closeWithAnimation}
+                      messageInputRef={this.messageInputRef}
+                      containerRef={this.containerRef}
+                      onOverlayStateChange={this.handleOverlayStateChange}
+                      onDragOffset={this.handleDragOffset}
+                      onResize={this.handleResize}
+                      onDockToTopRight={this.handleDockToTopRight}
+                      popoverPortalHost={popoverPortalHost}
+                    />
+                  ) : (
+                    <QuickAskPanel
+                      plugin={this.options.plugin}
+                      capabilities={{ edit: false }}
+                      editor={null}
+                      view={null}
+                      contextText={this.options.contextText}
+                      fileTitle={this.options.fileTitle}
+                      sourceFilePath={this.options.sourceFilePath}
+                      initialPrompt={this.options.initialPrompt}
+                      initialMentionables={this.options.initialMentionables}
+                      initialMode={this.options.initialMode}
+                      initialInput={this.options.initialInput}
+                      autoSend={this.options.autoSend}
+                      initialAssistantId={this.options.initialAssistantId}
+                      onClose={this.closeWithAnimation}
+                      messageInputRef={this.messageInputRef}
+                      containerRef={this.containerRef}
+                      onOverlayStateChange={this.handleOverlayStateChange}
+                      onDragOffset={this.handleDragOffset}
+                      onResize={this.handleResize}
+                      onDockToTopRight={this.handleDockToTopRight}
+                      popoverPortalHost={popoverPortalHost}
+                    />
+                  )}
+                </McpProvider>
               </AppProvider>
             </LanguageProvider>
           </SettingsProvider>

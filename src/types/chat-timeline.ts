@@ -21,7 +21,6 @@ export type ActiveConversationTailState = {
 type ChatTimelineBaseItem = {
   id: string
   renderKey: string
-  estimatedHeight: number
   spacingBefore?: number
   isActive?: boolean
   isEditable?: boolean
@@ -37,6 +36,7 @@ export type ChatTimelineUserMessageItem = ChatTimelineBaseItem & {
 
 export type ChatTimelineAssistantGroupItem = ChatTimelineBaseItem & {
   kind: 'assistant-group'
+  /** Stable logical group identity shared by all rendered slices. */
   groupId: string
   messageIds: string[]
   revision: number
@@ -49,12 +49,32 @@ export type ChatTimelineCompactionPendingItem = ChatTimelineBaseItem & {
 
 export type ChatTimelineCompactionDividerItem = ChatTimelineBaseItem & {
   kind: 'compaction-divider'
-  anchorMessageId: string
+  anchorMessageId: string | null
   compaction: ChatConversationCompaction | null
+}
+
+/**
+ * A "resumed session couldn't be reached, started a fresh one instead"
+ * notice anchored into the transcript — see `CliSessionFallbackBoundary`.
+ * Structurally identical to `ChatTimelineCompactionDividerItem` (same
+ * divider visual) but carries its own copy since, unlike a compaction
+ * divider's surface-wide text, the notice names the specific profile that
+ * became unreachable.
+ */
+export type ChatTimelineSessionFallbackDividerItem = ChatTimelineBaseItem & {
+  kind: 'session-fallback-divider'
+  anchorMessageId: string | null
+  title: string
+  description: string
 }
 
 export type ChatTimelineQueryProgressItem = ChatTimelineBaseItem & {
   kind: 'query-progress'
+}
+
+export type ChatTimelinePendingResponseItem = ChatTimelineBaseItem & {
+  kind: 'pending-response'
+  sourceUserMessageId: string
 }
 
 export type ChatTimelineContinueResponseItem = ChatTimelineBaseItem & {
@@ -70,7 +90,9 @@ export type ChatTimelineItem =
   | ChatTimelineAssistantGroupItem
   | ChatTimelineCompactionPendingItem
   | ChatTimelineCompactionDividerItem
+  | ChatTimelineSessionFallbackDividerItem
   | ChatTimelineQueryProgressItem
+  | ChatTimelinePendingResponseItem
   | ChatTimelineContinueResponseItem
   | ChatTimelineBottomAnchorItem
 
