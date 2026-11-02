@@ -3,6 +3,7 @@ import { EditorView } from '@codemirror/view'
 import {
   Editor,
   MarkdownView,
+  Menu,
   Notice,
   Platform,
   Plugin,
@@ -25,10 +26,10 @@ import { ConfirmModal } from './components/modals/ConfirmModal'
 import { mountUpdateToast } from './components/UpdateToast'
 import { CHAT_VIEW_TYPE } from './constants'
 import { BAKED_PLUGIN_VERSION } from './constants/bakedVersion'
-import type { YoloAgentApi, YoloAgentApiService } from './core/agent/agent-api'
+import type { AgentRunApi, YoloAgentApi } from './core/agent/agent-api'
 import type {
   AgentConversationRunSummary,
-  AgentService,
+  AgentSessionService,
 } from './core/agent/service'
 import {
   clearAllChatGPTOAuthServices,
@@ -36,6 +37,13 @@ import {
   getChatGPTOAuthService as getChatGPTOAuthServiceRuntime,
   initializeChatGPTOAuthRuntime,
 } from './core/auth/chatgptOAuthRuntime'
+import {
+  clearAllCopilotOAuthServices,
+  clearCopilotOAuthService,
+  getCopilotOAuthService as getCopilotOAuthServiceRuntime,
+  initializeCopilotOAuthRuntime,
+} from './core/auth/copilotOAuthRuntime'
+import type { CopilotOAuthStatus } from './core/auth/copilotOAuthService'
 import {
   clearGeminiOAuthService,
   getGeminiOAuthService as getGeminiOAuthServiceRuntime,
@@ -64,6 +72,8 @@ import {
   bindClaudeSdkHost,
   unbindClaudeSdkHost,
 } from './core/llm/claude-sdk/host'
+import { clearCopilotAutoSession } from './core/llm/copilotAutoSession'
+import { clearCopilotModelCatalog } from './core/llm/copilotModelCatalog'
 import {
   isLLMDebugCaptureEnabled,
   setLLMDebugCaptureEnabled,
@@ -75,6 +85,7 @@ import type {
 } from './core/mcp/localMcpServerConfig'
 import type { McpCoordinator } from './core/mcp/mcpCoordinator'
 import type { McpManager } from './core/mcp/mcpManager'
+import { migrateLegacyMemoryFiles } from './core/memory/legacyMemoryMigration'
 import {
   CoreModuleAgentCapabilityProvider,
   CoreModuleChatCapabilityProvider,
@@ -87,15 +98,19 @@ import {
   ModuleChatModeRegistry,
   ModuleConfigCapabilityProvider,
   ModuleDeviceStateStore,
+  ModuleFileTextRendererRegistry,
   ModuleIntentStore,
   ModuleLoader,
+  ModulePdfCapabilityProvider,
   ModulePrivateStorageCapabilityProvider,
+  type ModuleRibbonSlots,
   ModuleRuntime,
   ModuleRuntimeReservation,
   type ModuleService,
   ModuleSettingsCapabilityProvider,
   ModuleSettingsContributionRegistry,
   ModuleStore,
+  ModuleToolSetRegistry,
   OFFICIAL_MODULE_ARTIFACT_TIMEOUT_MS,
   ObsidianModuleContributionRegistrar,
   ObsidianModuleUiCapabilityProvider,
@@ -116,6 +131,7 @@ import {
   parseModuleArtifactManifest,
   resolveModuleSkillVaultPath,
   runExclusive as runManagedModuleDataExclusive,
+  seedDefaultModuleInstallIntents,
   selectModuleManifestVariant,
 } from './core/modules'
 import { normalizeModuleCatalogLocale } from './core/modules/moduleCatalogPresentation'
@@ -172,14 +188,26 @@ import {
 } from './core/skills/liteSkills'
 import type { ToolContext } from './core/tools/types'
 import {
+  type AutoUpdatedCore,
+  type AutoUpdatedItem,
+  takeAutoUpdatedCore,
+  writeAutoUpdatedCore,
+} from './core/update/autoUpdateReport'
+import {
   type InstallationIncompleteDetail,
   type ReleaseFileName,
   checkInstallationIntegrityLayer1And2,
 } from './core/update/installationIntegrity'
 import {
+  readLastLaunchedCoreVersion,
+  writeLastLaunchedCoreVersion,
+} from './core/update/lastLaunchedCoreVersion'
+import {
+  type InstalledModuleUpdate,
   ModuleUpdateController,
   type ModuleUpdateOffer,
 } from './core/update/moduleUpdateController'
+import { openCommunityPluginsSettings } from './core/update/openCommunityPluginsSettings'
 import {
   type PluginUpdateState,
   applyRepairFiles,
@@ -191,6 +219,7 @@ import {
   getStagingDir,
   getStagingStatus,
 } from './core/update/pluginUpdater'
+import { reloadPlugin } from './core/update/reloadPlugin'
 import {
   type ReleaseAssets,
   type UpdateCheckResult,
@@ -200,8 +229,7 @@ import {
 } from './core/update/updateChecker'
 import type { DatabaseManager } from './database/DatabaseManager'
 import { ChatManager } from './database/json/chat/ChatManager'
-import { pruneImageCache } from './database/json/chat/imageCacheStore'
-import { prunePdfTextCache } from './database/json/chat/pdfTextCacheStore'
+import { importLegacyImageCache } from './database/local-cache/legacyImageCacheImport'
 import type {
   ReconcileResult,
   VectorManager,
@@ -221,6 +249,7 @@ import {
 } from './features/editor/diff-review/review-model'
 import type { InlineSuggestionGhostPayload } from './features/editor/inline-suggestion/inlineSuggestion'
 import { InlineSuggestionController } from './features/editor/inline-suggestion/inlineSuggestionController'
+import { createEmbeddedQuickAskAttacher } from './features/editor/quick-ask/embeddedQuickAsk'
 import type { QuickAskSelectionScope } from './features/editor/quick-ask/quickAsk.types'
 import type { QuickAskLaunchMode } from './features/editor/quick-ask/quickAsk.types'
 import { QuickAskController } from './features/editor/quick-ask/quickAskController'
@@ -234,7 +263,12 @@ import {
 } from './features/editor/selection-rewrite/selectionRewriteController'
 import { TabCompletionController } from './features/editor/tab-completion/tabCompletionController'
 import { enablePdfScreenshotFeature } from './features/pdf-screenshot'
-import { type Language, createTranslationFunction, loadLocale } from './i18n'
+import {
+  type Language,
+  createTranslationFunction,
+  loadLocale,
+  resolveLanguageFromLocale,
+} from './i18n'
 import {
   YoloSettings,
   yoloSettingsSchema,
@@ -253,9 +287,13 @@ import type {
 } from './types/mentionable'
 import { MentionableFile, MentionableFolder } from './types/mentionable'
 import { isUntitledConversationTitle } from './utils/chat/conversationTitle'
+import { captureReactDocumentListeners } from './utils/dom/react-document-listeners'
 import { stableStringify } from './utils/json/stableStringify'
 import { applyKnownMaxContextTokensToChatModels } from './utils/llm/model-capability-registry'
 import { getMentionableBlockData } from './utils/obsidian'
+import { addPdfAnnotations } from './utils/pdf/addPdfAnnotations'
+import { PdfDocumentCache } from './utils/pdf/pdfDocumentCache'
+import { showDesktopSaveDialog } from './utils/platform/desktopSaveFile'
 import { ensureBufferByteLengthCompat } from './utils/runtime/ensureBufferByteLengthCompat'
 import { YOLO_ICON_ID, YOLO_ICON_SVG } from './yoloIcon'
 
@@ -277,14 +315,11 @@ type TranslateFn = (keyPath: string, fallback?: string) => string
 type BackgroundStatusPanelAction = BackgroundActivityAction
 
 /**
- * A staged module update can only be installed from the update toast, so
- * downloading one while the notice is off would never be applied.
+ * A staged module update is installed from the update toast, which the off
+ * mode never shows, so it would never be applied there.
  */
 function isModuleAutoDownloadEnabled(settings: YoloSettings): boolean {
-  return (
-    settings.pluginUpdateNoticeEnabled &&
-    settings.pluginUpdateAutoDownloadEnabled
-  )
+  return settings.pluginUpdateMode !== 'off'
 }
 
 export default class YoloPlugin extends Plugin {
@@ -292,17 +327,29 @@ export default class YoloPlugin extends Plugin {
   settingsChangeListeners: ((newSettings: YoloSettings) => void)[] = []
   private deviceId: string | null = null
   private currentSettingsMeta: YoloDataMeta | null = null
+  /**
+   * Shown while `data.json` exists but could not be read or parsed. Until it
+   * is cleared, `this.settings` holds defaults standing in for the user's
+   * real settings, so nothing may be written back to `data.json`.
+   */
+  private unreadableSettingsNotice: Notice | null = null
   updateCheckResult: UpdateCheckResult | null = null
+  private autoUpdatedItems: readonly AutoUpdatedItem[] = Object.freeze([])
+  private readonly autoUpdatedListeners = new Set<() => void>()
   private hasCheckedForUpdates = false
   private updateCheckListeners: (() => void)[] = []
   pluginUpdateState: PluginUpdateState = { status: 'idle' }
   private pluginUpdateListeners: (() => void)[] = []
   private pluginUpdateDownloadPromise: Promise<void> | null = null
+  private disposeReactDocumentListeners: (() => void) | null = null
   private updateToastCleanup: (() => void) | null = null
   private actionToastController: ActionToastController | null = null
   private readonly moduleSettingsContributions =
     new ModuleSettingsContributionRegistry()
   private readonly moduleChatModeRegistry = new ModuleChatModeRegistry()
+  private readonly moduleToolSetRegistry = new ModuleToolSetRegistry()
+  private readonly moduleFileTextRendererRegistry =
+    new ModuleFileTextRendererRegistry()
   installationIncompleteDetail: InstallationIncompleteDetail | null = null
   private installationIncompleteBannerDismissed = false
   private installationIncompleteListeners: (() => void)[] = []
@@ -333,7 +380,9 @@ export default class YoloPlugin extends Plugin {
   private ragIndexService: RagIndexService | null = null
   private mcpCoordinator: McpCoordinator | null = null
   private moduleService: ModuleService | null = null
+  private moduleRibbonSlots: ModuleRibbonSlots | null = null
   private runtimeComponentService: RuntimeComponentService | null = null
+  private pdfDocumentCache: PdfDocumentCache | null = null
   private localEmbeddingModelManager: LocalEmbeddingModelManager | null = null
   private distributionFeedClient: DistributionFeedClient | null = null
   private moduleUpdateController: ModuleUpdateController | null = null
@@ -341,6 +390,7 @@ export default class YoloPlugin extends Plugin {
   private moduleRuntimeReservation: ModuleRuntimeReservation | null = null
   private learningModuleSettingsHandoff: (() => Promise<void>) | null = null
   private learningLegacyInstallMigration: (() => Promise<void>) | null = null
+  private defaultModuleInstallSeed: (() => Promise<void>) | null = null
   private rawLearningLegacySettings: unknown = undefined
   private learningModuleSettingsHandoffReady = false
   private readonly managedModulePathChangeListeners = new Set<() => void>()
@@ -358,9 +408,9 @@ export default class YoloPlugin extends Plugin {
     null
   private cliRuntimeCapabilityError: unknown = null
   private cliRunSummaryUnsubscribe: (() => void) | null = null
-  private agentService: AgentService | null = null
-  private agentServiceReady: Promise<AgentService> | null = null
-  private agentApiService: YoloAgentApiService | null = null
+  private agentService: AgentSessionService | null = null
+  private agentServiceReady: Promise<AgentSessionService> | null = null
+  private agentApiService: AgentRunApi | null = null
   private agentNotificationCoordinator: AgentNotificationCoordinator | null =
     null
   private backgroundActivityRegistry: BackgroundActivityRegistry | null = null
@@ -644,6 +694,30 @@ export default class YoloPlugin extends Plugin {
     clearGeminiOAuthService(providerId)
   }
 
+  getCopilotOAuthService(providerId: string) {
+    return (
+      getCopilotOAuthServiceRuntime(providerId) ??
+      initializeCopilotOAuthRuntime(this.app, this.manifest.id, providerId)
+    )
+  }
+
+  async getCopilotOAuthStatus(providerId: string): Promise<CopilotOAuthStatus> {
+    return this.getCopilotOAuthService(providerId).getStatus()
+  }
+
+  async disconnectCopilotOAuthAccount(providerId: string): Promise<void> {
+    await this.getCopilotOAuthService(providerId).clearCredential()
+    // The next login may be another account with other models.
+    clearCopilotModelCatalog(providerId)
+    clearCopilotAutoSession(providerId)
+  }
+
+  clearCopilotOAuthRuntime(providerId: string): void {
+    clearCopilotOAuthService(providerId)
+    clearCopilotModelCatalog(providerId)
+    clearCopilotAutoSession(providerId)
+  }
+
   private syncOAuthRuntimesFromSettings(
     settings: Pick<YoloSettings, 'providers'> = this.settings,
   ): void {
@@ -653,6 +727,9 @@ export default class YoloPlugin extends Plugin {
       }
       if (provider.presetType === 'gemini-oauth') {
         this.getGeminiOAuthService(provider.id)
+      }
+      if (provider.presetType === 'github-copilot') {
+        this.getCopilotOAuthService(provider.id)
       }
     }
   }
@@ -788,11 +865,11 @@ export default class YoloPlugin extends Plugin {
           this.showQuickAskWithOptions(editor, view, options),
         showQuickAskWithAutoSend: (editor, view, options) =>
           this.showQuickAskWithAutoSend(editor, view, options),
-        showQuickAskFromPdf: (args) =>
-          this.getQuickAskController().showFromPdf(args),
-        pruneOrphanedQuickAskPdfInstance: (activePdfLeaves) =>
-          this.getQuickAskController().pruneOrphanedPdfInstance(
-            activePdfLeaves,
+        showQuickAskFromReadOnlySelection: (args) =>
+          this.getQuickAskController().showFromReadOnlySelection(args),
+        pruneOrphanedReadOnlyQuickAsk: (openLeaves) =>
+          this.getQuickAskController().pruneOrphanedReadOnlyInstance(
+            openLeaves,
           ),
         openChatWithSelectionAndPrefill: async (
           selectedBlock,
@@ -911,7 +988,6 @@ export default class YoloPlugin extends Plugin {
     if (!this.ragAutoUpdateService) {
       this.ragAutoUpdateService = new RagAutoUpdateService({
         getSettings: () => this.settings,
-        setSettings: (settings) => this.setSettings(settings),
         runIndex: async (kbId, request) => {
           // Background auto-update never surfaces partial failures (product
           // decision: settings page shows them durably via the snapshot). The
@@ -955,6 +1031,8 @@ export default class YoloPlugin extends Plugin {
         getRagEngine: (kbId) => this.getRagCoordinator().getRagEngine(kbId),
         activityRegistry: this.getBackgroundActivityRegistry(),
         isRagEnabled: () => !!this.settings?.ragOptions?.enabled,
+        getKnowledgeBaseIds: () =>
+          this.settings.knowledgeBases.map((kb) => kb.id),
         t: (key, fallback) => this.t(key, fallback),
       })
     }
@@ -1010,7 +1088,16 @@ export default class YoloPlugin extends Plugin {
           const { runSubagent } = await import('./core/agent/subagent/runner')
           return (runSubagent as NonNullable<ToolContext['runSubagent']>)(input)
         },
+        resolveModuleFileTextRenderer: (extension) =>
+          this.moduleFileTextRendererRegistry.resolve(extension),
         moduleChatModeRegistry: this.moduleChatModeRegistry,
+        moduleToolSetRegistry: this.moduleToolSetRegistry,
+        persistDiscoveredCatalogs: (catalogs) => {
+          void this.setSettings({
+            ...this.settings,
+            mcp: { ...this.settings.mcp, discoveredCatalogs: catalogs },
+          })
+        },
       })
     }
     return this.mcpCoordinator
@@ -1029,6 +1116,7 @@ export default class YoloPlugin extends Plugin {
       ragAccess: this.getRagAccess(),
       openConversation: (conversationId) =>
         this.openChatView({ initialConversationId: conversationId }),
+      getModuleToolSetRegistry: () => this.getModuleToolSetRegistry(),
     })
     this.localMcpServer = runtime
     this.localMcpSettingsUnsubscribe = this.addSettingsChangeListener(
@@ -1125,12 +1213,7 @@ export default class YoloPlugin extends Plugin {
   }
 
   private resolveObsidianLanguage(): Language {
-    const rawLanguage = String(getLanguage() ?? '')
-      .trim()
-      .toLowerCase()
-    if (rawLanguage.startsWith('zh')) return 'zh'
-    if (rawLanguage.startsWith('it')) return 'it'
-    return 'en'
+    return resolveLanguageFromLocale(getLanguage())
   }
 
   private warnIfInstallationIncomplete() {
@@ -1225,12 +1308,12 @@ export default class YoloPlugin extends Plugin {
     this.agentService?.abortAll()
   }
 
-  async warmupAgentService(): Promise<AgentService> {
+  async warmupAgentService(): Promise<AgentSessionService> {
     if (!this.agentServiceReady) {
       this.agentServiceReady = (async () => {
         try {
-          const { AgentService } = await import('./core/agent/service')
-          const { YoloAgentApiService } = await import('./core/agent/agent-api')
+          const { AgentSessionService } = await import('./core/agent/service')
+          const { AgentRunApi } = await import('./core/agent/agent-api')
           const { createAgentConversationPersistence } = await import(
             './core/agent/conversationPersistence'
           )
@@ -1239,7 +1322,7 @@ export default class YoloPlugin extends Plugin {
           }
           const { persistConversationMessages } =
             createAgentConversationPersistence(this.app, () => this.settings)
-          const service = new AgentService({
+          const service = new AgentSessionService({
             getSettings: () => this.settings,
             persistConversationMessages,
           })
@@ -1251,11 +1334,12 @@ export default class YoloPlugin extends Plugin {
           this.registerEvent(this.app.vault.on('rename', h.rename))
           service.startBackgroundTaskResultListener()
           this.agentService = service
-          this.agentApiService = new YoloAgentApiService({
+          this.agentApiService = new AgentRunApi({
             app: this.app,
             getSettings: () => this.settings,
             getAgentService: () => this.getAgentService(),
             getMcpManager: () => this.getMcpManager(),
+            getModuleToolSetRegistry: () => this.getModuleToolSetRegistry(),
           })
           return service
         } catch (error) {
@@ -1267,7 +1351,7 @@ export default class YoloPlugin extends Plugin {
     return this.agentServiceReady
   }
 
-  getAgentService(): AgentService {
+  getAgentService(): AgentSessionService {
     if (!this.agentService) {
       throw new Error(
         '[YOLO] Agent service is not ready yet; await plugin.warmupAgentService() first.',
@@ -1915,10 +1999,7 @@ export default class YoloPlugin extends Plugin {
     }
 
     const descriptor = getCliRuntimeDescriptor(runtimeId)
-    const fullLabel = this.t(
-      descriptor.labelKey,
-      runtimeId === 'claude-code' ? 'Claude Code' : 'Codex',
-    )
+    const fullLabel = this.t(descriptor.labelKey, descriptor.defaultLabel)
     badge.classList.add(`yolo-runtime-badge--${runtimeId}`)
     badge.setText(
       descriptor.shortLabelKey
@@ -2012,12 +2093,6 @@ export default class YoloPlugin extends Plugin {
           this.app.workspace.getActiveFile()?.basename?.trim() ?? '',
         setTabCompletionDisplay: (view, payload) =>
           inlineSuggestionController.setTabCompletionDisplay(view, payload),
-        setInlineSuggestionGhost: (view, payload) =>
-          inlineSuggestionController.setInlineSuggestionGhost(view, payload),
-        showTabLoadingDots: (view, from) =>
-          inlineSuggestionController.showTabLoadingDots(view, from),
-        hideTabLoadingDots: (view) =>
-          inlineSuggestionController.hideTabLoadingDots(view),
         getSwitchSuggestionHint: () =>
           this.t('common.switchSuggestion', '↑↓ 切换建议'),
         clearInlineSuggestion: () =>
@@ -2168,6 +2243,8 @@ export default class YoloPlugin extends Plugin {
     this.isUnloaded = false
     this.cliRuntimeCapabilityError = null
     bindClaudeSdkHost(this.app)
+    // Must precede the first React root (the action toast below).
+    this.disposeReactDocumentListeners = captureReactDocumentListeners(document)
     this.actionToastController = mountActionToast()
     this.initializeModuleSystem()
     this.initializeRuntimeComponentSystem()
@@ -2216,6 +2293,11 @@ export default class YoloPlugin extends Plugin {
       console.error('[YOLO] Learning legacy install migration failed', error)
     }
     try {
+      await this.defaultModuleInstallSeed?.()
+    } catch (error) {
+      console.error('[YOLO] Default module install seeding failed', error)
+    }
+    try {
       // Must complete before `activateModules()`: the Learning module reads
       // and writes `learning-srs`/`anki-import-journals` directly under the
       // visible `data/` root (see `modules/learning/src/host/srsStorage.ts`)
@@ -2224,6 +2306,8 @@ export default class YoloPlugin extends Plugin {
     } catch (error) {
       console.error('[YOLO] User data root migration failed', error)
     }
+    // Before any view is registered: cache reads wait for this to settle.
+    void importLegacyImageCache(this.app, this.settings)
     this.warnIfInstallationIncomplete()
     this.activateModules()
     this.syncOAuthRuntimesFromSettings()
@@ -2231,9 +2315,6 @@ export default class YoloPlugin extends Plugin {
       console.error('[YOLO] Failed to initialize local MCP server', error)
     })
 
-    // Prune stale image cache entries (>30 days) on startup
-    void pruneImageCache(this.app, 30, this.settings)
-    void prunePdfTextCache(this.app, 30, this.settings)
     await this.getRagIndexService().initialize()
     // One-time, idempotent migration of legacy skill frontmatter. Skill files
     // themselves remain at their user-chosen paths.
@@ -2248,6 +2329,14 @@ export default class YoloPlugin extends Plugin {
         .finally(() => {
           prewarmLiteSkillRegistry(this.app, this.settings)
         })
+    })
+    // One-time, idempotent migration of pre-v2 single-file memory into the v2
+    // per-scope directories. Runs off the request path; a failure only means
+    // the old files stay put and the next startup retries.
+    this.app.workspace.onLayoutReady(() => {
+      void migrateLegacyMemoryFiles(this.app, this.settings).catch((error) => {
+        console.error('[YOLO] Legacy memory migration failed', error)
+      })
     })
     this.app.workspace.onLayoutReady(() => {
       void this.runtimeComponentService?.start().catch((error) => {
@@ -2307,8 +2396,16 @@ export default class YoloPlugin extends Plugin {
     )
 
     // This creates an icon in the left ribbon.
-    this.addRibbonIcon(YOLO_ICON_ID, 'YOLO Chat', () => {
+    const ribbonIconEl = this.addRibbonIcon(YOLO_ICON_ID, 'YOLO Chat', () => {
       void this.openChatView({ placement: this.resolveRibbonPlacement() })
+    })
+    // Right-click picks a one-off placement. The ribbon container binds its
+    // own hide/show menu on `contextmenu`, so stop propagation or it replaces
+    // ours; right-clicking elsewhere on the ribbon still reaches it.
+    this.registerDomEvent(ribbonIconEl, 'contextmenu', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      this.showRibbonPlacementMenu(event)
     })
 
     this.setupBackgroundActivityStatusBar()
@@ -2731,6 +2828,7 @@ export default class YoloPlugin extends Plugin {
   onunload() {
     this.isUnloaded = true
     clearAllChatGPTOAuthServices()
+    clearAllCopilotOAuthServices()
     unbindClaudeSdkHost()
     this.disposeCliRuntimeCoordinator()
     this.liteSkillRegistryDispose?.()
@@ -2740,6 +2838,7 @@ export default class YoloPlugin extends Plugin {
     this.moduleUpdateController = null
     this.moduleService?.dispose()
     this.moduleService = null
+    this.moduleRibbonSlots = null
 
     // RagEngine cleanup — must run before `runtimeComponentService.stop()`
     // below so the local embedding session's `embedding-engine` lease is
@@ -2749,6 +2848,8 @@ export default class YoloPlugin extends Plugin {
     this.ragCoordinator?.cleanup()
     this.ragCoordinator = null
 
+    void this.pdfDocumentCache?.closeAll()
+    this.pdfDocumentCache = null
     setRuntimeComponentService(null)
     this.runtimeComponentService?.stop()
     this.runtimeComponentService = null
@@ -2758,6 +2859,7 @@ export default class YoloPlugin extends Plugin {
     this.distributionFeedClient = null
     this.learningModuleSettingsHandoff = null
     this.learningLegacyInstallMigration = null
+    this.defaultModuleInstallSeed = null
     this.rawLearningLegacySettings = undefined
     this.learningModuleSettingsHandoffReady = false
     this.managedModulePathChangeListeners.clear()
@@ -2786,6 +2888,9 @@ export default class YoloPlugin extends Plugin {
     this.selectionRewriteController?.destroy()
     this.selectionRewriteController = null
     this.continuationController = null
+    selectionHighlightController.destroy()
+    this.disposeReactDocumentListeners?.()
+    this.disposeReactDocumentListeners = null
 
     // clear all timers
     this.timeoutIds.forEach((id) => {
@@ -2848,7 +2953,33 @@ export default class YoloPlugin extends Plugin {
     this.rawLearningLegacySettings = sourceRaw?.learningOptions
     const sourceMeta = pluginExtract?.meta ?? null
 
-    const parsedSettings = parseYoloSettings(sourceRaw)
+    let parsedSettings: YoloSettings | null = null
+    try {
+      parsedSettings = parseYoloSettings(sourceRaw)
+    } catch (error) {
+      console.error(
+        '[YOLO] data.json does not match the settings schema.',
+        error,
+      )
+    }
+    // Obsidian's loadData yields nothing both when data.json is missing (a
+    // fresh install) and when it exists but failed to read or parse — e.g.
+    // while a sync tool is replacing it. Only the former may start from
+    // defaults that get saved.
+    if (
+      parsedSettings === null ||
+      (!pluginExtract &&
+        (await this.app.vault.adapter.exists(`${this.manifest.dir}/data.json`)))
+    ) {
+      this.unreadableSettingsNotice = new Notice(
+        this.t(
+          'notices.settingsFileUnreadable',
+          'YOLO could not read its settings file (data.json) and is running with default settings. Changes will not be saved until the file can be read again. If a sync tool is updating it, wait for the sync to finish.',
+        ),
+        0,
+      )
+      parsedSettings = parseYoloSettings(null)
+    }
     const { ensureDefaultAssistantInSettings } = await import(
       './core/agent/default-assistant'
     )
@@ -2862,7 +2993,9 @@ export default class YoloPlugin extends Plugin {
       : settingsWithDefaultAssistant
 
     this.settings = normalizedSettings
-    this.currentSettingsMeta = sourceMeta
+    // No meta while unreadable, so whatever version of data.json reads next
+    // is adopted rather than compared against a version we never loaded.
+    this.currentSettingsMeta = this.unreadableSettingsNotice ? null : sourceMeta
     setLLMDebugCaptureEnabled(
       this.settings.debug?.captureRawRequestDebug ?? false,
     )
@@ -3059,11 +3192,13 @@ export default class YoloPlugin extends Plugin {
    *   `data.json` without bumping `__meta.updatedAt` falls outside the
    *   protocol — we accept that such an edit may be missed until the
    *   next external-change event re-reads the file.
+   *
+   * Returns whether the payload was adopted.
    */
   private async applyExternalSettingsUpdate(
     raw: Record<string, unknown>,
     incomingMeta: YoloDataMeta | null,
-  ): Promise<void> {
+  ): Promise<boolean> {
     // Self-write echo: same device + same updatedAt means this event is
     // the reflection of our own most recent saveData. Suppress.
     if (
@@ -3072,13 +3207,13 @@ export default class YoloPlugin extends Plugin {
       incomingMeta.deviceId === this.currentSettingsMeta.deviceId &&
       incomingMeta.updatedAt === this.currentSettingsMeta.updatedAt
     ) {
-      return
+      return false
     }
     // Meta-less incoming with a meta-stamped local copy: refuse, per
     // protocol — we can't compare freshness so preferring local avoids
     // stale replays clobbering newer settings.
     if (!incomingMeta && this.currentSettingsMeta) {
-      return
+      return false
     }
     // Reject anything our current in-memory state already beats under
     // the total `metaBeats` ordering (older OR equal-and-loser).
@@ -3087,10 +3222,19 @@ export default class YoloPlugin extends Plugin {
       incomingMeta &&
       !this.metaBeats(this.currentSettingsMeta, incomingMeta)
     ) {
-      return
+      return false
     }
 
-    const parsedSettings = parseYoloSettings(raw)
+    let parsedSettings: YoloSettings
+    try {
+      parsedSettings = parseYoloSettings(raw)
+    } catch (error) {
+      console.warn(
+        '[YOLO] Ignored an external data.json change that does not match the settings schema.',
+        error,
+      )
+      return false
+    }
     const { ensureDefaultAssistantInSettings } = await import(
       './core/agent/default-assistant'
     )
@@ -3155,6 +3299,9 @@ export default class YoloPlugin extends Plugin {
     this.settingsChangeListeners.forEach((listener) => {
       listener(normalizedSettings)
     })
+    this.unreadableSettingsNotice?.hide()
+    this.unreadableSettingsNotice = null
+    return true
   }
 
   /**
@@ -3271,7 +3418,11 @@ export default class YoloPlugin extends Plugin {
     )
 
     if (shouldAdoptMirror && mirrorMeta) {
-      await this.applyExternalSettingsUpdate(mirrorRead.raw, mirrorMeta)
+      if (
+        !(await this.applyExternalSettingsUpdate(mirrorRead.raw, mirrorMeta))
+      ) {
+        return
+      }
       try {
         await this.saveData(stampYoloDataMeta(this.settings, mirrorMeta))
         this.currentSettingsMeta = mirrorMeta
@@ -3347,6 +3498,28 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
           'settings.agent.yoloBaseDirHiddenPath',
           'YOLO root cannot contain a folder name starting with a dot because Obsidian does not index hidden folders.',
         ),
+      )
+      return false
+    }
+
+    if (this.unreadableSettingsNotice) {
+      // Persisting now would replace the user's real settings with the
+      // defaults standing in for them. Read the file again instead; if it
+      // reads, adopt it, and the user redoes the change on top of it.
+      const extract = extractYoloDataMeta(await this.loadData())
+      if (extract) {
+        await this.applyExternalSettingsUpdate(extract.raw, extract.meta)
+      }
+      new Notice(
+        this.unreadableSettingsNotice
+          ? this.t(
+              'notices.settingsNotSavedUnreadable',
+              'Not saved: YOLO still cannot read its settings file (data.json).',
+            )
+          : this.t(
+              'notices.settingsReloadedRedo',
+              'YOLO reloaded your settings from data.json. Your last change was not saved — please redo it.',
+            ),
       )
       return false
     }
@@ -3740,9 +3913,16 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     return this.pluginUpdateDownloadPromise
   }
 
-  async applyPluginUpdate(): Promise<void> {
+  /**
+   * Installs the staged update, then loads it: by reloading the window, or —
+   * for automatic updating, which nobody is waiting on — by reloading only
+   * this plugin. True once it is installed.
+   */
+  async applyPluginUpdate(
+    reload: 'window' | 'plugin' = 'window',
+  ): Promise<boolean> {
     if (this.pluginUpdateState.status !== 'ready') {
-      return
+      return false
     }
 
     const version = this.pluginUpdateState.version
@@ -3770,12 +3950,54 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
         message: applyResult.reason,
         repairFiles,
       })
-      return
+      return false
     }
 
     this.setPluginUpdateState({ status: 'idle' })
     this.updateCheckResult = null
     this.notifyUpdateCheckListeners()
+    if (reload === 'plugin') {
+      reloadPlugin(this.app, this.manifest.id)
+    } else {
+      window.location.reload()
+    }
+    return true
+  }
+
+  /**
+   * One click from a place that is blocked on a newer core (a module held back
+   * by the Host API): download, install, and reload. It reads the feed afresh
+   * instead of `updateCheckResult`, which only exists while the update toast
+   * is allowed to prompt. Without self-update, community plugins does it.
+   */
+  async updateCoreNow(): Promise<void> {
+    const result =
+      canSelfUpdate(this) && this.distributionFeedClient
+        ? await checkForUpdate(
+            this.manifest.version,
+            this.distributionFeedClient,
+          )
+        : null
+    if (!result?.hasUpdate || !result.assets) {
+      openCommunityPluginsSettings(this.app)
+      return
+    }
+    await this.downloadPluginRelease(result.latestVersion, result.assets)
+    const state = this.pluginUpdateState
+    if (
+      state.status !== 'ready' ||
+      state.version !== normalizePluginVersion(result.latestVersion)
+    ) {
+      new Notice(this.t('update.downloadFailed', 'Download failed'))
+      openCommunityPluginsSettings(this.app)
+      return
+    }
+    // Reloads the window on success. A too-old Obsidian opens its own modal.
+    await this.applyPluginUpdate()
+    const applied = this.pluginUpdateState
+    if (applied.status === 'error' && applied.message !== 'min_app_version') {
+      new Notice(this.t('update.installFailed', 'Install failed'))
+    }
   }
 
   private async autoRepairInstallation(): Promise<void> {
@@ -3875,43 +4097,199 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
       return
     }
     this.hasCheckedForUpdates = true
-    void Promise.allSettled([
-      (async () => {
-        if (!this.distributionFeedClient) return
-        // The Feed load itself is never gated: it is also the module catalog's
-        // data source, so `设置 → 模块` keeps offering updates even when the
-        // update notice is off. Only the prompt and its download are gated.
-        const fetched = await checkForUpdate(
-          this.manifest.version,
-          this.distributionFeedClient,
-        )
-        if (fetched?.hasUpdate) {
-          if (
-            !this.settings.pluginUpdateNoticeEnabled ||
-            this.isUpdateVersionMuted(fetched.latestVersion)
-          ) {
-            return
-          }
-          this.updateCheckResult = fetched
-          this.notifyUpdateCheckListeners()
-          await this.refreshPluginUpdateStaging(fetched.latestVersion)
-          if (
-            this.settings.pluginUpdateAutoDownloadEnabled &&
-            canSelfUpdate(this) &&
-            fetched.assets
-          ) {
-            void this.startPluginUpdateDownload()
-          }
-        }
-      })(),
-      (async () => {
-        // Catalog refresh always runs — it feeds the module list in settings.
-        // Only the toast-facing offers (and their auto-download) are gated.
-        await this.moduleService?.checkForUpdates()
-        if (!this.settings.pluginUpdateNoticeEnabled) return
-        await this.moduleUpdateController?.refresh()
-      })(),
+    void this.runUpdateCheck()
+  }
+
+  private async runUpdateCheck(): Promise<void> {
+    // Written by the instance that installed this core and reloaded into us.
+    const updatedCore = takeAutoUpdatedCore(this.app, this.manifest.version)
+    // The Feed and the module catalog are loaded in every mode: they are also
+    // what `设置 → 模块` shows. Only prompting and installing follow the mode.
+    const [core] = await Promise.all([
+      this.distributionFeedClient
+        ? checkForUpdate(this.manifest.version, this.distributionFeedClient)
+        : null,
+      this.moduleService?.checkForUpdates().catch((error: unknown) => {
+        console.warn('[YOLO] Module update check failed', error)
+      }),
     ])
+    // Not gated by the mode: turning prompts off means "don't interrupt me",
+    // not "leave my modules behind the core".
+    const followed = await this.followCoreUpdate()
+    if (this.isUnloaded) return
+    const mode = this.settings.pluginUpdateMode
+    const coreUpdate = core?.hasUpdate ? core : null
+    if (mode === 'auto') {
+      if (
+        coreUpdate &&
+        (await this.installCoreUpdateAutomatically(coreUpdate))
+      ) {
+        return
+      }
+      const installed =
+        (await this.moduleUpdateController?.installAll({
+          skipMuted: false,
+        })) ?? []
+      await this.reportAutoUpdated(updatedCore, [...followed, ...installed])
+    } else {
+      this.noticeModulesFollowedCore(followed)
+      if (mode === 'off') return
+    }
+    // What is left is prompted: everything in notify mode, and in auto mode
+    // whatever could not be installed here, as the fallback.
+    if (coreUpdate) await this.offerCoreUpdate(coreUpdate)
+    await this.moduleUpdateController?.refresh()
+  }
+
+  private async offerCoreUpdate(result: UpdateCheckResult): Promise<void> {
+    if (this.isUpdateVersionMuted(result.latestVersion)) return
+    this.updateCheckResult = result
+    this.notifyUpdateCheckListeners()
+    await this.refreshPluginUpdateStaging(result.latestVersion)
+    if (canSelfUpdate(this) && result.assets) {
+      void this.startPluginUpdateDownload()
+    }
+  }
+
+  /**
+   * Downloads the core update, waits until reloading would cut off no AI
+   * work, writes it, and hot-reloads the plugin; the instance it reloads into
+   * reports what changed. False when it cannot be done here — no self-update
+   * on this device, or a failed download or install — which leaves the update
+   * to the card.
+   */
+  private async installCoreUpdateAutomatically(
+    result: UpdateCheckResult,
+  ): Promise<boolean> {
+    if (!canSelfUpdate(this) || !result.assets) return false
+    await this.downloadPluginRelease(result.latestVersion, result.assets)
+    const version = normalizePluginVersion(result.latestVersion)
+    const state = this.pluginUpdateState
+    if (
+      state.status !== 'ready' ||
+      state.version !== version ||
+      state.repairFiles
+    ) {
+      return false
+    }
+    await this.waitUntilAiIdle()
+    if (this.isUnloaded) return true
+    writeAutoUpdatedCore(this.app, {
+      version,
+      releaseNotes: result.releaseNotes,
+    })
+    return this.applyPluginUpdate('plugin')
+  }
+
+  /**
+   * Resolves once reloading the plugin would cut off no AI work: no request in
+   * flight, and no agent or CLI run working or waiting for approval.
+   */
+  private async waitUntilAiIdle(): Promise<void> {
+    const busy = () =>
+      this.activeAbortControllers.size > 0 ||
+      [...this.latestBackgroundActivities.values()].some(
+        (activity) =>
+          activity.status === 'running' || activity.status === 'waiting',
+      )
+    while (!this.isUnloaded && busy()) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2_000))
+    }
+  }
+
+  /**
+   * From the update card: switches to automatic updates and runs this one
+   * now. The card stays up and shows the progress.
+   */
+  async switchToAutoUpdate(): Promise<void> {
+    await this.setSettings({ ...this.settings, pluginUpdateMode: 'auto' })
+    const core = this.updateCheckResult
+    if (core?.hasUpdate && (await this.installCoreUpdateAutomatically(core))) {
+      return
+    }
+    await this.moduleUpdateController?.updateAll()
+  }
+
+  getAutoUpdatedSnapshot = (): readonly AutoUpdatedItem[] =>
+    this.autoUpdatedItems
+
+  subscribeAutoUpdated = (listener: () => void): (() => void) => {
+    this.autoUpdatedListeners.add(listener)
+    return () => this.autoUpdatedListeners.delete(listener)
+  }
+
+  dismissAutoUpdated(): void {
+    this.autoUpdatedItems = Object.freeze([])
+    for (const listener of [...this.autoUpdatedListeners]) listener()
+  }
+
+  private async reportAutoUpdated(
+    core: AutoUpdatedCore | null,
+    modules: readonly InstalledModuleUpdate[],
+  ): Promise<void> {
+    const controller = this.moduleUpdateController
+    const moduleItems = await Promise.all(
+      modules.map(
+        async (module): Promise<AutoUpdatedItem> => ({
+          key: `${module.moduleId}@${module.version}`,
+          name: module.name,
+          version: module.version,
+          releaseNotes: (await controller?.loadInstalledNotes(module)) ?? null,
+        }),
+      ),
+    )
+    const items: AutoUpdatedItem[] = core
+      ? [
+          {
+            key: 'core',
+            name: 'YOLO',
+            version: core.version,
+            releaseNotes: core.releaseNotes,
+          },
+          ...moduleItems,
+        ]
+      : moduleItems
+    if (items.length === 0 || this.isUnloaded) return
+    this.autoUpdatedItems = Object.freeze(items)
+    for (const listener of [...this.autoUpdatedListeners]) listener()
+  }
+
+  /**
+   * Brings modules up to date after the core itself changed version — through
+   * the update toast, automatic updating, or by hand in community plugins. A
+   * coordinated release is one click on the core update; the modules it ships
+   * alongside, including any that need the new Host API, follow here on the
+   * next start. An unknown previous version (first start with this rule)
+   * counts as a change: only pending updates of enabled modules are
+   * installed, so a fresh install has nothing to do.
+   */
+  private async followCoreUpdate(): Promise<readonly InstalledModuleUpdate[]> {
+    const controller = this.moduleUpdateController
+    if (!controller) return []
+    const currentVersion = this.manifest.version
+    if (readLastLaunchedCoreVersion(this.app) === currentVersion) return []
+    const installed = await controller.installAll({
+      skipMuted: this.settings.pluginUpdateMode !== 'auto',
+    })
+    writeLastLaunchedCoreVersion(this.app, currentVersion)
+    return installed
+  }
+
+  private noticeModulesFollowedCore(
+    installed: readonly InstalledModuleUpdate[],
+  ): void {
+    if (installed.length === 0) return
+    new Notice(
+      this.t(
+        'update.modulesFollowedCore',
+        '{modules} updated along with YOLO',
+      ).replace(
+        '{modules}',
+        installed
+          .map((module) => `${module.name} ${module.version}`)
+          .join(', '),
+      ),
+    )
   }
 
   async openChatView(options?: {
@@ -3932,6 +4310,50 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
       return last ?? 'sidebar'
     }
     return action
+  }
+
+  private showRibbonPlacementMenu(event: MouseEvent) {
+    const items: {
+      placement: ChatLeafPlacement
+      title: string
+      icon: string
+    }[] = [
+      {
+        placement: 'sidebar',
+        title: this.t('chat.ribbonMenu.openInSidebar'),
+        icon: 'lucide-panel-right',
+      },
+      {
+        placement: 'tab',
+        title: this.t('chat.ribbonMenu.openInTab'),
+        icon: 'lucide-file-plus',
+      },
+      {
+        placement: 'split',
+        title: this.t('chat.ribbonMenu.openInSplit'),
+        icon: 'lucide-separator-vertical',
+      },
+    ]
+    if (Platform.isDesktop) {
+      items.push({
+        placement: 'window',
+        title: this.t('chat.ribbonMenu.openInWindow'),
+        icon: 'lucide-picture-in-picture-2',
+      })
+    }
+
+    const menu = new Menu()
+    for (const { placement, title, icon } of items) {
+      menu.addItem((item) =>
+        item
+          .setTitle(title)
+          .setIcon(icon)
+          .onClick(() => {
+            void this.openChatView({ placement })
+          }),
+      )
+    }
+    menu.showAtMouseEvent(event)
   }
 
   async openCurrentOrSidebarNewChat() {
@@ -4042,12 +4464,24 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     await this.moduleUpdateController?.update(key)
   }
 
+  async applyAllModuleUpdates(): Promise<void> {
+    await this.moduleUpdateController?.updateAll()
+  }
+
   getModuleSettingsContributionRegistry(): ModuleSettingsContributionRegistry {
     return this.moduleSettingsContributions
   }
 
   getModuleChatModeRegistry(): ModuleChatModeRegistry {
     return this.moduleChatModeRegistry
+  }
+
+  getModuleToolSetRegistry(): ModuleToolSetRegistry {
+    return this.moduleToolSetRegistry
+  }
+
+  getModuleFileTextRendererRegistry(): ModuleFileTextRendererRegistry {
+    return this.moduleFileTextRendererRegistry
   }
 
   private initializeModuleSystem(): void {
@@ -4084,8 +4518,13 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     const servicesReference: { current: ModuleService | null } = {
       current: null,
     }
+    const registrar = new ObsidianModuleContributionRegistrar(this)
+    // Plugin load runs before Obsidian restores the workspace layout, which is
+    // the only point where a ribbon icon gets its saved position back.
+    registrar.ribbonSlots.restore()
+    this.moduleRibbonSlots = registrar.ribbonSlots
     const runtime = new ModuleRuntime(
-      new ObsidianModuleContributionRegistrar(this),
+      registrar,
       new CoreModuleHostCapabilityProvider({
         agent: new CoreModuleAgentCapabilityProvider({
           isDebugCaptureEnabled: isLLMDebugCaptureEnabled,
@@ -4102,6 +4541,23 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
         backgroundActivities: this.getBackgroundActivityRegistry(),
         chat: new CoreModuleChatCapabilityProvider({
           sink: this.moduleChatModeRegistry,
+          toolSetSink: this.moduleToolSetRegistry,
+          fileTextRendererSink: this.moduleFileTextRendererRegistry,
+          addSelection: async ({ path, text, page }) => {
+            const file = this.app.vault.getAbstractFileByPath(path)
+            if (!(file instanceof TFile)) {
+              throw new Error(`Not a file in the vault: ${path}`)
+            }
+            // Line numbers mean nothing for a PDF (the host's own PDF
+            // selections carry 0 too); the page is what locates it.
+            await this.getChatViewNavigator().addSelectionBlockToChat({
+              content: text,
+              file,
+              startLine: 0,
+              endLine: 0,
+              ...(page === undefined ? {} : { pageNumber: page }),
+            })
+          },
         }),
         config: new ModuleConfigCapabilityProvider({
           createBackend: (moduleId) => {
@@ -4173,6 +4629,7 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
         ui: new ObsidianModuleUiCapabilityProvider({
           app: this.app,
           createConfirmModal: (app, options) => new ConfirmModal(app, options),
+          attachQuickAsk: createEmbeddedQuickAskAttacher(this),
           actionToasts: {
             show: (toast) => {
               if (!this.actionToastController) {
@@ -4188,8 +4645,13 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
               error,
             )
           },
+          saveFile: Platform.isDesktopApp ? showDesktopSaveDialog : undefined,
         }),
         vault: new ObsidianModuleVaultCapabilityProvider(this.app),
+        pdf: new ModulePdfCapabilityProvider(
+          () => this.getPdfDocumentCache(),
+          addPdfAnnotations,
+        ),
       }),
     )
     const runtimeReservation = new ModuleRuntimeReservation({ runtime })
@@ -4216,6 +4678,18 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
         legacySettings: this.rawLearningLegacySettings,
         enableIfAbsent: (moduleId) =>
           intentStore.setIfAbsent(moduleId, 'enabled'),
+      })
+    }
+    this.defaultModuleInstallSeed = async () => {
+      await seedDefaultModuleInstallIntents({
+        enableIfAbsent: (moduleId) =>
+          intentStore.setIfAbsent(moduleId, 'enabled'),
+        reportError: (moduleId, error) => {
+          console.error(
+            `[YOLO] Default install intent seeding failed for module "${moduleId}"`,
+            error,
+          )
+        },
       })
     }
     const getCompatibility = createOfficialModuleCompatibilityProvider({
@@ -4452,15 +4926,8 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
               asset?: NonNullable<(typeof descriptor)['assets']>[number],
             ) =>
               asset
-                ? resolveRuntimeComponentAssetSources(
-                    descriptor,
-                    asset,
-                    BAKED_PLUGIN_VERSION,
-                  )
-                : resolveRuntimeComponentArtifactSources(
-                    descriptor,
-                    BAKED_PLUGIN_VERSION,
-                  ),
+                ? resolveRuntimeComponentAssetSources(asset)
+                : resolveRuntimeComponentArtifactSources(descriptor),
           }
         : {}),
       reportCleanupError: (error) => {
@@ -4482,6 +4949,42 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
     })
     this.runtimeComponentService = service
     setRuntimeComponentService(service)
+
+    const pdfDocuments = new PdfDocumentCache({
+      readFile: async (path) => {
+        const file = this.app.vault.getFileByPath(path)
+        if (!file) throw new Error(`PDF file not found: ${path}`)
+        return new Uint8Array(await this.app.vault.readBinary(file))
+      },
+      acquireEngine: () => service.acquire('pdf-engine'),
+      reportError: (error) => {
+        console.error('[YOLO] PDF document cache error', error)
+      },
+    })
+    this.pdfDocumentCache = pdfDocuments
+    // Open documents hold engine leases; turning the engine off must close
+    // them rather than wait for every reader to let go.
+    service.registerQuiesceParticipant('pdf-engine', () =>
+      pdfDocuments.closeAll(),
+    )
+    this.registerEvent(
+      this.app.vault.on('modify', (file) => pdfDocuments.invalidate(file.path)),
+    )
+    this.registerEvent(
+      this.app.vault.on('delete', (file) => pdfDocuments.invalidate(file.path)),
+    )
+    this.registerEvent(
+      this.app.vault.on('rename', (_file, oldPath) =>
+        pdfDocuments.invalidate(oldPath),
+      ),
+    )
+  }
+
+  getPdfDocumentCache(): PdfDocumentCache {
+    if (!this.pdfDocumentCache) {
+      throw new Error('[YOLO] PDF documents are unavailable')
+    }
+    return this.pdfDocumentCache
   }
 
   private initializeLocalEmbedding(): void {
@@ -4512,6 +5015,9 @@ ${validationResult.error.issues.map((v) => v.message).join('\n')}`)
       .start()
       .catch((error) => {
         console.error('[YOLO] Failed to start modules', error)
+      })
+      .finally(() => {
+        if (!this.isUnloaded) this.moduleRibbonSlots?.releaseUnclaimed()
       })
   }
 

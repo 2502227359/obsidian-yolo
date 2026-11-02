@@ -21,6 +21,7 @@ import {
   clearDynamicStyleClass,
   updateDynamicStyleClass,
 } from '../../../utils/dom/dynamicStyleManager'
+import { getNodeWindow } from '../../../utils/dom/window-context'
 import type { MessageInputCoreRef } from '../../chat-view/chat-input/MessageInputCore'
 
 import { QuickAskPanel } from './QuickAskPanel'
@@ -43,6 +44,11 @@ type QuickAskOverlayOptions = {
   contextText: string
   fileTitle: string
   sourceFilePath?: string
+  /**
+   * Extra context from whoever opened the panel, injected after the editor
+   * snapshot — see QuickAskShowOptions.getSurfaceContext.
+   */
+  getSurfaceContext?: () => string | Promise<string>
   initialPrompt?: string
   initialMentionables?: Mentionable[]
   initialMode?: QuickAskLaunchMode
@@ -80,12 +86,44 @@ export class QuickAskOverlay {
   private dragPosition: { x: number; y: number } | null = null
   // Resize state - when set, override panel size
   private resizeSize: { width: number; height: number } | null = null
+  /**
+   * Width chosen by the first anchored placement, kept for later ones.
+   *
+   * The anchor's content column is measured in screen pixels, so on a surface
+   * that scales its content — a zoomed board — recomputing it would resize the
+   * panel every time the anchor moves. Following an anchor is about where the
+   * panel is, not how big it is.
+   */
+  private anchoredWidth: number | null = null
   // pos is only meaningful for CM-based anchors (ViewPlugin route)
   private pos: number | null = null
+  /**
+   * The window the overlay is actually mounted in. Resolved from the anchor at
+   * mount time: in a popout every timer, observer and listener has to come
+   * from that window — the main window's `requestAnimationFrame` is throttled
+   * while it is hidden, which would freeze a panel the user is looking at.
+   */
+  private hostWindow: Window & typeof globalThis = window
 
   constructor(private readonly options: QuickAskOverlayOptions) {}
 
   mount(pos?: number): void {
+    // One panel at a time, whoever opened it. `closeCurrentWithAnimation` and
+    // `focusCurrentInput` address *the* panel, and the shared overlay root
+    // belongs to one host element — a second live overlay would leave both
+    // pointing at the wrong one. Closing goes through the previous owner's
+    // own callback so its bookkeeping unwinds with it.
+    const previous = QuickAskOverlay.currentInstance
+    if (previous && previous !== this) {
+      // A panel already mid-fade would otherwise run its owner's close a
+      // fifth of a second from now — after this one has taken the focus.
+      if (previous.closeAnimationTimeout !== null) {
+        previous.hostWindow.clearTimeout(previous.closeAnimationTimeout)
+        previous.closeAnimationTimeout = null
+      }
+      previous.options.onClose()
+    }
+
     this.pos = pos ?? 0
     QuickAskOverlay.currentInstance = this
     this.mountOverlay()
@@ -100,12 +138,12 @@ export class QuickAskOverlay {
     }
 
     if (this.closeAnimationTimeout !== null) {
-      window.clearTimeout(this.closeAnimationTimeout)
+      this.hostWindow.clearTimeout(this.closeAnimationTimeout)
       this.closeAnimationTimeout = null
     }
 
     if (this.dockAnimationTimeout !== null) {
-      window.clearTimeout(this.dockAnimationTimeout)
+      this.hostWindow.clearTimeout(this.dockAnimationTimeout)
       this.dockAnimationTimeout = null
     }
 
@@ -123,7 +161,7 @@ export class QuickAskOverlay {
     this.cleanupCallbacks = []
 
     if (this.rafId !== null) {
-      cancelAnimationFrame(this.rafId)
+      this.hostWindow.cancelAnimationFrame(this.rafId)
       this.rafId = null
     }
 
@@ -167,7 +205,7 @@ export class QuickAskOverlay {
 
     if (QuickAskOverlay.overlayRoot) return QuickAskOverlay.overlayRoot
 
-    const root = document.createElement('div')
+    const root = host.ownerDocument.createElement('div')
     root.className = 'yolo-quick-ask-overlay-root'
     host.appendChild(root)
     host.classList.add('yolo-quick-ask-overlay-host')
@@ -191,7 +229,7 @@ export class QuickAskOverlay {
     if (instance.messageInputRef.current) {
       instance.messageInputRef.current.focus()
     } else {
-      window.requestAnimationFrame(() => {
+      instance.hostWindow.requestAnimationFrame(() => {
         instance.messageInputRef.current?.focus()
       })
     }
@@ -217,7 +255,7 @@ export class QuickAskOverlay {
     }
 
     // Wait for animation to complete before actually closing
-    this.closeAnimationTimeout = window.setTimeout(() => {
+    this.closeAnimationTimeout = this.hostWindow.setTimeout(() => {
       this.closeAnimationTimeout = null
       this.options.onClose()
     }, 200) // Match CSS animation duration
@@ -226,9 +264,10 @@ export class QuickAskOverlay {
   private mountOverlay() {
     const overlayHost = this.options.anchor.hostEl
     this.overlayHost = overlayHost
+    this.hostWindow = getNodeWindow(overlayHost)
 
     const overlayRoot = QuickAskOverlay.getOverlayRoot(overlayHost)
-    const overlayContainer = document.createElement('div')
+    const overlayContainer = overlayHost.ownerDocument.createElement('div')
     overlayContainer.className = 'yolo-quick-ask-overlay'
     overlayRoot.appendChild(overlayContainer)
     this.overlayContainer = overlayContainer
@@ -242,7 +281,7 @@ export class QuickAskOverlay {
     // popover positioning. Its own opacity-only closing animation (toggled
     // alongside overlayContainer's in closeWithAnimation) keeps it visually
     // in sync without touching transform.
-    const popoverPortalHost = document.createElement('div')
+    const popoverPortalHost = overlayHost.ownerDocument.createElement('div')
     popoverPortalHost.className = 'yolo-quick-ask-popover-portal'
     overlayRoot.appendChild(popoverPortalHost)
     this.popoverPortalHost = popoverPortalHost
@@ -276,6 +315,7 @@ export class QuickAskOverlay {
                       contextText={this.options.contextText}
                       fileTitle={this.options.fileTitle}
                       sourceFilePath={this.options.sourceFilePath}
+                      getSurfaceContext={this.options.getSurfaceContext}
                       initialPrompt={this.options.initialPrompt}
                       initialMentionables={this.options.initialMentionables}
                       initialMode={this.options.initialMode}
@@ -302,6 +342,7 @@ export class QuickAskOverlay {
                       contextText={this.options.contextText}
                       fileTitle={this.options.fileTitle}
                       sourceFilePath={this.options.sourceFilePath}
+                      getSurfaceContext={this.options.getSurfaceContext}
                       initialPrompt={this.options.initialPrompt}
                       initialMentionables={this.options.initialMentionables}
                       initialMode={this.options.initialMode}
@@ -326,17 +367,29 @@ export class QuickAskOverlay {
       </ChatViewProvider>,
     )
 
+    // The anchor's own window, not the global one: an overlay mounted in a
+    // popout is scrolled and resized by that window's events, and the main
+    // window's never fire for it.
+    const hostWindow = getNodeWindow(overlayHost)
+
     const handleScroll = () => this.schedulePositionUpdate()
-    window.addEventListener('scroll', handleScroll, true)
+    hostWindow.addEventListener('scroll', handleScroll, true)
     this.cleanupCallbacks.push(() =>
-      window.removeEventListener('scroll', handleScroll, true),
+      hostWindow.removeEventListener('scroll', handleScroll, true),
     )
 
     const handleResize = () => this.schedulePositionUpdate()
-    window.addEventListener('resize', handleResize)
+    hostWindow.addEventListener('resize', handleResize)
     this.cleanupCallbacks.push(() =>
-      window.removeEventListener('resize', handleResize),
+      hostWindow.removeEventListener('resize', handleResize),
     )
+
+    // An anchor that moves without scrolling says so itself — a board pans by
+    // transform, which fires neither scroll nor resize.
+    const unsubscribeAnchor = this.options.anchor.subscribe?.(this.reanchor)
+    if (unsubscribeAnchor) {
+      this.cleanupCallbacks.push(unsubscribeAnchor)
+    }
 
     const scrollEl = this.options.anchor.scrollEl
     if (scrollEl) {
@@ -346,7 +399,7 @@ export class QuickAskOverlay {
       )
     }
 
-    this.resizeObserver = new ResizeObserver(() =>
+    this.resizeObserver = new hostWindow.ResizeObserver(() =>
       this.schedulePositionUpdate(),
     )
     if (scrollEl) this.resizeObserver.observe(scrollEl)
@@ -374,16 +427,32 @@ export class QuickAskOverlay {
       this.closeWithAnimation()
     }
 
-    window.addEventListener('keydown', handleKeyDown, true)
+    const hostWindow = this.hostWindow
+    hostWindow.addEventListener('keydown', handleKeyDown, true)
     this.cleanupListeners = () => {
-      window.removeEventListener('keydown', handleKeyDown, true)
+      hostWindow.removeEventListener('keydown', handleKeyDown, true)
       this.cleanupListeners = null
     }
   }
 
+  /**
+   * Re-place the panel against an anchor that has physically moved.
+   *
+   * The first anchored placement locks itself into `dragPosition` so that
+   * later content growth and document edits stop pulling the panel around;
+   * an anchor moving under it is the one case where that lock has to be
+   * re-taken. A panel the user has dragged or docked has left the anchor
+   * behind for good and stays where it was put.
+   */
+  private reanchor = () => {
+    if (this.hasUserDragged || this.isDockedTopRight) return
+    this.dragPosition = null
+    this.schedulePositionUpdate()
+  }
+
   private schedulePositionUpdate() {
     if (this.rafId !== null) return
-    this.rafId = window.requestAnimationFrame(() => {
+    this.rafId = this.hostWindow.requestAnimationFrame(() => {
       this.rafId = null
       this.updateOverlayPosition()
     })
@@ -433,7 +502,7 @@ export class QuickAskOverlay {
 
     const hostRect =
       this.overlayHost?.getBoundingClientRect() ??
-      document.body.getBoundingClientRect()
+      this.hostWindow.document.body.getBoundingClientRect()
 
     const viewportWidth = hostRect.width
     const margin = 12
@@ -441,10 +510,11 @@ export class QuickAskOverlay {
 
     const contentBounds = anchor.getContentBounds()
     const editorContentWidth = contentBounds.width
-    const maxPanelWidth = Math.max(
-      120,
-      Math.min(editorContentWidth, viewportWidth - margin * 2),
-    )
+    const maxPanelWidth =
+      this.resizeSize?.width ??
+      this.anchoredWidth ??
+      Math.max(120, Math.min(editorContentWidth, viewportWidth - margin * 2))
+    this.anchoredWidth = maxPanelWidth
 
     const contentLeft = contentBounds.left - hostRect.left
     const contentRight = contentLeft + editorContentWidth
@@ -545,7 +615,7 @@ export class QuickAskOverlay {
     const margin = 12
     const hostRect =
       this.overlayHost?.getBoundingClientRect() ??
-      document.body.getBoundingClientRect()
+      this.hostWindow.document.body.getBoundingClientRect()
 
     // Panel rect 一次读两个维度,避免对同一元素两次 getBoundingClientRect。
     const panelRect = this.containerRef.current?.getBoundingClientRect() ?? null
@@ -607,7 +677,7 @@ export class QuickAskOverlay {
 
     const hostRect =
       this.overlayHost?.getBoundingClientRect() ??
-      document.body.getBoundingClientRect()
+      this.hostWindow.document.body.getBoundingClientRect()
     const dockRect = this.options.anchor.getDockReferenceRect()
 
     const measuredWidth = this.getPanelWidth()
@@ -641,10 +711,10 @@ export class QuickAskOverlay {
     this.overlayContainer.classList.add('yolo-quick-ask-overlay--docking')
 
     if (this.dockAnimationTimeout !== null) {
-      window.clearTimeout(this.dockAnimationTimeout)
+      this.hostWindow.clearTimeout(this.dockAnimationTimeout)
     }
 
-    this.dockAnimationTimeout = window.setTimeout(() => {
+    this.dockAnimationTimeout = this.hostWindow.setTimeout(() => {
       this.dockAnimationTimeout = null
       this.overlayContainer?.classList.remove('yolo-quick-ask-overlay--docking')
     }, 220)

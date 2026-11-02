@@ -1,6 +1,6 @@
 import { EditorView } from '@codemirror/view'
 import { useMutation } from '@tanstack/react-query'
-import { Notice, TFile, TFolder, normalizePath } from 'obsidian'
+import { Notice, TFile } from 'obsidian'
 import { Dispatch, MutableRefObject, SetStateAction, useCallback } from 'react'
 
 import { useApp } from '../../contexts/app-context'
@@ -8,10 +8,13 @@ import { useLanguage } from '../../contexts/language-context'
 import { useMcp } from '../../contexts/mcp-context'
 import { usePlugin } from '../../contexts/plugin-context'
 import { useSettings } from '../../contexts/settings-context'
+import type { ChatMode } from '../../core/agent/chat-mode'
+import { isModuleChatMode, isToolChatMode } from '../../core/agent/chat-mode'
 import { materializeTextEditPlan } from '../../core/edits/textEditEngine'
 import { parseTextEditPlan } from '../../core/edits/textEditPlan'
 import { captureLLMDebugOperation } from '../../core/llm/debugCapture'
-import { readEditReviewSnapshot } from '../../database/json/chat/editReviewSnapshotStore'
+import { getExtraAllowanceKeysForRequest } from '../../core/tools/native/paths'
+import { readEditReviewSnapshot } from '../../database/edit-review/editReviewSnapshotStore'
 import { selectionHighlightController } from '../../features/editor/selection-highlight/selectionHighlightController'
 import type { useChatHistory } from '../../hooks/useChatHistory'
 import type { useChatManager } from '../../hooks/useJsonManagers'
@@ -44,38 +47,14 @@ import {
 } from '../../utils/chat/tool-result-index'
 import { readTFileContent } from '../../utils/obsidian'
 
-import {
-  type ChatMode,
-  isAgentChatMode,
-  isModuleChatMode,
-} from './chat-input/ChatModeSelect'
+import { yoloPreferencePatch } from './chat-input/ChatModeSelect'
 import { invalidateChatRuntimeNavigation } from './cliChatIntegration'
+import { openEditTarget, usableSnapshotPair } from './editTargetIo'
 import { isDelegateSubagentToolName } from './messageNavigatorUtils'
+import { openEditSummaryFile } from './openEditSummaryFile'
 import type { QueryProgressState } from './QueryProgress'
 import type { useChatStreamManager } from './useChatStreamManager'
 import { serializeActiveBranchByUserMessageId } from './useYoloChatSession'
-
-const ensureDirectoryPathExists = async (
-  app: ReturnType<typeof useApp>,
-  path: string,
-): Promise<void> => {
-  const segments = normalizePath(path)
-    .split('/')
-    .filter((segment) => segment.length > 0)
-
-  let currentPath = ''
-  for (const segment of segments) {
-    currentPath = currentPath.length > 0 ? `${currentPath}/${segment}` : segment
-    const existing = app.vault.getAbstractFileByPath(currentPath)
-    if (!existing) {
-      await app.vault.createFolder(currentPath)
-      continue
-    }
-    if (!(existing instanceof TFolder)) {
-      throw new Error(`Path exists and is not a folder: ${currentPath}`)
-    }
-  }
-}
 
 const offsetToSelectionPosition = (content: string, offset: number) => {
   const clampedOffset = Math.max(0, Math.min(offset, content.length))
@@ -168,6 +147,7 @@ export type UseChatDomainActionsParams = {
   chatMessagesStateRef: MutableRefObject<ChatMessage[]>
   setChatMessages: Dispatch<SetStateAction<ChatMessage[]>>
   currentConversationId: string
+  isCurrentConversationRunActive: boolean
   conversationOverrides: ConversationOverrideSettings | null
   conversationModelId: string
   chatMode: ChatMode
@@ -241,6 +221,7 @@ export function useChatDomainActions({
   chatMessagesStateRef,
   setChatMessages,
   currentConversationId,
+  isCurrentConversationRunActive,
   conversationOverrides,
   conversationModelId,
   chatMode,
@@ -371,7 +352,7 @@ export function useChatDomainActions({
 
         if (allowForConversation) {
           if (request.metadata?.approvalPolicy === 'always-require-user') {
-            // See `AgentService.approveToolCall`'s matching guard: module
+            // See `AgentSessionService.approveToolCall`'s matching guard: module
             // chat mode tools declared `requiresApproval: true` are an
             // unconditional per-call confirmation gate and must never be
             // added to the conversation's "always allow" list, even from
@@ -389,6 +370,7 @@ export function useChatDomainActions({
               request.name,
               conversationId,
               args,
+              getExtraAllowanceKeysForRequest(request),
             )
           }
         }
@@ -428,7 +410,10 @@ export function useChatDomainActions({
               // match the schema used when the call was emitted.
               chatModelId:
                 toolMessage.metadata?.branchModelId ?? conversationModelId,
-              workspaceScope: isAgentChatMode(chatMode)
+              // Max carries the assistant's workspace scope for the same
+              // reason Agent does — the live path
+              // (`useChatStreamManager`) passes it for every built-in mode.
+              workspaceScope: isToolChatMode(chatMode)
                 ? selectedAssistant?.workspaceScope
                 : undefined,
               subagentParentContext: isDelegateSubagentToolName(request.name)
@@ -442,6 +427,8 @@ export function useChatDomainActions({
               // `ToolCallRequest.metadata.executionConstraints`.
               bashReadOnly:
                 request.metadata?.executionConstraints?.bashReadOnly,
+              capabilityForceEnabled:
+                request.metadata?.executionConstraints?.capabilityForceEnabled,
             }),
           getResponseBody: (response) => response,
         })
@@ -632,7 +619,7 @@ export function useChatDomainActions({
         {
           ...(conversationOverrides ?? {}),
           chatMode,
-          agentYoloEnabled: yoloEnabled,
+          ...yoloPreferencePatch(chatMode, yoloEnabled),
         },
         conversationModelId,
         serializeMessageModelMap(
@@ -874,6 +861,9 @@ export function useChatDomainActions({
 
       try {
         const undoStateByPath = new Map<string, 'applied' | 'unavailable'>()
+        // 「快照根本不在本机」和「文件后来又被改过」是两回事，前者只能提示
+        // 换回做出这次编辑的设备，所以分开记。
+        let missingSnapshotCount = 0
 
         for (const fileGroup of summary.files) {
           const [firstSnapshot, latestSnapshot] = await Promise.all([
@@ -882,63 +872,46 @@ export function useChatDomainActions({
               conversationId: currentConversationId,
               roundId: fileGroup.firstRoundId,
               filePath: fileGroup.path,
-              settings,
             }),
             readEditReviewSnapshot({
               app,
               conversationId: currentConversationId,
               roundId: fileGroup.latestRoundId,
               filePath: fileGroup.path,
-              settings,
             }),
           ])
 
-          if (!firstSnapshot || !latestSnapshot) {
+          const snapshots = usableSnapshotPair(firstSnapshot, latestSnapshot)
+          if (!snapshots) {
+            missingSnapshotCount += 1
             undoStateByPath.set(fileGroup.path, 'unavailable')
             continue
           }
 
-          const targetFile = app.vault.getAbstractFileByPath(fileGroup.path)
-          const currentFile = targetFile instanceof TFile ? targetFile : null
+          const target = await openEditTarget(app, fileGroup.path)
+          const currentContent = await target.read()
 
-          if (latestSnapshot.afterExists) {
-            if (!currentFile) {
-              undoStateByPath.set(fileGroup.path, 'unavailable')
-              continue
-            }
-
-            const currentContent = await app.vault.read(currentFile)
-            if (currentContent !== latestSnapshot.afterContent) {
-              undoStateByPath.set(fileGroup.path, 'unavailable')
-              continue
-            }
-          } else if (targetFile) {
+          if (
+            snapshots.latest.afterExists
+              ? currentContent !== snapshots.latest.afterContent
+              : currentContent !== null
+          ) {
             undoStateByPath.set(fileGroup.path, 'unavailable')
             continue
           }
 
           undoStateByPath.set(fileGroup.path, 'applied')
 
-          if (!firstSnapshot.beforeExists) {
-            if (currentFile) {
-              await app.fileManager.trashFile(currentFile)
+          if (!snapshots.first.beforeExists) {
+            if (currentContent !== null) {
+              await target.trash()
             }
             continue
           }
 
-          if (currentFile) {
-            const currentContent = await app.vault.read(currentFile)
-            if (currentContent !== firstSnapshot.beforeContent) {
-              await app.vault.modify(currentFile, firstSnapshot.beforeContent)
-            }
-            continue
+          if (currentContent !== snapshots.first.beforeContent) {
+            await target.write(snapshots.first.beforeContent)
           }
-
-          const parentPath = fileGroup.path.split('/').slice(0, -1).join('/')
-          if (parentPath.length > 0) {
-            await ensureDirectoryPathExists(app, parentPath)
-          }
-          await app.vault.create(fileGroup.path, firstSnapshot.beforeContent)
         }
 
         const appliedCount = summary.files.filter(
@@ -1002,6 +975,13 @@ export function useChatDomainActions({
               '部分文件已撤销，另一些文件因后续变更未覆盖。',
             ),
           )
+        } else if (missingSnapshotCount === summary.files.length) {
+          new Notice(
+            t(
+              'chat.editSummary.snapshotUnavailable',
+              '本设备没有这次编辑的快照，无法撤销或评审（快照只保存在本机，不随笔记同步）。',
+            ),
+          )
         } else {
           new Notice(
             t(
@@ -1023,7 +1003,6 @@ export function useChatDomainActions({
       chatMessages,
       currentConversationId,
       persistConversationImmediately,
-      settings,
       t,
       setChatMessages,
       setUndoingEditSummaryTarget,
@@ -1031,93 +1010,16 @@ export function useChatDomainActions({
   )
 
   const handleOpenEditSummaryFile = useCallback(
-    async ({
-      path,
-      firstRoundId,
-      latestRoundId,
-    }: GroupEditSummary['files'][number]) => {
-      const targetEntry = app.vault.getAbstractFileByPath(path)
-      const targetFile = targetEntry instanceof TFile ? targetEntry : null
-
-      if (!currentConversationId) {
-        if (!targetFile) {
-          new Notice(
-            t('chat.editSummary.fileMissing', '文件不存在或已被移动。'),
-          )
-          return
-        }
-        const leaf = app.workspace.getLeaf(false)
-        void leaf.openFile(targetFile)
-        return
-      }
-
-      const [firstSnapshot, latestSnapshot] = await Promise.all([
-        readEditReviewSnapshot({
-          app,
-          conversationId: currentConversationId,
-          roundId: firstRoundId,
-          filePath: path,
-          settings,
-        }),
-        readEditReviewSnapshot({
-          app,
-          conversationId: currentConversationId,
-          roundId: latestRoundId,
-          filePath: path,
-          settings,
-        }),
-      ])
-
-      if (firstSnapshot && latestSnapshot) {
-        if (!latestSnapshot.afterExists) {
-          new Notice(
-            t(
-              'chat.editSummary.fileDeleted',
-              '文件已被删除，可使用撤销进行恢复。',
-            ),
-          )
-          return
-        }
-
-        if (!targetFile) {
-          new Notice(
-            t('chat.editSummary.fileMissing', '文件不存在或已被移动。'),
-          )
-          return
-        }
-
-        const currentContent = await app.vault.read(targetFile)
-        if (currentContent !== latestSnapshot.afterContent) {
-          const leaf = app.workspace.getLeaf(false)
-          await leaf.openFile(targetFile)
-          new Notice(
-            t(
-              'chat.editSummary.undoUnavailable',
-              '文件内容已变化，无法安全撤销本轮修改。',
-            ),
-          )
-          return
-        }
-
-        await plugin.openApplyReview({
-          file: targetFile,
-          originalContent: firstSnapshot.beforeContent,
-          newContent: latestSnapshot.afterContent,
-          viewMode: 'applied-review',
-          reviewMode: 'full',
-        })
-        return
-      }
-
-      if (!targetFile) {
-        new Notice(t('chat.editSummary.fileMissing', '文件不存在或已被移动。'))
-        return
-      }
-
-      const leaf = app.workspace.getLeaf(false)
-      await leaf.openFile(targetFile)
-    },
-    [app, app.vault, app.workspace, currentConversationId, plugin, settings, t],
+    (file: GroupEditSummary['files'][number]) =>
+      openEditSummaryFile({
+        app,
+        openApplyReview: (state) => plugin.openApplyReview(state),
+        t,
+        conversationId: currentConversationId || null,
+        isRunActive: isCurrentConversationRunActive,
+        file,
+      }),
+    [app, currentConversationId, isCurrentConversationRunActive, plugin, t],
   )
 
   const updateToolMessageInChatHistory = useCallback(

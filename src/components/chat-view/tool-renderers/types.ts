@@ -11,14 +11,10 @@ import type {
 
 /**
  * Per-tool-call context a custom renderer needs to mount. Assembled and
- * handed down by the caller (currently nothing live — ToolMessage.tsx's own
- * rendering still runs unchanged until D8 replaces its `if` chain with a
- * lookup into `TOOL_RENDERERS`); this type is what that future call site
- * must produce.
+ * handed down by the caller (ToolMessage.tsx).
  *
- * Shape decided against `delegate_subagent`'s `SubagentCard` (Phase 1 D3 —
- * see phase1-skeleton.md's "关键验证点"), the upper bound of what a custom
- * card needs:
+ * Shape decided against `delegate_subagent`'s `SubagentCard`, the upper
+ * bound of what a custom card needs:
  *   - `toolCallId` / `request` / `response` / `conversationId`: plain values
  *     already threaded through ToolMessage.tsx's per-call render function.
  *   - `subagentResult`: message-tree-derived (looked up from a
@@ -31,7 +27,7 @@ import type {
  *
  * Extending this bag with more optional fields as later tools need them is
  * additive and does not require revisiting this shape or any existing
- * renderer. `terminalCommandResult` (D8) is the first such addition —
+ * renderer. `terminalCommandResult` is the first such addition —
  * `terminal_command`'s `body` renderer needs it to hydrate a live/persisted
  * background-session result, mirroring `subagentResult` above.
  */
@@ -51,16 +47,16 @@ export type ToolRendererProps = {
  * in the plain-text transcript `getToolMessageContent` produces. A pure
  * function of the call's *arguments* — no React, no response data — which is
  * why its implementations live beside each tool's `definition.ts` in
- * `core/tools/<tool>/chat-summary.ts` rather than in a `ui.tsx` (D8): they
+ * `core/tools/<tool>/chat-summary.ts` rather than in a `ui.tsx`: they
  * need no more from the UI layer than `ui.tsx` files are explicitly allowed
- * to avoid (master.md §3.2 — `definition.ts` never imports `ui.tsx`).
+ * to avoid (`definition.ts` never imports `ui.tsx`).
  *
  * `labels` is declared here as a plain structural echo of the handful of
  * translated strings any summary function needs (currently: `todo_write`'s
  * four list-state strings, `terminal_command`'s three session-follow-up
  * strings) — NOT an import of `ToolMessage.tsx`'s `ToolLabels`. Importing
  * that type would create a components -> components cycle the moment
- * `ToolMessage.tsx` itself imports `TOOL_RENDERERS` (this D8 change), since
+ * `ToolMessage.tsx` itself imports `TOOL_RENDERERS`, since
  * a component-scoped type-only import is still an edge this project's
  * circular-dependency check counts (see `core/tools/types.ts`'s
  * `OpaqueSubagentParentContext` doc comment for the same reasoning applied
@@ -70,9 +66,9 @@ export type ToolRendererProps = {
  * narrows `labels` down to only the fields it actually reads (see
  * `terminal_command/chat-summary.ts` / `todo_write/chat-summary.ts`).
  *
- * Returns `undefined` for "no summary" — e.g. every tool that had no branch
- * in the old `if` chain (memory_add/update/delete, context_compact,
- * context_prune_tool_results, ask_user_question) simply omits this field.
+ * Returns `undefined` for "no summary" on a particular call — e.g. an empty
+ * query. A tool that should never show one declares `summary: null` instead
+ * of omitting the field; see `ToolRenderer`.
  */
 export type ToolChatSummaryLabels = {
   todoWriteCleared: string
@@ -95,46 +91,77 @@ export type ToolChatSummaryFn = (args: {
 /**
  * A tool's chat-surface rendering strategy.
  *
- * Three kinds, because the existing card mount sites in ToolMessage.tsx come
- * in exactly two custom shapes plus the default:
+ * Four kinds, because the card mount sites in ToolMessage.tsx come in three
+ * custom shapes plus the default:
  *
  * - `{ kind: 'generic' }` — explicit opt-out meaning "no custom card; use the
  *   default collapsed-card rendering". Distinct from a missing table entry,
  *   which is a compile error (see `TOOL_RENDERERS`'s doc comment).
  *
  * - `{ kind: 'replace', render }` — renders *instead of* the whole tool-call
- *   block. Modelled on `SubagentCard` (`ToolMessage.tsx`'s pre-D8 early
+ *   block. Modelled on `SubagentCard` (`ToolMessage.tsx`'s former early
  *   `return`), which takes over the entire call's presentation.
  *
  * - `{ kind: 'body', render }` — renders *inside* the default collapsed
  *   card's content area, below the parameters section. Modelled on
- *   `LiveTaskCard` (`ToolMessage.tsx`'s pre-D8 `isTerminalLikeRequest`
+ *   `LiveTaskCard` (`ToolMessage.tsx`'s former `isTerminalLikeRequest`
  *   branch), which augments the generic card rather than replacing it.
- *   Without this variant, terminal-like tools (D6 batch 6) could not be
- *   expressed at all. `terminal_command` is the sole `body` entry (D8) —
+ *   Without this variant, terminal-like tools could not be
+ *   expressed at all. `terminal_command` is the sole `body` entry —
  *   the CLI `command_execution` capability and the legacy
  *   `delegate_external_agent` name also mount `LiveTaskCard`, but neither is
  *   tool-name-indexed, so both stay as inline branches in `ToolMessage.tsx`
  *   rather than table entries (see that file's own comment at the mount
  *   site).
  *
- * Either `render` may return `null` for a particular call/state to fall back
+ * - `{ kind: 'content', render }` — renders *as* the default card's whole
+ *   content area: it replaces both the "参数" (arguments JSON) section and
+ *   the "结果" (result JSON) section, while the header, the collapse
+ *   toggle, and the approval / running footers stay exactly as they are for
+ *   every other tool. The file-editing tools (`fs_edit`, `fs_write`,
+ *   `edit_file`, `write_file`) are its only entries: their expanded
+ *   card shows a diff of what the call actually changed, and neither of the
+ *   two JSON blocks it replaces adds anything a diff doesn't already say —
+ *   `oldText`/`newText`/`content` *are* the diff, spelled as escaped JSON.
+ *
+ *   `body` cannot express this: it is defined as "append below the default
+ *   sections", so a `body` renderer would leave the arguments JSON sitting
+ *   above the diff (and, once the call succeeds, the result JSON too).
+ *   `replace` overshoots in the other direction — it takes over the header
+ *   and the approval footer as well, which these tools must keep: a pending
+ *   file write still needs its Allow/Reject row and its `+N/-M` headline.
+ *
+ * Any `render` may return `null` for a particular call/state to fall back
  * to the default rendering — e.g. `delegate_subagent`'s renderer returns
  * `null` while pending approval, matching current behavior where the approval
- * footer (not `SubagentCard`) owns that state.
+ * footer (not `SubagentCard`) owns that state; the file-editing `content`
+ * renderer returns `null` for every status `resolveFileChangeRows` does not
+ * draw, so a failed or rejected write still shows its error/rejection
+ * section verbatim.
  *
- * `summary` (D8) is orthogonal to `kind` — a `generic`-kind tool can still
+ * `summary` is orthogonal to `kind` — a `generic`-kind tool can still
  * have a custom header summary (most of them do); see `ToolChatSummaryFn`'s
  * own doc comment above.
  *
  * Deliberately NOT modelled here: `CliSubagentCard` (`ToolMessage.tsx`'s
  * `cliSubagent.presentation && actions && sessionRef` branch). That gate is
  * a capability/state condition, not a tool name — so it is not a by-name
- * concern and stays out of this table (phase2-migration.md D8: non-tool-name
- * branches are preserved as-is).
+ * concern and stays out of this table.
  */
 export type ToolRenderer = {
-  summary?: ToolChatSummaryFn
+  /**
+   * Required, and `null` is a real answer — not an omission.
+   *
+   * `kind` and `summary` are orthogonal decisions, so a shared constant that
+   * settles one of them must not silently settle the other. When this field
+   * was optional, wiring a new tool to the `genericRenderer` constant read as
+   * "no custom card" while also, unnoticed, meaning "no header summary" —
+   * which is how `vault_search` shipped with a bare title while every
+   * comparable tool showed its arguments. Making it required forces the
+   * second decision to be written down: a summary function, or `null` with a
+   * reason.
+   */
+  summary: ToolChatSummaryFn | null
 } & (
   | { kind: 'generic' }
   | {
@@ -143,6 +170,10 @@ export type ToolRenderer = {
     }
   | {
       kind: 'body'
+      render: (props: ToolRendererProps) => ReactNode
+    }
+  | {
+      kind: 'content'
       render: (props: ToolRendererProps) => ReactNode
     }
 )

@@ -1,11 +1,15 @@
 import * as nacl from 'tweetnacl'
 
+import {
+  type ModuleCatalogLocalizations,
+  parseModuleCatalogLocalizations,
+} from '../modules/moduleCatalogPresentation'
 import { parseModuleReleaseUrl } from '../modules/moduleReleaseUrl'
 import {
   OfficialModuleCatalogV1,
   OfficialModuleDataSchema,
   OfficialModulePlatform,
-  parseOfficialModuleCatalog,
+  isModuleHostApiRange,
 } from '../modules/officialModuleCatalog'
 
 export const DISTRIBUTION_FEED_KEY_ID = 'yolo-distribution-2026-01'
@@ -16,6 +20,8 @@ const SHA256 = /^[a-f0-9]{64}$/
 const CORE_VERSION = /^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){2,3}$/
 const MODULE_VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/
 const MODULE_ID = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/
+const SCHEMA_NAMESPACE = /^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/
+const DANGEROUS_NAMESPACES = new Set(['__proto__', 'prototype', 'constructor'])
 
 export type DistributionReleaseNotes = Readonly<{ en: string; zh: string }>
 
@@ -49,9 +55,7 @@ export type DistributionCore = Readonly<{
 export type DistributionModule = Readonly<{
   id: string
   icon: string
-  localizations: Readonly<
-    Record<string, Readonly<{ name: string; description: string }>>
-  >
+  localizations: ModuleCatalogLocalizations
   version: string
   hostApi: string
   platforms: readonly OfficialModulePlatform[]
@@ -95,10 +99,18 @@ export function verifyAndParseDistributionFeed(
   return parseFeed(decoded)
 }
 
+/**
+ * Reshapes the verified Feed into the catalog shape the module manager reads.
+ *
+ * There is no second parse here: the Feed is signature-verified and `parseFeed`
+ * already enforces every invariant the resolver depends on. Re-serializing this
+ * object only to run it back through an adversarial-input parser validated
+ * nothing the publisher's key had not already vouched for.
+ */
 export function projectDistributionFeedCatalog(
   feed: DistributionFeedV1,
 ): OfficialModuleCatalogV1 {
-  const projection = {
+  return Object.freeze({
     schemaVersion: 1 as const,
     modules: Object.freeze(
       feed.modules.map((module) =>
@@ -127,15 +139,12 @@ export function projectDistributionFeedCatalog(
         }),
       ),
     ),
-  }
-  return parseOfficialModuleCatalog(JSON.stringify(projection), {
-    allowedRepositories: [{ owner: 'Lapis0x0', repo: 'obsidian-yolo' }],
   })
 }
 
 function parseFeed(value: unknown): DistributionFeedV1 {
   const feed = record(value, 'Distribution Feed')
-  exactKeys(feed, ['schemaVersion', 'revision', 'keyId', 'core', 'modules'])
+  requireKeys(feed, ['schemaVersion', 'revision', 'keyId', 'core', 'modules'])
   if (
     feed.schemaVersion !== 1 ||
     !Number.isSafeInteger(feed.revision) ||
@@ -161,7 +170,7 @@ function parseFeed(value: unknown): DistributionFeedV1 {
 
 function parseCore(value: unknown): DistributionCore {
   const core = record(value, 'Core distribution')
-  exactKeys(core, [
+  requireKeys(core, [
     'version',
     'minAppVersion',
     'releaseUrl',
@@ -178,7 +187,7 @@ function parseCore(value: unknown): DistributionCore {
     throw new Error('Core distribution is invalid')
   }
   const assets = record(core.assets, 'Core assets')
-  exactKeys(assets, ['mainJs', 'manifestJson', 'stylesCss'])
+  requireKeys(assets, ['mainJs', 'manifestJson', 'stylesCss'])
   return Object.freeze({
     version: core.version,
     minAppVersion: core.minAppVersion,
@@ -206,7 +215,7 @@ function parseCore(value: unknown): DistributionCore {
 
 function parseModule(value: unknown): DistributionModule {
   const module = record(value, 'Module distribution')
-  exactKeys(module, [
+  requireKeys(module, [
     'id',
     'icon',
     'localizations',
@@ -226,26 +235,35 @@ function parseModule(value: unknown): DistributionModule {
     !module.icon ||
     typeof module.version !== 'string' ||
     !MODULE_VERSION.test(module.version) ||
-    typeof module.hostApi !== 'string' ||
-    !module.hostApi ||
+    !isModuleHostApiRange(module.hostApi) ||
     !Array.isArray(module.platforms) ||
     module.platforms.length === 0 ||
     module.platforms.some(
       (platform) => platform !== 'desktop' && platform !== 'mobile',
     ) ||
+    new Set(module.platforms).size !== module.platforms.length ||
     !isReleasePage(module.releaseUrl, `${module.id}/v${module.version}`)
   ) {
     throw new Error('Module distribution is invalid')
   }
-  const localizations = parseLocalizations(module.localizations)
+  const localizations = parseModuleCatalogLocalizations(
+    module.localizations,
+    'Module localizations',
+  )
   const schemas = record(module.dataSchemas, 'Module data schemas')
   const parsedSchemas = Object.create(null) as Record<
     string,
     OfficialModuleDataSchema
   >
   for (const [namespace, schemaValue] of Object.entries(schemas)) {
+    if (
+      !SCHEMA_NAMESPACE.test(namespace) ||
+      DANGEROUS_NAMESPACES.has(namespace)
+    ) {
+      throw new Error('Module data schema namespace is invalid')
+    }
     const schema = record(schemaValue, 'Module data schema')
-    exactKeys(schema, ['readMin', 'readMax', 'write'])
+    requireKeys(schema, ['readMin', 'readMax', 'write'])
     if (
       !isSchemaVersion(schema.readMin) ||
       !isSchemaVersion(schema.readMax) ||
@@ -295,7 +313,13 @@ function parseAsset(
   expectedTag: string,
 ): DistributionAsset {
   const asset = record(value, 'Distribution asset')
-  exactKeys(asset, ['name', 'mirrorPath', 'canonicalUrl', 'byteSize', 'sha256'])
+  requireKeys(asset, [
+    'name',
+    'mirrorPath',
+    'canonicalUrl',
+    'byteSize',
+    'sha256',
+  ])
   if (
     typeof asset.name !== 'string' ||
     !asset.name ||
@@ -322,7 +346,7 @@ function parseReleaseNoteAsset(
   expectedTag: string,
 ): DistributionReleaseNoteAsset {
   const asset = record(value, 'Release note asset')
-  exactKeys(asset, ['name', 'canonicalUrl', 'byteSize', 'sha256'])
+  requireKeys(asset, ['name', 'canonicalUrl', 'byteSize', 'sha256'])
   if (
     asset.name !== 'release-note.md' ||
     !isCanonicalReleaseDownload(asset.canonicalUrl, asset.name, expectedTag) ||
@@ -344,7 +368,7 @@ function parseReleaseNoteAsset(
 
 function parseNotes(value: unknown): DistributionReleaseNotes {
   const notes = record(value, 'Distribution release notes')
-  exactKeys(notes, ['en', 'zh'])
+  requireKeys(notes, ['en', 'zh'])
   if (
     typeof notes.en !== 'string' ||
     !notes.en ||
@@ -356,37 +380,6 @@ function parseNotes(value: unknown): DistributionReleaseNotes {
     throw new Error('Distribution release notes are invalid')
   }
   return Object.freeze({ en: notes.en, zh: notes.zh })
-}
-
-function parseLocalizations(
-  value: unknown,
-): DistributionModule['localizations'] {
-  const localizations = record(value, 'Module localizations')
-  const parsed = Object.create(null) as Record<
-    string,
-    Readonly<{ name: string; description: string }>
-  >
-  for (const [locale, localizationValue] of Object.entries(localizations)) {
-    const localization = record(localizationValue, 'Module localization')
-    exactKeys(localization, ['name', 'description'])
-    if (
-      !/^[a-z]{2}(?:-[A-Z]{2})?$/.test(locale) ||
-      typeof localization.name !== 'string' ||
-      !localization.name ||
-      typeof localization.description !== 'string' ||
-      !localization.description
-    ) {
-      throw new Error('Module localization is invalid')
-    }
-    parsed[locale] = Object.freeze({
-      name: localization.name,
-      description: localization.description,
-    })
-  }
-  if (Object.keys(parsed).length === 0) {
-    throw new Error('Module localizations are empty')
-  }
-  return Object.freeze(parsed)
 }
 
 function decodeFeedBytes(raw: string | Uint8Array): Uint8Array {
@@ -423,17 +416,26 @@ function record(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
-function exactKeys(
+/**
+ * Requires every declared field and ignores any other.
+ *
+ * The Feed is Ed25519-signed by the release pipeline, so an unknown field can
+ * only be one this publisher added. Rejecting it would mean every already
+ * shipped client stops parsing the Feed the moment a newer field appears —
+ * update checks would return null with no online path back, since the client
+ * that must be replaced is the one refusing the Feed that describes its
+ * replacement. Forward compatibility therefore has to be the default, and a
+ * change that older clients must *not* apply gets a new `schemaVersion`.
+ */
+function requireKeys(
   value: Record<string, unknown>,
   keys: readonly string[],
 ): void {
-  const actual = Object.keys(value).sort()
-  const expected = [...keys].sort()
-  if (
-    actual.length !== expected.length ||
-    actual.some((key, index) => key !== expected[index])
-  ) {
-    throw new Error('Distribution object fields are invalid')
+  const missing = keys.find(
+    (key) => !Object.prototype.hasOwnProperty.call(value, key),
+  )
+  if (missing !== undefined) {
+    throw new Error(`Distribution object is missing field "${missing}"`)
   }
 }
 

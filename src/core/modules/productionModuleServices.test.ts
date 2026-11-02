@@ -7,7 +7,7 @@ import { ModuleDeviceStateStore } from './moduleDeviceStateStore'
 import type { ModuleIntent } from './moduleIntentStore'
 import { ModuleRuntimeReservation } from './moduleRuntimeReservation'
 import { ModuleStore } from './moduleStore'
-import { parseOfficialModuleCatalog } from './officialModuleCatalog'
+import type { OfficialModuleCatalogV1 } from './officialModuleCatalog'
 import { OfficialModuleCatalogSource } from './officialModuleCatalogSource'
 import { createOfficialModuleCompatibilityProvider } from './officialModuleCompatibilityProvider'
 import {
@@ -82,6 +82,9 @@ class MemoryAdapter {
   }
 
   async list(path: string): Promise<{ files: string[]; folders: string[] }> {
+    // Obsidian's adapter throws for a path that does not exist; a lenient empty
+    // listing would hide every "the artifacts are gone" code path.
+    if (!this.folders.has(path)) throw new Error(`Missing folder: ${path}`)
     const prefix = `${path}/`
     return {
       files: [...this.textFiles.keys(), ...this.binaryFiles.keys()].filter(
@@ -301,9 +304,7 @@ function createHarness(
     },
   })
   const loadCatalog = async () =>
-    parseOfficialModuleCatalog((await catalogRequest()).text, {
-      allowedRepositories: [{ owner: 'Lapis0x0', repo: 'obsidian-yolo' }],
-    })
+    JSON.parse((await catalogRequest()).text) as OfficialModuleCatalogV1
   const catalogSource = new OfficialModuleCatalogSource({
     client: { load: loadCatalog, loadFresh: loadCatalog },
     getCompatibility,
@@ -513,11 +514,22 @@ describe('createProductionModuleServices', () => {
     expect(await harness.adapter.exists(previousRoot)).toBe(true)
   })
 
-  it('rejects a stale same-version candidate without removing active artifacts', async () => {
+  // The hash, not the version, binds a download to what the user confirmed: a
+  // rebuilt artifact keeps the version and changes only the manifest.
+  it('rejects a same-version candidate whose manifest changed, without removing active artifacts', async () => {
     const harness = createHarness()
     await harness.services.refresh()
     const candidate = harness.services.getInstallCandidate('learning')!
     await harness.services.install(candidate)
+
+    const rebuilt = JSON.parse(harness.fixture.catalog) as {
+      modules: Array<{ versions: Array<{ manifest: { sha256: string } }> }>
+    }
+    rebuilt.modules[0].versions[0].manifest.sha256 = 'c'.repeat(64)
+    harness.catalogRequest.mockResolvedValueOnce(
+      response(JSON.stringify(rebuilt)),
+    )
+    await harness.services.checkForUpdates()
 
     await expect(harness.services.install(candidate)).rejects.toThrow(
       'candidate changed after confirmation',
@@ -683,6 +695,49 @@ describe('createProductionModuleServices', () => {
     expect(harness.services.getSnapshot().modules[0]?.catalog?.version).toBe(
       '1.2.4',
     )
+  })
+
+  // Deleting or reinstalling the plugin folder wipes the artifacts while the
+  // device-state row survives. That row keeps reporting the module installed at
+  // a version whose bytes are gone, and refuses the uninstall (no intent left
+  // to clear).
+  it('drops a device state whose intent and artifacts are both gone', async () => {
+    const harness = createHarness()
+    const root = await seedActiveVersion(harness, '1.2.3')
+    harness.adapter.folders.delete(root)
+    harness.intents.delete('learning')
+    harness.activeVersions.delete('learning')
+    await harness.services.refresh()
+    // The catalog resolves the very version the dead row claims, so the
+    // reinstall is offered even before startup drops that row.
+    expect(harness.services.getInstallCandidate('learning')).toMatchObject({
+      moduleId: 'learning',
+      expectedVersion: '1.2.3',
+    })
+
+    await harness.services.start()
+
+    expect(await harness.deviceStateStore.read('learning')).toBeNull()
+    expect(harness.services.getInstallCandidate('learning')).toMatchObject({
+      moduleId: 'learning',
+      expectedVersion: '1.2.3',
+    })
+  })
+
+  // A moved YOLO base directory or a Vault whose data has not synced makes the
+  // intent look absent while the module is perfectly installed. Losing it there
+  // would cost the user a working module and a full re-download.
+  it('keeps an installed module whose intent has merely gone missing', async () => {
+    const harness = createHarness()
+    const root = await seedActiveVersion(harness, '1.2.3')
+    await harness.adapter.write(`${root}/entry.js`, '/* entry */')
+    harness.intents.delete('learning')
+
+    await harness.services.start()
+
+    expect(await harness.deviceStateStore.read('learning')).toMatchObject({
+      active: { version: '1.2.3' },
+    })
   })
 
   it('activates a pending target and commits it as active', async () => {

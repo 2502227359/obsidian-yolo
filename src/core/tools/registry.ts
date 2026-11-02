@@ -1,14 +1,20 @@
+import { getLocalFileToolServerName } from '../mcp/localFileToolNames'
+import { getToolName } from '../mcp/tool-name-utils'
+
 import { CAPABILITIES } from './capabilities'
 import type {
   BuiltinCapabilityDefinition,
+  BuiltinChatModeId,
   BuiltinToolDefinition,
+  ChatModeCapabilityOverride,
+  ChatModeCapabilityOverrides,
 } from './types'
 
 /**
  * The finite set of capability ids / tool names, derived structurally from
  * the concrete `CAPABILITIES` array rather than hand-maintained. This is the
  * root every completeness check in this project hangs off: the two exhaustive
- * UI wiring tables (`TOOL_RENDERERS` / `CAPABILITY_SETTINGS_LAUNCHERS`, D4)
+ * UI wiring tables (`TOOL_RENDERERS` / `CAPABILITY_SETTINGS_LAUNCHERS`)
  * `satisfies Record<BuiltinToolName, ...>` / `Record<BuiltinCapabilityId, ...>`
  * against these unions, so forgetting to wire up a new tool/capability is a
  * compile error instead of a silent gap.
@@ -56,7 +62,7 @@ export function assertNoDuplicates(
 
 // Build-time assertions: capability ids and tool names must each be unique.
 // A `Record<K, V>` literal silently de-duplicates repeated keys, so the two
-// exhaustive wiring tables in D4 would NOT catch a duplicate on their own —
+// exhaustive wiring tables would NOT catch a duplicate on their own —
 // this is the only place that does.
 assertNoDuplicates(
   CAPABILITIES.map((capability) => capability.id),
@@ -93,5 +99,58 @@ export const listBuiltinTools = (): readonly BuiltinToolDefinition[] =>
 export const isBuiltinToolName = (name: string): name is BuiltinToolName =>
   BUILTIN_TOOLS.some((tool) => tool.name === name)
 
+/**
+ * Fully-qualified names (`yolo_local__fs_read`, see `getToolName`) of every
+ * built-in tool — the form an assistant's enabled-tool list and the agent
+ * runtime's `allowedToolNames` speak in.
+ */
+export const listBuiltinToolNames = (): string[] =>
+  BUILTIN_TOOLS.map((tool) =>
+    getToolName(getLocalFileToolServerName(), tool.name),
+  )
+
+/**
+ * The same, narrowed to what a built-in chat mode exposes to the model: every
+ * tool of every capability whose `chatModes` includes `mode`.
+ *
+ * This is the *only* derivation of per-mode tool visibility. A mode that
+ * wants to hide a capability changes that capability's `chatModes`; there is no list of
+ * blocked ids or names to keep in sync anywhere. Module chat modes never
+ * reach here — see `chatModes`'s doc comment in types.ts.
+ */
+export const getToolNamesForChatMode = (mode: BuiltinChatModeId): string[] =>
+  (CAPABILITIES as readonly BuiltinCapabilityDefinition[])
+    .filter((capability) => capability.chatModes.includes(mode))
+    .flatMap((capability) =>
+      capability.tools.map((tool) =>
+        getToolName(getLocalFileToolServerName(), tool.name),
+      ),
+    )
+
+/**
+ * Fully-qualified names of the tools one capability owns. Same projection as
+ * {@link getToolNamesForChatMode}, addressed by capability instead of by
+ * mode — used where a runtime grant names capabilities rather than tools.
+ */
+export const getToolNamesForCapability = (capabilityId: string): string[] =>
+  (getCapability(capabilityId)?.tools ?? []).map((tool) =>
+    getToolName(getLocalFileToolServerName(), tool.name),
+  )
+
 export const isBuiltinCapabilityId = (id: string): id is BuiltinCapabilityId =>
   CAPABILITIES.some((capability) => capability.id === id)
+
+/**
+ * The running mode's override for the capability that owns `toolName` (a
+ * short name, not an FQN), if any. The single lookup every consumer of
+ * {@link ChatModeCapabilityOverrides} goes through, so "which capability owns
+ * this tool" is answered here rather than at each call site.
+ */
+export const getCapabilityOverrideForTool = (
+  overrides: ChatModeCapabilityOverrides | undefined,
+  toolName: string,
+): ChatModeCapabilityOverride | undefined => {
+  if (!overrides) return undefined
+  const capability = getCapabilityForTool(toolName)
+  return capability ? overrides.get(capability.id) : undefined
+}

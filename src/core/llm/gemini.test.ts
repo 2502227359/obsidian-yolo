@@ -260,6 +260,50 @@ describe('GeminiProvider response parsing', () => {
     ])
   })
 
+  it('answers an invoke_tool call under the name the model actually called', () => {
+    // The gateway rewrites the request to the tool `invoke_tool` wrapped, so
+    // the stored response names a tool Gemini was never given. The response
+    // has to go back under the envelope's name or Gemini rejects the turn.
+    const contents = GeminiProvider.buildRequestContents([
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            id: 'call-1',
+            name: 'yolo_local__invoke_tool',
+            arguments: args({
+              tool_name: 'notion__notion-search',
+              arguments: { query: 'x' },
+            }),
+          },
+        ],
+      },
+      {
+        role: 'tool',
+        tool_call: {
+          id: 'call-1',
+          name: 'notion__notion-search',
+          arguments: args({ query: 'x' }),
+        },
+        content: 'hit',
+      },
+    ])
+
+    expect(contents[1]).toEqual({
+      role: 'user',
+      parts: [
+        {
+          functionResponse: {
+            id: 'call-1',
+            name: 'yolo_local__invoke_tool',
+            response: { result: 'hit' },
+          },
+        },
+      ],
+    })
+  })
+
   it('preserves assistant tool-only turns without dropping function calls', () => {
     const contents = GeminiProvider.buildRequestContents([
       {
@@ -298,21 +342,23 @@ describe('GeminiProvider response parsing', () => {
   it('keeps tool calls when finish reason is STOP in non-stream response', () => {
     const parsed = GeminiProvider.parseNonStreamingResponse(
       {
-        text: '',
-        functionCalls: [
-          {
-            id: 'fc-1',
-            name: 'yolo_local__fs_read',
-            args: { path: 'note.md' },
-          },
-        ],
         candidates: [
           {
             finishReason: 'STOP',
-            content: { parts: [] },
+            content: {
+              parts: [
+                {
+                  functionCall: {
+                    id: 'fc-1',
+                    name: 'yolo_local__fs_read',
+                    args: { path: 'note.md' },
+                  },
+                },
+              ],
+            },
           },
         ],
-      } as never,
+      },
       'gemini-2.5-flash',
       'msg-1',
     )
@@ -336,10 +382,9 @@ describe('GeminiProvider response parsing', () => {
     })
   })
 
-  it('extracts stream tool calls from parts fallback when functionCalls is absent', () => {
+  it('extracts stream tool calls with their thought signature from parts', () => {
     const parsed = GeminiProvider.parseStreamingResponseChunk(
       {
-        text: '',
         candidates: [
           {
             finishReason: 'STOP',
@@ -357,7 +402,7 @@ describe('GeminiProvider response parsing', () => {
             },
           },
         ],
-      } as never,
+      },
       'gemini-2.5-flash',
       'msg-2',
     )
@@ -371,17 +416,9 @@ describe('GeminiProvider response parsing', () => {
     ).toBe('sig-stream-1')
   })
 
-  it('attaches thought signature metadata when top-level functionCalls exist', () => {
+  it('attaches thought signature metadata to non-stream tool calls', () => {
     const parsed = GeminiProvider.parseNonStreamingResponse(
       {
-        text: '',
-        functionCalls: [
-          {
-            id: 'fc-3',
-            name: 'yolo_local__fs_list',
-            args: { path: '/' },
-          },
-        ],
         candidates: [
           {
             finishReason: 'STOP',
@@ -399,7 +436,7 @@ describe('GeminiProvider response parsing', () => {
             },
           },
         ],
-      } as never,
+      },
       'gemini-2.5-flash',
       'msg-3',
     )
@@ -407,80 +444,6 @@ describe('GeminiProvider response parsing', () => {
     expect(
       parsed.choices[0]?.message.tool_calls?.[0]?.metadata?.thoughtSignature,
     ).toBe('sig-nonstream-1')
-  })
-
-  it('does not access response.text when non-text parts exist in non-stream response', () => {
-    const response = {
-      candidates: [
-        {
-          finishReason: 'STOP',
-          content: {
-            parts: [
-              { text: 'done' },
-              {
-                thoughtSignature: 'sig-nontext',
-                functionCall: {
-                  id: 'fc-4',
-                  name: 'yolo_local__fs_read',
-                  args: { path: 'note.md' },
-                },
-              },
-            ],
-          },
-        },
-      ],
-    } as never
-
-    Object.defineProperty(response, 'text', {
-      get() {
-        throw new Error('response.text should not be accessed')
-      },
-    })
-
-    const parsed = GeminiProvider.parseNonStreamingResponse(
-      response,
-      'gemini-2.5-flash',
-      'msg-4',
-    )
-
-    expect(parsed.choices[0]?.message.content).toBe('done')
-  })
-
-  it('does not access chunk.text when non-text parts exist in stream response', () => {
-    const chunk = {
-      candidates: [
-        {
-          finishReason: 'STOP',
-          content: {
-            parts: [
-              { text: 'partial' },
-              {
-                thoughtSignature: 'sig-stream-nontext',
-                functionCall: {
-                  id: 'fc-5',
-                  name: 'yolo_local__fs_search',
-                  args: { query: 'TODO' },
-                },
-              },
-            ],
-          },
-        },
-      ],
-    } as never
-
-    Object.defineProperty(chunk, 'text', {
-      get() {
-        throw new Error('chunk.text should not be accessed')
-      },
-    })
-
-    const parsed = GeminiProvider.parseStreamingResponseChunk(
-      chunk,
-      'gemini-2.5-flash',
-      'msg-5',
-    )
-
-    expect(parsed.choices[0]?.delta.content).toBe('partial')
   })
 })
 

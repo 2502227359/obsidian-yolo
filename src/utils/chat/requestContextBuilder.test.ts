@@ -5,10 +5,14 @@ jest.mock('../../database/json/chat/promptSnapshotStore', () => ({
   readPromptSnapshotEntries: jest.fn(async () => ({})),
 }))
 
-jest.mock('../../core/memory/memoryManager', () => ({
-  getMemoryPromptContext: jest.fn(async () => ''),
-  resolveMemoryFilePaths: jest.fn(() => ({
-    global: 'YOLO/memory/global.md',
+jest.mock('../../core/memory/memoryStore', () => ({
+  readMemoryIndexes: jest.fn(async () => ({ global: null, assistant: null })),
+  resolveMemoryIndexPaths: jest.fn(() => ({
+    global: 'YOLO/memory/global/MEMORY.md',
+    assistant: null,
+  })),
+  resolveMemoryDirPaths: jest.fn(() => ({
+    global: 'YOLO/memory/global',
     assistant: null,
   })),
 }))
@@ -25,7 +29,10 @@ jest.mock('../../core/skills/liteSkills', () => ({
 }))
 
 import { SystemPromptSnapshotStore } from '../../core/agent/systemPromptSnapshotStore'
-import { getMemoryPromptContext } from '../../core/memory/memoryManager'
+import {
+  readMemoryIndexes,
+  resolveMemoryDirPaths,
+} from '../../core/memory/memoryStore'
 import {
   getLiteSkillDocument,
   listLiteSkillEntries,
@@ -896,6 +903,56 @@ describe('RequestContextBuilder compileUserMessagePrompt', () => {
     )
     expect(textContent).toContain('```notes/empty.md\n\n```')
   })
+
+  // The @mention `full` mode dispatches a claimed extension to the module's renderer
+  // instead of inlining raw bytes — same dispatch fs_read uses, threaded in
+  // here as `resolveModuleFileTextRenderer`.
+  it('renders a claimed extension through the module renderer in full mode instead of raw content', async () => {
+    const boardFile = Object.assign(
+      createMockFile('Boards/Reading Notes.yoloboard'),
+      { stat: { size: 23, mtime: 1000, ctime: 1000 } },
+    )
+
+    const app = createMockApp({
+      files: [boardFile],
+      fileContents: new Map([[boardFile.path, '{"nodes":[],"edges":[]}']]),
+    })
+
+    const render = jest.fn().mockResolvedValue('3 cards, 1 edge')
+
+    const builder = new RequestContextBuilder(
+      app as never,
+      {
+        ...settings,
+        chatOptions: {
+          includeCurrentFileContent: true,
+          mentionContextMode: 'full',
+        },
+      } as unknown as YoloSettings,
+      {
+        resolveModuleFileTextRenderer: (extension) =>
+          extension === 'yoloboard'
+            ? { extensions: ['yoloboard'], render }
+            : null,
+      },
+    )
+
+    const result = await builder.compileUserMessagePrompt({
+      message: createUserMessage([{ type: 'file', file: boardFile }]),
+    })
+
+    const textContent = getTextContent(result.promptContent)
+
+    expect(render).toHaveBeenCalledWith({
+      path: boardFile.path,
+      content: '{"nodes":[],"edges":[]}',
+    })
+    expect(textContent).toContain(
+      '### `Boards/Reading Notes.yoloboard` (full content, 1 lines)',
+    )
+    expect(textContent).toContain('1|3 cards, 1 edge')
+    expect(textContent).not.toContain('"nodes"')
+  })
 })
 
 describe('RequestContextBuilder generateRequestMessages', () => {
@@ -1035,7 +1092,6 @@ describe('RequestContextBuilder generateRequestMessages', () => {
         },
       ],
       hasTools: true,
-      hasMemoryTools: false,
       model: {
         provider: 'openai',
         model: 'gpt-test',
@@ -1056,7 +1112,7 @@ describe('RequestContextBuilder generateRequestMessages', () => {
     })
   })
 
-  it('hides pruned tool results from future request context', async () => {
+  it('replaces pruned tool results with a placeholder and keeps the call', async () => {
     const app = {
       vault: {
         adapter: {
@@ -1161,7 +1217,6 @@ describe('RequestContextBuilder generateRequestMessages', () => {
         },
       ],
       hasTools: true,
-      hasMemoryTools: false,
       model: {
         provider: 'openai',
         model: 'gpt-test',
@@ -1172,11 +1227,11 @@ describe('RequestContextBuilder generateRequestMessages', () => {
     })
 
     expect(
-      requestMessages.some(
+      requestMessages.find(
         (message) =>
           message.role === 'tool' && message.tool_call.id === 'edit-1',
-      ),
-    ).toBe(false)
+      )?.content,
+    ).toBe('[Result pruned from context]')
     expect(
       requestMessages.some(
         (message) =>
@@ -1185,7 +1240,7 @@ describe('RequestContextBuilder generateRequestMessages', () => {
             (toolCall) => toolCall.id === 'edit-1',
           ),
       ),
-    ).toBe(false)
+    ).toBe(true)
     expect(
       requestMessages.some(
         (message) =>
@@ -1261,7 +1316,6 @@ describe('RequestContextBuilder generateRequestMessages', () => {
         },
       ],
       hasTools: true,
-      hasMemoryTools: false,
       model: {
         provider: 'openai',
         model: 'gpt-test',
@@ -1368,7 +1422,6 @@ describe('RequestContextBuilder generateRequestMessages', () => {
         },
       ],
       hasTools: true,
-      hasMemoryTools: false,
       model: {
         provider: 'openai',
         model: 'gpt-test',
@@ -1420,7 +1473,6 @@ describe('RequestContextBuilder generateRequestMessages', () => {
         },
       ],
       hasTools: true,
-      hasMemoryTools: false,
       model: {
         provider: 'openai',
         model: 'gpt-test',
@@ -1495,7 +1547,6 @@ describe('RequestContextBuilder generateRequestMessages', () => {
         },
       ],
       hasTools: true,
-      hasMemoryTools: false,
       model: {
         provider: 'openai',
         model: 'gpt-test',
@@ -1605,7 +1656,6 @@ describe('RequestContextBuilder generateRequestMessages', () => {
         },
       ],
       hasTools: true,
-      hasMemoryTools: false,
       model: {
         provider: 'openai',
         model: 'gpt-test',
@@ -1680,7 +1730,6 @@ describe('RequestContextBuilder generateRequestMessages', () => {
       systemPromptSnapshotMode: 'create',
       messages: historyMessages,
       hasTools: false,
-      hasMemoryTools: false,
       model: {
         provider: 'openai',
         model: 'gpt-test',
@@ -1874,7 +1923,7 @@ describe('RequestContextBuilder project instructions injection', () => {
   })
 })
 
-describe('RequestContextBuilder generateRequestMessages currentFile merging', () => {
+describe('RequestContextBuilder generateRequestMessages stamped context', () => {
   const baseSettings = {
     systemPrompt: '',
     currentAssistantId: undefined,
@@ -1903,10 +1952,19 @@ describe('RequestContextBuilder generateRequestMessages currentFile merging', ()
     }
   }
 
-  it('merges currentFileMessage into last user message content parts when last history message is user', async () => {
-    const app = makeApp()
-    const builder = new RequestContextBuilder(app as never, baseSettings)
-    const currentFile = createMockFile('notes/focus.md')
+  const stampedContext = [
+    { type: 'text' as const, text: '# Current Context\nFile: notes/focus.md' },
+  ]
+  const textOf = (content: unknown): string =>
+    Array.isArray(content)
+      ? (content as Array<{ type: string; text?: string }>)
+          .filter((p) => p.type === 'text')
+          .map((p) => p.text)
+          .join('')
+      : String(content)
+
+  it('sends the context stamped on a user message after its content', async () => {
+    const builder = new RequestContextBuilder(makeApp() as never, baseSettings)
 
     const requestMessages = await builder.generateRequestMessages({
       systemPromptSnapshotMode: 'create',
@@ -1917,6 +1975,7 @@ describe('RequestContextBuilder generateRequestMessages currentFile merging', ()
           content: null,
           promptContent: 'hello',
           mentionables: [],
+          injectedContext: stampedContext,
         },
       ],
       model: {
@@ -1925,31 +1984,21 @@ describe('RequestContextBuilder generateRequestMessages currentFile merging', ()
         name: 'gpt-test',
       } as never,
       conversationId: 'conv-1',
-      contextualInjections: [
-        { type: 'current-file-pointer', file: currentFile },
-      ],
     })
 
-    // Should have system + 1 user (not system + 2 user)
     const userMessages = requestMessages.filter((m) => m.role === 'user')
     expect(userMessages).toHaveLength(1)
-
-    // The single user message content must be an array (merged ContentPart[])
-    const lastUser = userMessages[0]
-    expect(Array.isArray(lastUser.content)).toBe(true)
-    const parts = lastUser.content as Array<{ type: string; text?: string }>
-    const textParts = parts.filter((p) => p.type === 'text')
-    // Original promptContent text
-    expect(textParts.some((p) => p.text?.includes('hello'))).toBe(true)
-    // Current-file pointer text
-    expect(textParts.some((p) => p.text?.includes('notes/focus.md'))).toBe(true)
+    expect(userMessages[0].content).toEqual([
+      { type: 'text', text: 'hello' },
+      ...stampedContext,
+    ])
   })
 
-  it('appends currentFileMessage as independent user message when last history message is not user (agent loop continuation)', async () => {
-    const app = makeApp()
+  // Mid tool loop the request must end with the tool result, not a context
+  // message that the next request would drop.
+  it('keeps stamped context on its own message during a tool loop', async () => {
     const emptyArgs = createCompleteToolCallArguments({ value: {} })
-    const builder = new RequestContextBuilder(app as never, baseSettings)
-    const currentFile = createMockFile('notes/focus.md')
+    const builder = new RequestContextBuilder(makeApp() as never, baseSettings)
 
     const requestMessages = await builder.generateRequestMessages({
       systemPromptSnapshotMode: 'create',
@@ -1960,6 +2009,7 @@ describe('RequestContextBuilder generateRequestMessages currentFile merging', ()
           content: null,
           promptContent: 'do something',
           mentionables: [],
+          injectedContext: stampedContext,
         },
         {
           role: 'assistant',
@@ -1998,29 +2048,86 @@ describe('RequestContextBuilder generateRequestMessages currentFile merging', ()
         name: 'gpt-test',
       } as never,
       conversationId: 'conv-2',
-      contextualInjections: [
-        { type: 'current-file-pointer', file: currentFile },
-      ],
     })
 
-    // Last message should be an independent user message containing the current-file pointer
-    const lastMsg = requestMessages.at(-1)
-    expect(lastMsg?.role).toBe('user')
-    const content = lastMsg?.content
-    const text =
-      typeof content === 'string'
-        ? content
-        : Array.isArray(content)
-          ? (content as Array<{ type: string; text?: string }>)
-              .filter((p) => p.type === 'text')
-              .map((p) => p.text)
-              .join('')
-          : ''
-    expect(text).toContain('notes/focus.md')
-
-    // The original user message should still exist separately
+    expect(requestMessages.at(-1)?.role).toBe('tool')
     const userMessages = requestMessages.filter((m) => m.role === 'user')
-    expect(userMessages.length).toBeGreaterThanOrEqual(2)
+    expect(userMessages).toHaveLength(1)
+    expect(textOf(userMessages[0].content)).toContain('notes/focus.md')
+  })
+})
+
+describe('RequestContextBuilder native reply replay', () => {
+  const nativeParts = { gemini: { parts: [{ text: 'native' }] } }
+  const build = (requestModelId: string) =>
+    new RequestContextBuilder(
+      {
+        metadataCache: { getFileCache: jest.fn(() => null) },
+        vault: {
+          adapter: {
+            exists: jest.fn().mockResolvedValue(false),
+            mkdir: jest.fn().mockResolvedValue(undefined),
+            read: jest.fn().mockResolvedValue(''),
+            write: jest.fn().mockResolvedValue(undefined),
+          },
+          cachedRead: jest.fn(async () => ''),
+          getFileByPath: jest.fn(() => null),
+          getFolderByPath: jest.fn(() => null),
+        },
+      } as never,
+      {
+        systemPrompt: '',
+        assistants: [],
+        chatOptions: {},
+        skills: {},
+      } as unknown as YoloSettings,
+    ).generateRequestMessages({
+      systemPromptSnapshotMode: 'create',
+      messages: [
+        {
+          role: 'user',
+          id: 'user-1',
+          content: null,
+          promptContent: 'hi',
+          mentionables: [],
+        },
+        {
+          role: 'assistant',
+          id: 'assistant-1',
+          content: 'hello',
+          metadata: {
+            model: { id: 'gemini-a' } as never,
+            providerMetadata: nativeParts as never,
+          },
+        },
+        {
+          role: 'user',
+          id: 'user-2',
+          content: null,
+          promptContent: 'again',
+          mentionables: [],
+        },
+      ],
+      model: { id: requestModelId, model: requestModelId } as never,
+      conversationId: 'conv-replay',
+    })
+
+  const assistantOf = (messages: RequestMessage[]) =>
+    messages.find((m) => m.role === 'assistant') as Extract<
+      RequestMessage,
+      { role: 'assistant' }
+    >
+
+  it('hands the native reply back to the model that wrote it', async () => {
+    expect(assistantOf(await build('gemini-a')).providerMetadata).toEqual(
+      nativeParts,
+    )
+  })
+
+  it('rebuilds the reply for a different model', async () => {
+    const assistant = assistantOf(await build('gemini-b'))
+    expect(assistant.providerMetadata).toBeUndefined()
+    expect(assistant.content).toBe('hello')
   })
 })
 
@@ -2232,7 +2339,6 @@ describe('parseToolMessage document hoisting', () => {
         },
       ],
       hasTools: true,
-      hasMemoryTools: false,
       // Use a PDF-capable model so prepareDocumentsForModel passes document parts through.
       model: {
         id: PDF_MODEL_ID,
@@ -2272,11 +2378,52 @@ describe('parseToolMessage document hoisting', () => {
     expect(headerPart?.type === 'text' && headerPart.text).toContain(
       'PDF attachments from tool call',
     )
-    expect(headerPart?.type === 'text' && headerPart.text).toContain(
-      'yolo_local__fs_read',
+    // Model-facing text, so the built-in is named the way the model knows it.
+    expect(headerPart?.type === 'text' && headerPart.text).toContain('fs_read')
+    expect(headerPart?.type === 'text' && headerPart.text).not.toContain(
+      'yolo_local__',
     )
     const docPart = content.find((p) => p.type === 'document')
     expect(docPart).toEqual(documentPart)
+  })
+
+  it('replays a built-in tool call under its model-facing short name', async () => {
+    // Messages persist the fully qualified name; the request must show the
+    // model the same name its `tools` field registered, on both the call and
+    // the result that answers it (Gemini pairs the two by name).
+    const messages = await buildMessagesWithToolResponse(
+      'yolo_local__fs_read',
+      [],
+    )
+
+    const assistant = messages.find((m) => m.role === 'assistant')
+    expect(
+      assistant?.role === 'assistant' &&
+        assistant.tool_calls?.map((call) => call.name),
+    ).toEqual(['fs_read'])
+
+    const toolMessage = messages.find((m) => m.role === 'tool')
+    expect(toolMessage?.role === 'tool' && toolMessage.tool_call.name).toBe(
+      'fs_read',
+    )
+  })
+
+  it('keeps an MCP tool call fully qualified when replaying it', async () => {
+    const messages = await buildMessagesWithToolResponse(
+      'github__create_issue',
+      [],
+    )
+
+    const assistant = messages.find((m) => m.role === 'assistant')
+    expect(
+      assistant?.role === 'assistant' &&
+        assistant.tool_calls?.map((call) => call.name),
+    ).toEqual(['github__create_issue'])
+
+    const toolMessage = messages.find((m) => m.role === 'tool')
+    expect(toolMessage?.role === 'tool' && toolMessage.tool_call.name).toBe(
+      'github__create_issue',
+    )
   })
 
   it('hoists image_url part alone → header is "Images from tool call"', async () => {
@@ -2302,6 +2449,33 @@ describe('parseToolMessage document hoisting', () => {
     expect(headerPart?.type === 'text' && headerPart.text).toContain(
       'Images from tool call',
     )
+  })
+
+  it('tells the model about a history image whose cache:// ref did not resolve', async () => {
+    const unresolvedPart: ContentPart = {
+      type: 'image_url',
+      image_url: { url: 'cache://abc123', cacheKey: 'abc123' },
+    }
+
+    const messages = await buildMessagesWithToolResponse(
+      'yolo_local__fs_read',
+      [unresolvedPart],
+    )
+
+    const sentParts = messages
+      .filter((m) => m.role === 'user' && Array.isArray(m.content))
+      .flatMap((m) => m.content as ContentPart[])
+    expect(
+      sentParts.some(
+        (p) => p.type === 'image_url' && p.image_url.url.startsWith('cache://'),
+      ),
+    ).toBe(false)
+    expect(sentParts).toContainEqual({
+      type: 'text',
+      text: expect.stringContaining('Image unavailable'),
+    })
+    // The conversation keeps the ref for devices that can still resolve it.
+    expect(unresolvedPart.image_url.url).toBe('cache://abc123')
   })
 
   it('mixed image + document → header is "Attachments from tool call"', async () => {
@@ -2365,7 +2539,7 @@ describe('RequestContextBuilder system prompt freezing', () => {
     },
   ]
 
-  const memMock = jest.mocked(getMemoryPromptContext)
+  const memMock = jest.mocked(readMemoryIndexes)
 
   const makeApp = () =>
     createMockApp({ files: [], fileContents: new Map() }) as never
@@ -2398,7 +2572,7 @@ describe('RequestContextBuilder system prompt freezing', () => {
     })
 
     const systemContent = getSystemContent(messages)
-    expect(systemContent).toContain('You have access to tools')
+    expect(systemContent).toContain('shows the user every tool call')
     expect(systemContent).toContain(
       'Before calling file-reading tools, use relevant content already present in the conversation, especially <user_selected_content> and prior tool results.',
     )
@@ -2574,7 +2748,7 @@ describe('RequestContextBuilder system prompt freezing', () => {
       systemPromptSnapshotMode: 'create',
     })
     expect(getSystemContent(withOnDemand)).toContain(
-      'Some tools are ON-DEMAND stubs',
+      'Tools listed in <tool_catalog>',
     )
   })
 
@@ -2598,6 +2772,60 @@ describe('RequestContextBuilder system prompt freezing', () => {
     )
   })
 
+  it('injects memory rules unconditionally, naming the resolved memory directories', async () => {
+    const pathsMock = jest.mocked(resolveMemoryDirPaths)
+    pathsMock.mockReturnValue({
+      global: 'Custom/memory/global',
+      assistant: 'Custom/memory/Scoped agent',
+    })
+    memMock.mockResolvedValue({ global: null, assistant: null })
+
+    try {
+      const builder = new RequestContextBuilder(makeApp(), baseSettings, {
+        includeSkills: false,
+      })
+      const messages = await builder.generateRequestMessages({
+        messages: userMessages,
+        model,
+        conversationId: 'conv-memory-rules',
+        // No memory tools, no memory content: the rules still ship, otherwise a
+        // first-time user's model would never learn memory exists.
+        systemPromptSnapshotMode: 'create',
+      })
+
+      const systemContent = getSystemContent(messages)
+      expect(systemContent).toContain('<memory_rules>')
+      expect(systemContent).toContain('`Custom/memory/global/`')
+      expect(systemContent).toContain('`Custom/memory/Scoped agent/`')
+      // No index content anywhere -> the <memory> block itself is omitted.
+      expect(systemContent).not.toContain('<memory>')
+    } finally {
+      pathsMock.mockReturnValue({
+        global: 'YOLO/memory/global',
+        assistant: null,
+      })
+    }
+  })
+
+  it('omits the assistant location from memory rules when no assistant is active', async () => {
+    memMock.mockResolvedValue({ global: null, assistant: null })
+    const builder = new RequestContextBuilder(makeApp(), baseSettings, {
+      includeSkills: false,
+    })
+    const messages = await builder.generateRequestMessages({
+      messages: userMessages,
+      model,
+      conversationId: 'conv-memory-rules-global-only',
+      systemPromptSnapshotMode: 'create',
+    })
+
+    const systemContent = getSystemContent(messages)
+    expect(systemContent).toContain(
+      '- Location: `YOLO/memory/global/` applies to every assistant.',
+    )
+    expect(systemContent).not.toContain('only to this one')
+  })
+
   it('freezes memory in the system prompt for the conversation lifetime (create mode)', async () => {
     const store = new SystemPromptSnapshotStore()
     const builder = new RequestContextBuilder(makeApp(), baseSettings, {
@@ -2612,19 +2840,17 @@ describe('RequestContextBuilder system prompt freezing', () => {
       messages: userMessages,
       model,
       conversationId: 'conv-1',
-      hasMemoryTools: true,
       systemPromptSnapshotMode: 'create',
     })
     expect(getSystemContent(first)).toContain('MEM_V1')
 
-    // Memory is rewritten mid-conversation (e.g. a memory_add tool call).
+    // MEMORY.md is rewritten mid-conversation (e.g. an fs_write tool call).
     memMock.mockResolvedValue({ global: 'MEM_V2', assistant: null })
 
     const second = await builder.generateRequestMessages({
       messages: userMessages,
       model,
       conversationId: 'conv-1',
-      hasMemoryTools: true,
       systemPromptSnapshotMode: 'create',
     })
     // Frozen: still V1, and memory was not re-read for the second iteration.
@@ -2637,7 +2863,6 @@ describe('RequestContextBuilder system prompt freezing', () => {
       messages: userMessages,
       model,
       conversationId: 'conv-2',
-      hasMemoryTools: true,
       systemPromptSnapshotMode: 'create',
     })
     expect(getSystemContent(other)).toContain('MEM_V2')
@@ -2659,7 +2884,6 @@ describe('RequestContextBuilder system prompt freezing', () => {
       messages: userMessages,
       model,
       conversationId: 'conv-1',
-      hasMemoryTools: true,
       systemPromptSnapshotMode: 'create',
     })
     expect(getSystemContent(first)).toContain('MEM_V1')
@@ -2671,7 +2895,6 @@ describe('RequestContextBuilder system prompt freezing', () => {
       messages: userMessages,
       model,
       conversationId: 'conv-1',
-      hasMemoryTools: true,
       systemPromptSnapshotMode: 'create',
     })
 
@@ -2693,7 +2916,6 @@ describe('RequestContextBuilder system prompt freezing', () => {
       messages: userMessages,
       model,
       conversationId: 'conv-1',
-      hasMemoryTools: true,
       systemPromptSnapshotMode: 'create',
     })
     expect(getSystemContent(beforeCompact)).toContain('MEM_BEFORE_COMPACT')
@@ -2704,7 +2926,6 @@ describe('RequestContextBuilder system prompt freezing', () => {
       messages: userMessages,
       model,
       conversationId: 'conv-1',
-      hasMemoryTools: true,
       systemPromptSnapshotMode: 'create',
     })
     expect(getSystemContent(afterMemoryWrite)).toContain('MEM_BEFORE_COMPACT')
@@ -2716,7 +2937,6 @@ describe('RequestContextBuilder system prompt freezing', () => {
       messages: userMessages,
       model,
       conversationId: 'conv-1',
-      hasMemoryTools: true,
       compaction: {
         anchorMessageId: 'tool-compact',
         summary: 'Earlier context summary',
@@ -2799,7 +3019,6 @@ describe('RequestContextBuilder system prompt freezing', () => {
       messages: userMessages,
       model,
       conversationId: 'conv-1',
-      hasMemoryTools: true,
       systemPromptSnapshotMode: 'create',
     })
     expect(getSystemContent(a)).toContain('MEM_V1')
@@ -2822,7 +3041,6 @@ describe('RequestContextBuilder system prompt freezing', () => {
       messages: userMessages,
       model,
       conversationId: 'conv-1',
-      hasMemoryTools: true,
       systemPromptSnapshotMode: 'create',
     })
     expect(getSystemContent(b)).toContain('MEM_V1')
@@ -2841,7 +3059,6 @@ describe('RequestContextBuilder system prompt freezing', () => {
       messages: userMessages,
       model,
       conversationId: 'conv-1',
-      hasMemoryTools: true,
       systemPromptSnapshotMode: 'reuse',
     })
     expect(getSystemContent(estimate)).toContain('MEM_V1')
@@ -2852,7 +3069,6 @@ describe('RequestContextBuilder system prompt freezing', () => {
       messages: userMessages,
       model,
       conversationId: 'conv-1',
-      hasMemoryTools: true,
       systemPromptSnapshotMode: 'create',
     })
     expect(getSystemContent(real)).toContain('MEM_V2')
@@ -2920,12 +3136,13 @@ describe('RequestContextBuilder ChatContextPolicy (module chat modes)', () => {
     skills: {},
   } as unknown as YoloSettings
 
-  const memMock = jest.mocked(getMemoryPromptContext)
+  const memMock = jest.mocked(readMemoryIndexes)
 
   beforeEach(() => {
-    // Mirrors real getMemoryPromptContext gating: assistant memory only
-    // materializes when an assistantId is actually passed in — required so
-    // this suite can tell "assistant cut off" apart from "mock ignores args".
+    // Mirrors real readMemoryIndexes behavior: the assistant index only
+    // materializes when an assistantId is actually passed in (the store has no
+    // fallback to settings.currentAssistantId) — required so this suite can
+    // tell "assistant cut off" apart from "mock ignores args".
     memMock.mockImplementation(async ({ assistantId }) => ({
       global: 'GLOBAL_MEMORY',
       assistant: assistantId ? 'ASSISTANT_MEMORY' : null,
@@ -2939,6 +3156,7 @@ describe('RequestContextBuilder ChatContextPolicy (module chat modes)', () => {
       contextPolicy?: { useAssistant: boolean }
       modePersonaPrompt?: string
       modePersonaModuleId?: string
+      modeEnvironmentPrompt?: string
       store?: SystemPromptSnapshotStore
     },
   ): Promise<string> {
@@ -2962,6 +3180,7 @@ describe('RequestContextBuilder ChatContextPolicy (module chat modes)', () => {
       contextPolicy: opts.contextPolicy,
       modePersonaPrompt: opts.modePersonaPrompt,
       modePersonaModuleId: opts.modePersonaModuleId,
+      modeEnvironmentPrompt: opts.modeEnvironmentPrompt,
     })
     const system = requestMessages.find((m) => m.role === 'system')
     expect(system).toBeDefined()
@@ -3050,9 +3269,38 @@ describe('RequestContextBuilder ChatContextPolicy (module chat modes)', () => {
     expect(moduleModePersonaChanged).not.toEqual(moduleMode)
     expect(moduleModePersonaChanged).toContain('Persona V2')
   })
+
+  it('emits the mode environment section and refreshes the frozen snapshot when it changes', async () => {
+    const store = new SystemPromptSnapshotStore()
+
+    const agentMode = await buildSystemContent(settingsWithAssistant, {
+      conversationId: 'conv-mode-environment',
+      store,
+    })
+    expect(agentMode).not.toContain('<max_environment>')
+
+    // Same conversation, same everything else — switching into Max must not
+    // keep serving the previous mode's frozen system prompt.
+    const maxMode = await buildSystemContent(settingsWithAssistant, {
+      conversationId: 'conv-mode-environment',
+      store,
+      modeEnvironmentPrompt: '<max_environment>cwd: /vault</max_environment>',
+    })
+    expect(maxMode).toContain('<max_environment>cwd: /vault</max_environment>')
+
+    const maxModeElsewhere = await buildSystemContent(settingsWithAssistant, {
+      conversationId: 'conv-mode-environment',
+      store,
+      modeEnvironmentPrompt: '<max_environment>cwd: /other</max_environment>',
+    })
+    expect(maxModeElsewhere).toContain(
+      '<max_environment>cwd: /other</max_environment>',
+    )
+    expect(maxModeElsewhere).not.toContain('/vault')
+  })
 })
 
-describe('RequestContextBuilder module chat mode skill scope (D6)', () => {
+describe('RequestContextBuilder module chat mode skill scope', () => {
   function makeApp() {
     return {
       metadataCache: { getFileCache: jest.fn(() => null) },

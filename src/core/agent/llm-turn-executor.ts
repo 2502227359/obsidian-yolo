@@ -1,6 +1,5 @@
 import { v4 as uuidv4 } from 'uuid'
 
-import type { ChatContextPolicy } from '../../components/chat-view/chat-runtime-profiles'
 import type {
   AssistantToolPreference,
   AssistantToolServerPreference,
@@ -25,11 +24,9 @@ import {
   resolveRequestReasoningLevel,
 } from '../../types/reasoning'
 import { ToolCallRequest } from '../../types/tool-call.types'
-import type { ContextualInjection } from '../../utils/chat/contextual-injections'
 import { ReasoningPhaseTracker } from '../../utils/chat/reasoningPhaseTracker'
 import { RequestContextBuilder } from '../../utils/chat/requestContextBuilder'
 import { formatErrorMessageWithCauses } from '../../utils/error-message'
-import { hasHostedWebSearch } from '../../utils/llm/model-tools'
 import { executeSingleTurn } from '../ai/single-turn'
 import { BaseLLMProvider } from '../llm/base'
 import {
@@ -40,17 +37,12 @@ import {
 } from '../llm/debugCapture'
 import { ProviderRequestError } from '../llm/providerErrors'
 import type { ResponseDeliveryMode } from '../llm/responseDeliveryMode'
-import {
-  LOCAL_FILE_TOOL_SHORT_NAMES,
-  getLocalFileToolServerName,
-} from '../mcp/localFileTools'
+import { fromModelToolName } from '../mcp/localFileTools'
 import { McpManager } from '../mcp/mcpManager'
+import type { ChatModeCapabilityOverrides } from '../tools/types'
 
-import { CONTEXT_COMPACT_TOOL_NAME } from './compaction'
-import {
-  type ToolCapabilityMode,
-  buildToolCapabilityPrompt,
-} from './tool-capability-prompt'
+import type { ChatContextPolicy } from './chat-runtime-profiles'
+import { type RuntimeMode, buildRuntimeModePrompt } from './runtime-mode-prompt'
 import { selectAllowedTools } from './tool-selection'
 
 type AgentLlmTurnExecutorInput = {
@@ -65,11 +57,8 @@ type AgentLlmTurnExecutorInput = {
   branchLabel?: string
   resumeAssistantMessage?: ChatAssistantMessage
   compaction?: ChatConversationCompactionLike | null
-  enableTools: boolean
-  includeBuiltinTools: boolean
   apiType?: LLMProviderApiType | null
   allowedToolNames?: string[]
-  enableToolDisclosure?: boolean
   toolPreferences?: Record<string, AssistantToolPreference>
   toolServerPreferences?: Record<string, AssistantToolServerPreference>
   allowedSkillPaths?: string[]
@@ -83,8 +72,10 @@ type AgentLlmTurnExecutorInput = {
     primaryRequestTimeoutMs?: number
     streamFallbackRecoveryEnabled?: boolean
   }
-  contextualInjections?: ContextualInjection[]
-  toolCapabilityMode?: ToolCapabilityMode
+  /** The running chat mode's capability grant; see `AgentToolGateway`. */
+  capabilityOverrides?: ChatModeCapabilityOverrides
+  runtimeMode?: RuntimeMode
+  modeEnvironmentPrompt?: string
   modePersonaPrompt?: string
   modePersonaModuleId?: string
   moduleChatModeId?: string
@@ -137,12 +128,93 @@ type AgentLlmTurnExecutorOutput = {
   requestReasoning: ReasoningLevel | undefined
 }
 
-export class AgentLlmTurnExecutor {
-  private static readonly LOCAL_TOOL_NAMES = new Set([
-    ...LOCAL_FILE_TOOL_SHORT_NAMES,
-    CONTEXT_COMPACT_TOOL_NAME,
-  ])
+export type PrepareTurnRequestInput = Pick<
+  AgentLlmTurnExecutorInput,
+  | 'model'
+  | 'requestContextBuilder'
+  | 'mcpManager'
+  | 'conversationId'
+  | 'messages'
+  | 'compaction'
+  | 'apiType'
+  | 'allowedToolNames'
+  | 'toolPreferences'
+  | 'toolServerPreferences'
+  | 'capabilityOverrides'
+  | 'runtimeMode'
+  | 'modeEnvironmentPrompt'
+  | 'modePersonaPrompt'
+  | 'modePersonaModuleId'
+  | 'moduleChatModeId'
+  | 'contextPolicy'
+  | 'systemPromptOverride'
+> & {
+  /**
+   * `create` for a real turn; `reuse` for an out-of-band request (compaction)
+   * that must match the frozen snapshot without minting a new one.
+   */
+  systemPromptSnapshotMode: 'create' | 'reuse'
+  debugTraceId?: string
+}
 
+/**
+ * Build the provider-ready messages and tools block for a turn over
+ * `messages`. Shared by the turn itself and by forced compaction at the start
+ * of a run, whose summary request has to rebuild the same cache-warm prefix.
+ */
+export async function prepareTurnRequest(
+  input: PrepareTurnRequestInput,
+): Promise<{
+  requestMessages: RequestMessage[]
+  tools: RequestTool[] | undefined
+}> {
+  const toolPlanStart = Date.now()
+  const availableTools = await input.mcpManager.listAvailableTools({
+    chatModelModalities: input.model.modalities,
+    capabilityOverrides: input.capabilityOverrides,
+  })
+  const { hasTools, hasOnDemandTools, requestTools, deferredToolCatalog } =
+    await selectAllowedTools({
+      availableTools,
+      allowedToolNames: input.allowedToolNames,
+      toolPreferences: input.toolPreferences,
+      toolServerPreferences: input.toolServerPreferences,
+      model: input.model,
+      apiType: input.apiType,
+      jsSandboxSettings: input.mcpManager.getJsSandboxSettings(),
+      settings: input.mcpManager.getSettingsSnapshot(),
+    })
+  updateLLMDebugTrace(input.debugTraceId, {
+    toolPlanDurationMs: Date.now() - toolPlanStart,
+  })
+
+  const contextPreparationStart = Date.now()
+  const requestMessages =
+    await input.requestContextBuilder.generateRequestMessages({
+      messages: input.messages,
+      hasTools,
+      hasOnDemandTools,
+      deferredToolCatalogText: deferredToolCatalog?.text,
+      model: input.model,
+      conversationId: input.conversationId,
+      compaction: input.compaction,
+      runtimeModePrompt: buildRuntimeModePrompt(input.runtimeMode ?? 'agent'),
+      modeEnvironmentPrompt: input.modeEnvironmentPrompt,
+      modePersonaPrompt: input.modePersonaPrompt,
+      modePersonaModuleId: input.modePersonaModuleId,
+      moduleChatModeId: input.moduleChatModeId,
+      contextPolicy: input.contextPolicy,
+      systemPromptOverride: input.systemPromptOverride,
+      systemPromptSnapshotMode: input.systemPromptSnapshotMode,
+    })
+  updateLLMDebugTrace(input.debugTraceId, {
+    contextPreparationDurationMs: Date.now() - contextPreparationStart,
+  })
+
+  return { requestMessages, tools: requestTools }
+}
+
+export class AgentLlmTurnExecutor {
   constructor(private readonly input: AgentLlmTurnExecutorInput) {}
 
   async run(): Promise<AgentLlmTurnExecutorOutput> {
@@ -227,76 +299,20 @@ export class AgentLlmTurnExecutor {
     let requestMessages: RequestMessage[]
     let tools: RequestTool[] | undefined
     try {
-      const toolPlanStart = Date.now()
-      const allAvailableTools = this.input.enableTools
-        ? await this.input.mcpManager.listAvailableTools({
-            includeBuiltinTools: this.input.includeBuiltinTools,
-            chatModelModalities: this.input.model.modalities,
-          })
-        : []
-      // When the provider runs web search itself, offering ours too just gives
-      // the model two interchangeable options. `web_scrape` still earns its
-      // place: hosted results carry titles and URLs but no page content.
-      const availableTools = hasHostedWebSearch(
-        this.input.model,
-        this.input.apiType,
-      )
-        ? allAvailableTools.filter(
-            (tool) => tool.name !== this.qualifyLocalToolName('web_search'),
-          )
-        : allAvailableTools
-      const {
-        filteredTools,
-        hasTools,
-        hasMemoryTools,
-        hasOnDemandTools,
-        requestTools,
-      } = await selectAllowedTools({
-        availableTools,
-        allowedToolNames: this.input.allowedToolNames,
-        toolPreferences: this.input.toolPreferences,
-        toolServerPreferences: this.input.toolServerPreferences,
-        apiType: this.input.apiType,
-        enableToolDisclosure: this.input.enableToolDisclosure,
-        jsSandboxSettings: this.input.mcpManager.getJsSandboxSettings(),
-        settings: this.input.mcpManager.getSettingsSnapshot(),
+      const prepared = await prepareTurnRequest({
+        ...this.input,
+        systemPromptSnapshotMode: 'create',
+        debugTraceId: debugTrace?.id,
       })
-      tools = requestTools
-      updateLLMDebugTrace(debugTrace?.id, {
-        toolPlanDurationMs: Date.now() - toolPlanStart,
-      })
-
-      const contextPreparationStart = Date.now()
-      const runtimeModePrompt = buildToolCapabilityPrompt({
-        mode: this.input.toolCapabilityMode ?? 'agent',
-        toolNames: filteredTools.map((tool) => tool.name),
-      })
-      const baseRequestMessages =
-        await this.input.requestContextBuilder.generateRequestMessages({
-          messages: this.input.messages,
-          hasTools,
-          hasMemoryTools,
-          hasOnDemandTools,
-          model: this.input.model,
-          conversationId: this.input.conversationId,
-          compaction: this.input.compaction,
-          contextualInjections: this.input.contextualInjections,
-          runtimeModePrompt,
-          modePersonaPrompt: this.input.modePersonaPrompt,
-          modePersonaModuleId: this.input.modePersonaModuleId,
-          moduleChatModeId: this.input.moduleChatModeId,
-          contextPolicy: this.input.contextPolicy,
-          systemPromptOverride: this.input.systemPromptOverride,
-          systemPromptSnapshotMode: 'create',
-        })
+      tools = prepared.tools
       requestMessages =
         this.input.transientRequestMessages &&
         this.input.transientRequestMessages.length > 0
-          ? [...baseRequestMessages, ...this.input.transientRequestMessages]
-          : baseRequestMessages
-      updateLLMDebugTrace(debugTrace?.id, {
-        contextPreparationDurationMs: Date.now() - contextPreparationStart,
-      })
+          ? [
+              ...prepared.requestMessages,
+              ...this.input.transientRequestMessages,
+            ]
+          : prepared.requestMessages
 
       requestReasoning = resolveRequestReasoningLevel(
         this.input.model,
@@ -596,17 +612,13 @@ export class AgentLlmTurnExecutor {
     }
   }
 
+  /**
+   * Inbound half of the model-facing name boundary: built-in tools are
+   * registered under their short names, so that is what the model calls back
+   * with. Everything downstream — gateway, approval, persistence — speaks the
+   * fully qualified name.
+   */
   private normalizeToolCallName(toolName: string): string {
-    if (toolName.includes(McpManager.TOOL_NAME_DELIMITER)) {
-      return toolName
-    }
-    if (!AgentLlmTurnExecutor.LOCAL_TOOL_NAMES.has(toolName)) {
-      return toolName
-    }
-    return this.qualifyLocalToolName(toolName)
-  }
-
-  private qualifyLocalToolName(toolName: string): string {
-    return `${getLocalFileToolServerName()}${McpManager.TOOL_NAME_DELIMITER}${toolName}`
+    return fromModelToolName(toolName)
   }
 }

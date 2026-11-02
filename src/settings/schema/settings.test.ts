@@ -28,8 +28,7 @@ describe('parseYoloSettings', () => {
     expect(result.softDismissedUpdateVersion).toBe('')
     expect(result.mutedUpdateVersion).toBe('')
     expect(result.mutedModuleUpdateVersions).toEqual({})
-    expect(result.pluginUpdateNoticeEnabled).toBe(true)
-    expect(result.pluginUpdateAutoDownloadEnabled).toBe(true)
+    expect(result.pluginUpdateMode).toBe('notify')
     expect(result.ragOptions).toMatchObject({
       enabled: true,
       chunkSize: 1000,
@@ -39,11 +38,10 @@ describe('parseYoloSettings', () => {
       indexPdf: true,
       autoUpdateEnabled: true,
       autoUpdateIntervalHours: 0,
-      lastAutoUpdateAt: 0,
     })
 
     expect(result.mcp.servers).toEqual([])
-    expect(result.mcp.enableToolDisclosure).toBe(false)
+    expect(result.mcp.discoveredCatalogs).toEqual({})
     expect(result.yolo).toEqual({ baseDir: 'YOLO' })
 
     expect(result.chatOptions).toMatchObject({
@@ -92,7 +90,6 @@ describe('parseYoloSettings', () => {
       mcp: {
         servers: [],
         builtinToolOptions: {},
-        enableToolDisclosure: false,
       },
     })
 
@@ -138,13 +135,19 @@ describe('parseYoloSettings', () => {
       chatOptions: {
         includeCurrentFileContent: true,
         lastChatSurface: 'chat',
-        lastCliRuntimeId: 'codex',
+        lastCliRuntimeId: 'grok',
+        cliModelIdByRuntime: { grok: 'grok-4.6' },
+        cliChatModeByRuntime: { grok: 'agent' },
+        cliAgentYoloEnabledByRuntime: { grok: false },
       },
     })
 
     expect(result.chatOptions).toMatchObject({
       lastChatSurface: 'chat',
-      lastCliRuntimeId: 'codex',
+      lastCliRuntimeId: 'grok',
+      cliModelIdByRuntime: { grok: 'grok-4.6' },
+      cliChatModeByRuntime: { grok: 'agent' },
+      cliAgentYoloEnabledByRuntime: { grok: false },
     })
   })
 
@@ -223,7 +226,6 @@ describe('parseYoloSettings', () => {
       chatModelId: 'openai/gpt-5',
       mcp: {
         servers: [],
-        enableToolDisclosure: false,
         builtinCapabilityOptions: {
           subagent_delegation: {
             allowedModelIds: [
@@ -273,7 +275,6 @@ describe('parseYoloSettings', () => {
       chatModelId: 'openai/gpt-5',
       mcp: {
         servers: [],
-        enableToolDisclosure: false,
         builtinCapabilityOptions: {},
       },
     })
@@ -538,9 +539,8 @@ describe('parseYoloSettings', () => {
   })
 
   it('keeps yolo-local embedding models even though no matching provider record exists', () => {
-    // `yolo-local` (docs/plans/08-22-local-embedding/00-plan.md §3.5) is a
-    // reserved providerId for on-device embedding models — it deliberately
-    // never has a `settings.providers` entry. Regression test for a bug
+    // `yolo-local` is a reserved providerId for on-device embedding models —
+    // it deliberately never has a `settings.providers` entry. Regression test for a bug
     // where `normalizeYoloSettingsReferences` treated that as "orphaned" and
     // silently deleted the model on every settings save.
     const result = parseYoloSettings({
@@ -710,28 +710,28 @@ describe('parseYoloSettings', () => {
     ])
   })
 
-  it('falls back to full settings defaults when two knowledge bases share an id or name', () => {
-    const byId = parseYoloSettings({
-      version: SETTINGS_SCHEMA_VERSION,
-      chatModelId: 'should-be-discarded',
-      knowledgeBases: [
-        { id: 'dup', name: 'A', description: '', include: [], exclude: [] },
-        { id: 'dup', name: 'B', description: '', include: [], exclude: [] },
-      ],
-    })
+  it('throws instead of yielding defaults when two knowledge bases share an id or name', () => {
     // A duplicate fails the whole field, which fails the whole settings
-    // parse (see knowledgeBasesFieldSchema's doc comment) — parseYoloSettings
-    // then falls back to full defaults, same as any other unparseable field.
-    expect(byId.knowledgeBases).toEqual([])
-    expect(byId.chatModelId).toBe('')
+    // parse (see knowledgeBasesFieldSchema's doc comment).
+    expect(() =>
+      parseYoloSettings({
+        version: SETTINGS_SCHEMA_VERSION,
+        chatModelId: 'kept-on-disk',
+        knowledgeBases: [
+          { id: 'dup', name: 'A', description: '', include: [], exclude: [] },
+          { id: 'dup', name: 'B', description: '', include: [], exclude: [] },
+        ],
+      }),
+    ).toThrow()
 
-    const byName = parseYoloSettings({
-      version: SETTINGS_SCHEMA_VERSION,
-      knowledgeBases: [
-        { id: 'a', name: 'Same', description: '', include: [], exclude: [] },
-        { id: 'b', name: 'same', description: '', include: [], exclude: [] }, // case-insensitive collision
-      ],
-    })
-    expect(byName.knowledgeBases).toEqual([])
+    expect(() =>
+      parseYoloSettings({
+        version: SETTINGS_SCHEMA_VERSION,
+        knowledgeBases: [
+          { id: 'a', name: 'Same', description: '', include: [], exclude: [] },
+          { id: 'b', name: 'same', description: '', include: [], exclude: [] }, // case-insensitive collision
+        ],
+      }),
+    ).toThrow()
   })
 })

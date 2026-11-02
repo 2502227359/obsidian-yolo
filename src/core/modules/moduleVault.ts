@@ -1,4 +1,11 @@
-import { App, type EventRef, TFile, TFolder, normalizePath } from 'obsidian'
+import {
+  App,
+  type EventRef,
+  TFile,
+  TFolder,
+  getLinkpath,
+  normalizePath,
+} from 'obsidian'
 
 import type { ModuleLifecycleScope } from './lifecycleScope'
 import type {
@@ -107,6 +114,12 @@ const UNAVAILABLE_MODULE_VAULT_API: YoloModuleVaultV1 = Object.freeze({
   exists: () => Promise.reject(new Error('Module vault is unavailable')),
   readText: () => Promise.reject(new Error('Module vault is unavailable')),
   readBinary: () => Promise.reject(new Error('Module vault is unavailable')),
+  getResourceUrl: () => unavailable(),
+  resolveLink: () => unavailable(),
+  generateLink: () => unavailable(),
+  getAvailableAttachmentPath: () =>
+    Promise.reject(new Error('Module vault is unavailable')),
+  getNewFileParent: () => unavailable(),
   ensureFolder: () => Promise.reject(new Error('Module vault is unavailable')),
   createFolder: () => Promise.reject(new Error('Module vault is unavailable')),
   createText: () => Promise.reject(new Error('Module vault is unavailable')),
@@ -223,14 +236,13 @@ function createObsidianModuleVaultCapability({
   const api: YoloModuleVaultV1 = Object.freeze({
     getEntry: (path) => {
       assertAvailable()
-      const entry = app.vault.getAbstractFileByPath(
-        normalizeModuleVaultPath(path, true),
-      )
+      const entry = getIndexedEntry(app, normalizeModuleVaultPath(path, true))
       return isVaultEntry(entry) ? describeEntry(entry) : null
     },
     listChildren: (folderPath) => {
       assertAvailable()
-      const entry = app.vault.getAbstractFileByPath(
+      const entry = getIndexedEntry(
+        app,
         normalizeModuleVaultPath(folderPath, true),
       )
       if (!(entry instanceof TFolder)) return Object.freeze([])
@@ -243,7 +255,7 @@ function createObsidianModuleVaultCapability({
     stat: async (rawPath) => {
       assertAvailable()
       const path = normalizeModuleVaultPath(rawPath, true)
-      const indexed = app.vault.getAbstractFileByPath(path)
+      const indexed = getIndexedEntry(app, path)
       if (isVaultEntry(indexed)) return describeEntry(indexed)
       const entry = await app.vault.adapter.stat(path)
       assertAvailable()
@@ -252,7 +264,7 @@ function createObsidianModuleVaultCapability({
     list: async (rawPath) => {
       assertAvailable()
       const path = normalizeModuleVaultPath(rawPath, true)
-      const indexed = app.vault.getAbstractFileByPath(path)
+      const indexed = getIndexedEntry(app, path)
       if (indexed instanceof TFolder) {
         return Object.freeze(indexed.children.map(describeEntry))
       }
@@ -302,6 +314,66 @@ function createObsidianModuleVaultCapability({
       }
       const bytes = await app.vault.readBinary(entry)
       return bytes.slice(0)
+    },
+    getResourceUrl: (filePath) => {
+      assertAvailable()
+      return app.vault.adapter.getResourcePath(
+        normalizeModuleVaultPath(filePath),
+      )
+    },
+    resolveLink: (linktext, sourcePath) => {
+      assertAvailable()
+      if (typeof linktext !== 'string' || linktext.trim().length === 0) {
+        return null
+      }
+      // `getLinkpath` drops the `#heading`/`^block` tail: the subpath picks a
+      // place *within* the file and says nothing about which file. Obsidian's
+      // own link resolution takes the same two arguments in the same order,
+      // so a module's answer and a note's answer cannot drift apart.
+      const file = app.metadataCache.getFirstLinkpathDest(
+        getLinkpath(linktext),
+        normalizeModuleVaultPath(sourcePath),
+      )
+      return file ? describeFile(file) : null
+    },
+    generateLink: (filePath, sourcePath, subpath, alias) => {
+      assertAvailable()
+      const file = app.vault.getAbstractFileByPath(
+        normalizeModuleVaultPath(filePath),
+      )
+      if (!(file instanceof TFile)) return null
+      if (subpath !== undefined && !subpath.startsWith('#')) {
+        throw new Error('Module vault link subpath must start with "#"')
+      }
+      return app.fileManager.generateMarkdownLink(
+        file,
+        normalizeModuleVaultPath(sourcePath, true),
+        subpath,
+        alias,
+      )
+    },
+    getAvailableAttachmentPath: async (fileName, sourcePath) => {
+      assertAvailable()
+      if (
+        typeof fileName !== 'string' ||
+        fileName.length === 0 ||
+        /[\\/]/.test(fileName)
+      ) {
+        throw new Error('Module vault attachment name must be a file name')
+      }
+      return normalizeModuleVaultPath(
+        await app.fileManager.getAvailablePathForAttachment(
+          fileName,
+          normalizeModuleVaultPath(sourcePath, true),
+        ),
+      )
+    },
+    getNewFileParent: () => {
+      assertAvailable()
+      const folder = app.fileManager.getNewFileParent(
+        app.workspace.getActiveFile()?.path ?? '',
+      )
+      return folder.isRoot() ? '' : normalizeModuleVaultPath(folder.path)
     },
     ensureFolder: async (folderPath) => {
       assertAvailable()
@@ -743,11 +815,15 @@ export function normalizeModuleVaultPath(
   if (segments.some((segment) => segment === '.' || segment === '..')) {
     throw new Error('Module vault path must not contain dot segments')
   }
-  const normalized = normalizePath(segments.join('/'))
-  if (!allowRoot && normalized === '') {
-    throw new Error('Module vault path must not be empty')
+  if (segments.length === 0) {
+    // Host API represents the vault root as '' — never hand '' to Obsidian's
+    // normalizePath, which turns it into '/'.
+    if (!allowRoot) {
+      throw new Error('Module vault path must not be empty')
+    }
+    return ''
   }
-  return normalized
+  return normalizePath(segments.join('/'))
 }
 
 function normalizeEventPath(path: string): string {
@@ -768,6 +844,14 @@ function doesPathAffectScope(path: string, scopePath: string): boolean {
   )
 }
 
+/** The Host API represents the vault root as '', but Obsidian indexes the
+ * root TFolder under '/', so a plain getAbstractFileByPath('') misses it. */
+function getIndexedEntry(app: App, path: string) {
+  return path === ''
+    ? app.vault.getRoot()
+    : app.vault.getAbstractFileByPath(path)
+}
+
 function isVaultEntry(entry: unknown): entry is TFile | TFolder {
   return entry instanceof TFile || entry instanceof TFolder
 }
@@ -782,10 +866,17 @@ function describeFile(file: TFile): YoloModuleVaultFileV1 {
   })
 }
 
-function describeEntry(entry: TFile | TFolder): YoloModuleVaultEntryV1 {
+export function describeEntry(entry: TFile | TFolder): YoloModuleVaultEntryV1 {
   return entry instanceof TFile
     ? describeFile(entry)
-    : Object.freeze({ kind: 'folder', path: entry.path, name: entry.name })
+    : Object.freeze({
+        kind: 'folder',
+        // Obsidian indexes the root folder under '/', but the Host API
+        // represents the vault root as '' — modules feed these paths straight
+        // back into the vault API, which rejects '/' as non vault-relative.
+        path: entry.path === '/' ? '' : entry.path,
+        name: entry.name,
+      })
 }
 
 function freezeEvent(

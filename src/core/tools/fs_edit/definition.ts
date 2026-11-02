@@ -13,6 +13,7 @@ import {
   buildFileChangeSummary,
   maybeWithInternalWrite,
 } from '../file-editing-support'
+import { describeStructuredVaultFormatDenial } from '../structured-vault-formats'
 import { MAX_FILE_SIZE_BYTES, formatJsonResult, getTextArg } from '../tool-args'
 import type { LocalToolCallResultMetadata } from '../types'
 
@@ -27,6 +28,7 @@ import {
 
 export const fsEditDefinition = defineTool({
   name: 'fs_edit',
+  summaryAction: 'edit',
   // Schema copied verbatim from the `fs_edit` entry in `getLocalFileTools()`
   // (`src/core/mcp/localFileTools.ts`). Static (no modality/platform
   // dependence), so `getMcpTool` ignores its `ctx` argument — matching
@@ -78,20 +80,18 @@ export const fsEditDefinition = defineTool({
   // (`src/core/mcp/localFileTools.ts`, pre-migration), minus the abort check
   // / workspace-scope / YOLO-data-root guards on the *top-level path
   // parameter* and the outer try/catch — those are dispatcher
-  // responsibilities (master.md §3.4). `fs_edit` has no per-resolved-path
+  // responsibilities. `fs_edit` has no per-resolved-path
   // checks of its own (unlike `fs_read`'s wikilink case) — `path` is a
   // literal argument throughout, so the dispatcher's raw-argument scan is
-  // sufficient and nothing extra needs to happen here (master.md §5).
+  // sufficient and nothing extra needs to happen here.
   //
   // `openApplyReview` / `requireReview` now come from `ToolContext` rather
   // than being destructured `callLocalFileTool` parameters — the only
   // change from the pre-migration body. `waitForFsEditReview`'s own timing
-  // and semantics (imported from `./schema-helpers`) are untouched
-  // (phase2-migration.md D6 批 4).
+  // and semantics (imported from `./schema-helpers`) are untouched.
   execute: async (args, ctx) => {
     const {
       app,
-      settings,
       openApplyReview,
       requireReview = false,
       signal,
@@ -102,6 +102,12 @@ export const fsEditDefinition = defineTool({
     } = ctx
 
     const path = validateVaultPath(getTextArg(args, 'path'))
+
+    const structuredFormatDenial = describeStructuredVaultFormatDenial(path)
+    if (structuredFormatDenial) {
+      throw new Error(structuredFormatDenial)
+    }
+
     const plan = getFsEditPlan(args)
 
     const file = app.vault.getAbstractFileByPath(path)
@@ -194,7 +200,6 @@ export const fsEditDefinition = defineTool({
       ? undefined
       : await buildFileChangeSummary({
           app,
-          settings,
           path,
           beforeContent: content,
           afterContent: appliedContent,

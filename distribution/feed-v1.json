@@ -1,36 +1,36 @@
 {
   "schemaVersion": 1,
-  "revision": 25,
+  "revision": 49,
   "keyId": "yolo-distribution-2026-01",
   "core": {
-    "version": "1.6.6.2",
+    "version": "1.6.13",
     "minAppVersion": "1.8.7",
-    "releaseUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/tag/1.6.6.2",
+    "releaseUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/tag/1.6.13",
     "releaseNotes": {
-      "en": "## 1.6.6.2\n\n- Added a Claude OAuth provider that lets you chat directly using your Claude Code subscription quota, with improved prompt caching support for Anthropic-based providers.\n- Added a Buy Me a Coffee funding option alongside 爱发电.\n- Fixed pi and Hermes CLI agents failing to start on Windows.\n- Fixed the \"Activity & Reminders\" popover appearing automatically after enabling the Learning module, with no way to dismiss it.\n- Improved the transition animation performance of the empty-state chat input.",
-      "zh": "## 1.6.6.2\n\n- 新增 Claude OAuth Provider，可直接使用 Claude Code 订阅额度对话，并增强了 Anthropic 系 Provider 的 Prompt Caching 支持。\n- 赞助方式新增 Buy Me a Coffee，与爱发电并列。\n- 修复 Windows 上 pi 与 Hermes CLI 智能体无法启动的问题。\n- 修复开启学习模块后，右下角「活动与提醒」浮层会自动弹出且无法关闭的问题。\n- 优化空会话状态下聊天输入框过渡动画的性能表现。"
+      "en": "## 1.6.13 Model Cleanup & Fixes 🧹\n\n- Added \"Enable all / Disable all\" toggles to the Agent skills page. (#621)\n- Removed retired default models, and allowed deleting default models in settings. (#624)\n- Fixed the send button being squeezed on iPad, hiding its icon. (#631)\n- Fixed memory climbing until a black-screen crash when a conversation file is corrupted. (#626)",
+      "zh": "## 1.6.13 模型清理与问题修复 🧹\n\n- 为 Agent 技能页增加「全部启用 / 全部停用」开关。（#621）\n- 移除已停用的默认模型，并允许在设置中删除默认模型。（#624）\n- 修复 iPad 上发送按钮被挤压、图标不显示的问题。（#631）\n- 修复会话文件损坏时内存持续上涨导致黑屏崩溃的问题。（#626）"
     },
     "assets": {
       "mainJs": {
         "name": "main.js",
-        "mirrorPath": "core/1.6.6.2/main.js",
-        "canonicalUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/1.6.6.2/main.js",
-        "byteSize": 9419889,
-        "sha256": "a1f0a8c90de4fc411a66c6e58dadc739127b495936243ae936f7861dee983909"
+        "mirrorPath": "core/1.6.13/main.js",
+        "canonicalUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/1.6.13/main.js",
+        "byteSize": 5816766,
+        "sha256": "69900ffdabf9d9e8ba15451be7b854f521b8a76efb24da98bf7f0e7857fb676e"
       },
       "manifestJson": {
         "name": "manifest.json",
-        "mirrorPath": "core/1.6.6.2/manifest.json",
-        "canonicalUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/1.6.6.2/manifest.json",
-        "byteSize": 413,
-        "sha256": "66b295e241bcc3d663725c2787416881a05ad02f1d32694e7d25515ca45bce7b"
+        "mirrorPath": "core/1.6.13/manifest.json",
+        "canonicalUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/1.6.13/manifest.json",
+        "byteSize": 412,
+        "sha256": "b39f4045a62e8ce6dc1cdff98af91887e8bad1f6a925d6bd01c4d4d8910d3331"
       },
       "stylesCss": {
         "name": "styles.css",
-        "mirrorPath": "core/1.6.6.2/styles.css",
-        "canonicalUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/1.6.6.2/styles.css",
-        "byteSize": 651203,
-        "sha256": "d8ef4b7649f8b435790e4e7bdd8e0648d46b202d8dd8906cbea3d058d3b32e96"
+        "mirrorPath": "core/1.6.13/styles.css",
+        "canonicalUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/1.6.13/styles.css",
+        "byteSize": 497437,
+        "sha256": "7da9418e1d11831fe96199472a73fe20caccbf90617e09c3a5a9cd1c2cf4c8a8"
       }
     }
   },
@@ -82,6 +82,55 @@
         "canonicalUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/learning%2Fv0.1.4/module.json",
         "byteSize": 1860,
         "sha256": "f226e62c9fb1d7785db70e49bb1fd48430c13501c1353f42d482c3081bc99120"
+      }
+    },
+    {
+      "id": "whiteboard",
+      "icon": "waypoints",
+      "localizations": {
+        "en": {
+          "name": "YOLO Whiteboard",
+          "description": "An infinite canvas for spatial thinking: place note, text, and PDF cards, connect them, and read/annotate PDFs alongside your notes."
+        },
+        "zh": {
+          "name": "YOLO 白板",
+          "description": "用于空间化思考的无限画布：摆放笔记、便签与 PDF 卡片，建立连线，并在笔记旁阅读与标注 PDF。"
+        },
+        "it": {
+          "name": "Lavagna YOLO",
+          "description": "Una tela infinita per il pensiero spaziale: disponi schede di note, testo e PDF, collegale tra loro e leggi/annota i PDF accanto alle tue note."
+        }
+      },
+      "version": "0.0.8",
+      "hostApi": "^1.12.0",
+      "platforms": [
+        "desktop",
+        "mobile"
+      ],
+      "dataSchemas": {
+        "settings": {
+          "readMin": 0,
+          "readMax": 1,
+          "write": 1
+        }
+      },
+      "releaseUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/tag/whiteboard/v0.0.8",
+      "releaseNotes": {
+        "en": "## 0.0.8 Edge Jumping & New Board Folder 🧭\n\n- Added a custom default folder for new whiteboards; left empty, it follows Obsidian's location for new notes. (#629)\n- Added \"Go to other end\" for whiteboard edges, to jump back and forth between an annotation and its source passage. (#627)",
+        "zh": "## 0.0.8 连线跳转与新建目录 🧭\n\n- 新建白板支持自定义默认目录，留空时跟随 Obsidian 新建笔记位置。（#629）\n- 白板连线支持「跳到另一端」，可在批注与原文段落之间来回跳转。（#627）"
+      },
+      "releaseNote": {
+        "name": "release-note.md",
+        "canonicalUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/whiteboard%2Fv0.0.8/release-note.md",
+        "byteSize": 542,
+        "sha256": "70a388bc1d6fef47e2b0a754c4663e6e9e6cd8476e3e200a34735531b2ca89ef"
+      },
+      "manifest": {
+        "name": "module.json",
+        "mirrorPath": "modules/whiteboard/0.0.8/module.json",
+        "canonicalUrl": "https://github.com/Lapis0x0/obsidian-yolo/releases/download/whiteboard%2Fv0.0.8/module.json",
+        "byteSize": 1867,
+        "sha256": "130f6032dd3d0582451c41cb061c095b8e42d58983b41edca58712f06962a6ce"
       }
     }
   ]

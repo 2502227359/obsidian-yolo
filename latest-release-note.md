@@ -1,17 +1,15 @@
-## 1.6.6.2
+## 1.6.13 Model Cleanup & Fixes 🧹
 
-- Added a Claude OAuth provider that lets you chat directly using your Claude Code subscription quota, with improved prompt caching support for Anthropic-based providers.
-- Added a Buy Me a Coffee funding option alongside 爱发电.
-- Fixed pi and Hermes CLI agents failing to start on Windows.
-- Fixed the "Activity & Reminders" popover appearing automatically after enabling the Learning module, with no way to dismiss it.
-- Improved the transition animation performance of the empty-state chat input.
+- Added "Enable all / Disable all" toggles to the Agent skills page. (#621)
+- Removed retired default models, and allowed deleting default models in settings. (#624)
+- Fixed the send button being squeezed on iPad, hiding its icon. (#631)
+- Fixed memory climbing until a black-screen crash when a conversation file is corrupted. (#626)
 
 ---
 
-## 1.6.6.2
+## 1.6.13 模型清理与问题修复 🧹
 
-- 新增 Claude OAuth Provider，可直接使用 Claude Code 订阅额度对话，并增强了 Anthropic 系 Provider 的 Prompt Caching 支持。
-- 赞助方式新增 Buy Me a Coffee，与爱发电并列。
-- 修复 Windows 上 pi 与 Hermes CLI 智能体无法启动的问题。
-- 修复开启学习模块后，右下角「活动与提醒」浮层会自动弹出且无法关闭的问题。
-- 优化空会话状态下聊天输入框过渡动画的性能表现。
+- 为 Agent 技能页增加「全部启用 / 全部停用」开关。（#621）
+- 移除已停用的默认模型，并允许在设置中删除默认模型。（#624）
+- 修复 iPad 上发送按钮被挤压、图标不显示的问题。（#631）
+- 修复会话文件损坏时内存持续上涨导致黑屏崩溃的问题。（#626）

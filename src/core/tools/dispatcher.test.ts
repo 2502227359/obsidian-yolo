@@ -1,8 +1,7 @@
-// Exercises `executeBuiltinTool`'s own responsibilities (master.md §3.4):
+// Exercises `executeBuiltinTool`'s own responsibilities:
 // abort short-circuit, the two `enforceBuiltinToolSecurityBoundary` checks
 // (./security-boundary.ts), unknown-tool-name handling, and normalizing a
-// thrown error into an Error-status result. Per phase2-migration.md D5,
-// these boundaries are verified through the dispatcher, not per tool — the
+// thrown error into an Error-status result. These boundaries are verified through the dispatcher, not per tool — the
 // security boundary must reject a call before registry lookup ever runs,
 // including for names that are not registered at all.
 
@@ -15,7 +14,7 @@ import type { AssistantWorkspaceScope } from '../../types/assistant.types'
 import { ToolCallResponseStatus } from '../../types/tool-call.types'
 
 import { executeBuiltinTool } from './dispatcher'
-import { memoryAddDefinition } from './memory_add/definition'
+import { todoWriteDefinition } from './todo_write/definition'
 import type { ToolContext } from './types'
 
 const app = {} as App
@@ -26,13 +25,13 @@ function makeCtx(overrides: Partial<ToolContext> = {}): ToolContext {
 
 describe('executeBuiltinTool: abort short-circuit', () => {
   it('returns Aborted and does not execute the tool body when signal is already aborted', async () => {
-    const executeSpy = jest.spyOn(memoryAddDefinition, 'execute')
+    const executeSpy = jest.spyOn(todoWriteDefinition, 'execute')
     const controller = new AbortController()
     controller.abort()
 
     const result = await executeBuiltinTool(
-      'memory_add',
-      { content: 'should not run' },
+      'todo_write',
+      { todos: [] },
       makeCtx({ signal: controller.signal }),
     )
 
@@ -75,7 +74,7 @@ describe('executeBuiltinTool: workspace-scope second line of defense', () => {
     }
   })
 
-  // fs_write is registered as of D6 batch 4 (previously it fell through to
+  // fs_write is registered now (previously it fell through to
   // the "not yet migrated" unknown-tool error, which is what these two
   // tests used to assert on as an indirect proxy for "the boundary check
   // passed rather than blocking"). Now that it actually executes, a minimal
@@ -188,11 +187,11 @@ describe('executeBuiltinTool: unknown tool name', () => {
 
 describe('executeBuiltinTool: normalizes a thrown tool error', () => {
   it('converts an Error thrown from execute() into an Error-status result rather than rejecting', async () => {
-    const result = await executeBuiltinTool('memory_add', {}, makeCtx())
+    const result = await executeBuiltinTool('fs_read', {}, makeCtx())
 
     expect(result).toEqual({
       status: ToolCallResponseStatus.Error,
-      error: 'content or items is required.',
+      error: 'paths must be an array of strings.',
     })
   })
 })

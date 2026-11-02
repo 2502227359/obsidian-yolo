@@ -49,7 +49,6 @@ const ragOptionsSchema = z.object({
   // auto update options
   autoUpdateEnabled: z.boolean().catch(true),
   autoUpdateIntervalHours: z.number().catch(0),
-  lastAutoUpdateAt: z.number().catch(0),
 })
 
 /**
@@ -76,6 +75,14 @@ export type KnowledgeBase = z.infer<typeof knowledgeBaseSchema>
 
 const localEmbeddingSettingsSchema = z.object({
   endpoint: z.string().catch(DEFAULT_LOCAL_EMBEDDING_ENDPOINT),
+  /**
+   * The local embedding shelf's CPU / GPU tab. q8 models always run on CPU
+   * (they're slower on WebGPU); fp16 models run on WebGPU when this is
+   * `'gpu'` and the machine supports it. Switching doesn't require
+   * reindexing — the same fp16 weights produce the same vectors on either
+   * backend.
+   */
+  device: z.enum(['cpu', 'gpu']).catch('cpu'),
 })
 export type LocalEmbeddingSettings = z.infer<
   typeof localEmbeddingSettingsSchema
@@ -98,9 +105,8 @@ export type LocalEmbeddingSettings = z.infer<
  * is what lets `import-config.ts`'s `safeParse` (and `main.ts`'s
  * `setSettings`) surface a clear "duplicate knowledge base" error instead of
  * silently discarding one of the two. On the disk-load path
- * (`parseYoloSettings`), a failure here falls back to full schema defaults
- * like any other unparseable settings field — pre-existing, systemic
- * behavior, not specific to this field.
+ * (`parseYoloSettings`), a failure here fails the whole parse like any other
+ * unparseable settings field.
  */
 const knowledgeBasesFieldSchema = resilientArraySchema(knowledgeBaseSchema)
   .transform((items) =>
@@ -391,6 +397,16 @@ const tabCompletionTriggerSchema = z
  * Settings
  */
 
+/**
+ * 检测到新版本后怎么做：
+ * - auto：后台下载并安装。主插件热重载（不重载整个窗口），模块热装，完成后
+ *   弹出带更新日志的卡片；
+ * - notify：弹出更新卡片，并在后台预先下载，由用户确认安装；
+ * - off：不提示，也不下载。
+ */
+export const pluginUpdateModeSchema = z.enum(['auto', 'notify', 'off'])
+export type PluginUpdateMode = z.infer<typeof pluginUpdateModeSchema>
+
 export const yoloSettingsSchema = z.object({
   // Version
   version: z.literal(SETTINGS_SCHEMA_VERSION).catch(SETTINGS_SCHEMA_VERSION),
@@ -422,14 +438,10 @@ export const yoloSettingsSchema = z.object({
   mutedModuleUpdateVersions: z.record(z.string(), z.string()).catch({}),
 
   /**
-   * 检测到新版本时是否弹出更新卡片。关闭后主插件与模块都不再提示,也不再自动
-   * 下载(没有卡片就没有安装入口)。分发源 Feed 仍然照常请求——它同时是模块
-   * 目录的数据源,`设置 → 模块` 的更新按钮依赖它。
+   * 见 `pluginUpdateModeSchema`。无论哪种方式，分发源 Feed 都照常请求——它同时
+   * 是模块目录的数据源，`设置 → 模块` 的更新按钮依赖它。
    */
-  pluginUpdateNoticeEnabled: z.boolean().catch(true),
-
-  /** 检测到新版本时在后台自动下载 release 文件；安装仍需用户确认。 */
-  pluginUpdateAutoDownloadEnabled: z.boolean().catch(true),
+  pluginUpdateMode: pluginUpdateModeSchema.catch('notify'),
 
   // RAG Options
   ragOptions: ragOptionsSchema.catch({
@@ -442,7 +454,6 @@ export const yoloSettingsSchema = z.object({
     indexPdf: true,
     autoUpdateEnabled: true,
     autoUpdateIntervalHours: 0,
-    lastAutoUpdateAt: 0,
   }),
 
   /**
@@ -453,14 +464,14 @@ export const yoloSettingsSchema = z.object({
   knowledgeBases: knowledgeBasesFieldSchema,
 
   /**
-   * Local (on-device) embedding model download settings — see
-   * docs/plans/08-22-local-embedding/00-plan.md §3.4. `endpoint` is the
+   * Local (on-device) embedding model download settings. `endpoint` is the
    * Hugging Face Hub-compatible host model files are resolved against
    * (`${endpoint}/${hfRepo}/resolve/${revision}/${file}`); a purely additive
    * field with a schema default, so it needs no migration entry of its own.
    */
   localEmbedding: localEmbeddingSettingsSchema.catch({
     endpoint: DEFAULT_LOCAL_EMBEDDING_ENDPOINT,
+    device: 'cpu',
   }),
 
   // MCP configuration
@@ -469,8 +480,7 @@ export const yoloSettingsSchema = z.object({
       servers: resilientArraySchema(mcpServerConfigSchema),
       /**
        * Keyed by `BuiltinCapabilityId` as of the `80_to_81` settings
-       * migration (D9, docs/plans/2026-08-15-tool-registry/phase2-migration.md
-       * D9) — was `builtinToolOptions`, keyed by the pre-capability short
+       * migration — was `builtinToolOptions`, keyed by the pre-capability short
        * tool/group names. Reuses `mcpServerToolOptionsSchema` unchanged: this
        * map carries more than `disabled` — `delegate_subagent`'s
        * `allowedModelIds`/`preferredModelId` and `terminal_command`'s
@@ -478,7 +488,34 @@ export const yoloSettingsSchema = z.object({
        * `terminal` respectively.
        */
       builtinCapabilityOptions: mcpServerToolOptionsSchema.catch({}),
-      enableToolDisclosure: z.boolean().catch(false),
+      /**
+       * Derived cache, not user configuration: the last-known `serverInfo`
+       * and tool-name list for each configured MCP server, keyed by the
+       * server's local id. Written by `McpManager` on a successful connect,
+       * and only when the discovered value actually changed.
+       *
+       * It lives in settings because the model-facing tool catalog is built
+       * during system-prompt assembly, which already reads settings, and
+       * because `computeSystemPromptFingerprint` can then treat it like any
+       * other configuration-level input. Losing it is harmless — the affected
+       * server is simply absent from the catalog until it connects once.
+       */
+      discoveredCatalogs: z
+        .record(
+          z.string(),
+          z.object({
+            serverInfo: z
+              .object({
+                name: z.string(),
+                title: z.string().optional(),
+                description: z.string().optional(),
+                version: z.string().optional(),
+              })
+              .optional(),
+            toolNames: z.array(z.string()).catch([]),
+          }),
+        )
+        .catch({}),
       localServer: z
         .object({
           enabled: z.boolean().catch(false),
@@ -499,7 +536,7 @@ export const yoloSettingsSchema = z.object({
     .catch({
       servers: [],
       builtinCapabilityOptions: {},
-      enableToolDisclosure: false,
+      discoveredCatalogs: {},
       localServer: {
         enabled: false,
         port: DEFAULT_LOCAL_MCP_SERVER_PORT,
@@ -561,24 +598,22 @@ export const yoloSettingsSchema = z.object({
       chatInputHeight: z.number().int().min(80).max(520).optional(),
       chatApplyMode: z.enum(['review-required', 'direct-apply']).optional(),
       chatTitlePrompt: z.string().optional(),
-      // Chat mode (ask/agent)
-      chatMode: z.enum(['ask', 'agent']).optional(),
-      // Auto-approve tool calls (YOLO). Orthogonal to chatMode; only effective
-      // in Agent mode.
+      // Chat mode (ask/agent/max)
+      chatMode: z.enum(['ask', 'agent', 'max']).optional(),
+      // Auto-approve tool calls (YOLO). Orthogonal to chatMode, and stored per
+      // trust profile: Agent and Max each keep their own. Ask has no profile
+      // of its own and reads Agent's. See `yoloPreferenceKeyForMode`.
       agentYoloEnabled: z.boolean().optional(),
+      maxYoloEnabled: z.boolean().optional(),
       // Whether the user has acknowledged the first-time full access (YOLO) warning
       fullAccessWarningConfirmed: z.boolean().optional(),
       // Persist preferred reasoning level per model id in Chat input
       reasoningLevelByModelId: z
         .record(z.string(), z.enum(REASONING_LEVELS))
         .optional(),
-      // Auto context compaction prompt injected at runtime LLM boundaries
-      // (based on last assistant usage).
+      // Forced context compaction before a request whose estimated size
+      // reaches this share of the model's context window.
       autoContextCompactionEnabled: z.boolean().optional(),
-      autoContextCompactionThresholdMode: z
-        .enum(['tokens', 'ratio'])
-        .optional(),
-      autoContextCompactionThresholdTokens: z.number().int().min(1).optional(),
       autoContextCompactionThresholdRatio: z.number().min(0).max(1).optional(),
       // Font scale factor for chat messages (1 = default)
       chatFontScale: z.number().min(0.7).max(1.5).optional(),
@@ -634,10 +669,8 @@ export const yoloSettingsSchema = z.object({
       chatMode: 'agent',
       fullAccessWarningConfirmed: false,
       reasoningLevelByModelId: {},
-      autoContextCompactionEnabled: false,
-      autoContextCompactionThresholdMode: 'tokens',
-      autoContextCompactionThresholdTokens: 100000,
-      autoContextCompactionThresholdRatio: 0.8,
+      autoContextCompactionEnabled: true,
+      autoContextCompactionThresholdRatio: 0.9,
       chatFontScale: undefined,
       imageReadingEnabled: true,
       imageCompressionEnabled: true,

@@ -1,12 +1,12 @@
-// Pins the chat-surface header summary text for all 16 active built-in
-// tools (docs/plans/2026-08-15-tool-registry/phase2-migration.md D8). Each
-// expected value below was read directly off the pre-D8 `if` chain in
+// Pins the chat-surface header summary text for every active built-in
+// tools. Each expected value below was read directly off the former `if`
+// chain in
 // `ToolMessage.tsx`'s private `getLocalToolSummaryText` before it was
 // replaced by a `TOOL_RENDERERS` lookup — this file is the regression net
 // for that rewrite: it must keep passing with the exact same strings.
 //
-// Tools with no summary (memory_add/update/delete, context_compact,
-// context_prune_tool_results, ask_user_question) had no branch in that `if`
+// Tools with no summary (context_compact, context_prune_tool_results,
+// ask_user_question) had no branch in that `if`
 // chain either — `TOOL_RENDERERS[name].summary` must be `undefined` for
 // them, same as before. `delegate_subagent`'s header summary is computed
 // elsewhere (`ToolMessage.tsx`'s own `getDelegateSubagentSummary`, applied
@@ -57,16 +57,16 @@ const summarize = (
 
 describe('TOOL_RENDERERS summary — tools with no header summary (unchanged)', () => {
   it.each([
-    'memory_add',
-    'memory_update',
-    'memory_delete',
     'context_compact',
     'context_prune_tool_results',
     'ask_user_question',
     'delegate_subagent',
-  ] as const)('%s has no summary function wired', (toolName) => {
-    expect(TOOL_RENDERERS[toolName].summary).toBeUndefined()
-  })
+  ] as const)(
+    '%s declares summary: null rather than omitting it',
+    (toolName) => {
+      expect(TOOL_RENDERERS[toolName].summary).toBeNull()
+    },
+  )
 })
 
 describe('TOOL_RENDERERS summary — fs_read', () => {
@@ -300,6 +300,34 @@ describe('load_tool_schemas summary (internal tool, not in TOOL_RENDERERS)', () 
   })
 })
 
+describe('TOOL_RENDERERS summary — vault_search', () => {
+  it('query only', () => {
+    expect(summarize('vault_search', { query: 'spaced repetition' })).toBe(
+      'spaced repetition',
+    )
+  })
+
+  it('appends the path and knowledge base that narrowed the search', () => {
+    expect(
+      summarize('vault_search', {
+        query: 'spaced repetition',
+        path: 'Notes/Learning',
+        knowledgeBase: 'Research',
+      }),
+    ).toBe('spaced repetition | Notes/Learning | Research')
+  })
+
+  it('long query: truncated at 60 like every other summary', () => {
+    expect(summarize('vault_search', { query: 'q'.repeat(80) })).toBe(
+      `${'q'.repeat(59)}...`,
+    )
+  })
+
+  it('empty query: no summary', () => {
+    expect(summarize('vault_search', { query: '   ' })).toBeUndefined()
+  })
+})
+
 describe('TOOL_RENDERERS completeness (kind wiring)', () => {
   it('terminal_command is the sole body-kind entry', () => {
     expect(TOOL_RENDERERS.terminal_command.kind).toBe('body')
@@ -309,8 +337,30 @@ describe('TOOL_RENDERERS completeness (kind wiring)', () => {
     expect(TOOL_RENDERERS.delegate_subagent.kind).toBe('replace')
   })
 
+  it('the four file-editing tools are the content-kind entries, and share one renderer', () => {
+    const fileEditing = [
+      TOOL_RENDERERS.fs_edit,
+      TOOL_RENDERERS.fs_write,
+      TOOL_RENDERERS.edit_file,
+      TOOL_RENDERERS.write_file,
+    ]
+    for (const renderer of fileEditing) {
+      expect(renderer.kind).toBe('content')
+    }
+    // Agent's vault tools and Max's native tools must show the same card, so
+    // they are literally the same object rather than four look-alikes.
+    expect(new Set(fileEditing).size).toBe(1)
+  })
+
   it('every other tool is generic-kind', () => {
-    const nonGeneric = new Set(['terminal_command', 'delegate_subagent'])
+    const nonGeneric = new Set([
+      'terminal_command',
+      'delegate_subagent',
+      'fs_edit',
+      'fs_write',
+      'edit_file',
+      'write_file',
+    ])
     for (const [name, renderer] of Object.entries(TOOL_RENDERERS)) {
       if (nonGeneric.has(name)) continue
       expect(renderer.kind).toBe('generic')

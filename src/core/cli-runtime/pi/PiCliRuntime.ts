@@ -1,5 +1,6 @@
 import type { App } from 'obsidian'
 
+import type { ToolCallResponse } from '../../../types/tool-call.types'
 import { loadDesktopNodeModule } from '../../../utils/platform/desktopNodeModule'
 import { getCliPathOverride } from '../cli-path-override'
 import { loadLoginShellEnvironment } from '../login-shell-env'
@@ -14,6 +15,7 @@ import type {
   CliRuntimeConfigurationUpdate,
   CliRuntimeEvent,
   CliRuntimeEventListener,
+  CliRuntimeId,
   CliRuntimeModel,
   CliRuntimeReadyInput,
   CliSessionHydration,
@@ -21,6 +23,8 @@ import type {
   CliTurnInput,
 } from '../types'
 
+import type { PiRuntimeDialect } from './dialect'
+import { PI_RUNTIME_DIALECT } from './dialect'
 import {
   type PiMappingState,
   buildPiForkSessionContent,
@@ -31,7 +35,6 @@ import {
   extractPiCurrentModelState,
   extractPiSessionIdentity,
   getPiTerminalErrorMessage,
-  isPiAgentSettled,
   mapPiEntriesToHydration,
   mapPiEvent,
   mapPiModels,
@@ -47,6 +50,11 @@ import { PiRpcTransport } from './transport'
 export type PiCliRuntimeOptions = {
   app: App
   vaultPath: string
+  /**
+   * Which runtime this engine instance runs as. Defaults to pi itself; the
+   * omp fork passes its own dialect (see `PiRuntimeDialect`).
+   */
+  dialect?: PiRuntimeDialect
 }
 
 type PiProcessHandle = {
@@ -54,11 +62,10 @@ type PiProcessHandle = {
   transport: PiRpcTransport
 }
 
-const NOT_FOUND_MESSAGE =
-  'pi CLI was not found on this device. Install pi (npm i -g @earendil-works/pi-cli, package name may vary), or set a custom CLI path in Settings → Agent, then retry.'
-
 /**
- * Native RPC runtime for `pi --mode rpc` (stdio JSONL).
+ * Native RPC runtime for `pi --mode rpc` (stdio JSONL), and for every CLI
+ * speaking that same protocol — currently pi and its `omp` hard fork, which
+ * differ only in the handful of points collected in `PiRuntimeDialect`.
  *
  * Unlike Claude/Codex/Hermes, pi has no pooled host: a pi session is bound
  * to the process at launch via `--session <target>`, so there is nothing to
@@ -70,7 +77,8 @@ const NOT_FOUND_MESSAGE =
  * process is available yet.
  */
 export class PiCliRuntime implements CliRuntime {
-  readonly runtimeId = 'pi' as const
+  private readonly dialect: PiRuntimeDialect
+  readonly runtimeId: CliRuntimeId
 
   private activeHandle: PiProcessHandle | null = null
   private detachActiveListeners: (() => void) | null = null
@@ -82,7 +90,14 @@ export class PiCliRuntime implements CliRuntime {
   private turnTerminalEmitted = true
   private cancelRequested = false
   private contextWindowHint: number | null = null
-  private readonly mappingState: PiMappingState = createPiMappingState()
+  /**
+   * The `prompt` response only acknowledges acceptance, so turn duration is
+   * measured from here to the dialect's terminal event — neither pi nor omp
+   * reports a duration of its own (Codex and Hermes are measured locally the
+   * same way).
+   */
+  private turnStartedAt: number | null = null
+  private readonly mappingState: PiMappingState
   private readonly listeners = new Set<CliRuntimeEventListener>()
   private models: CliRuntimeModel[] | null = null
   private modelId: string | null = null
@@ -93,10 +108,26 @@ export class PiCliRuntime implements CliRuntime {
   private sentUserMessageIds: string[] = []
   private disposed = false
 
-  constructor(private readonly options: PiCliRuntimeOptions) {}
+  constructor(private readonly options: PiCliRuntimeOptions) {
+    this.dialect = options.dialect ?? PI_RUNTIME_DIALECT
+    this.runtimeId = this.dialect.runtimeId
+    this.mappingState = createPiMappingState(this.runtimeId)
+  }
+
+  private get command(): string {
+    return this.dialect.command
+  }
+
+  private disposedMessage(): string {
+    return `${this.command} CLI runtime has been disposed.`
+  }
+
+  private notReadyMessage(): string {
+    return `${this.command} runtime is not ready.`
+  }
 
   async ensureReady(input: CliRuntimeReadyInput): Promise<void> {
-    if (this.disposed) throw new Error('pi CLI runtime has been disposed.')
+    if (this.disposed) throw new Error(this.disposedMessage())
     const targetKey = input.sessionRef
       ? (input.sessionRef.sessionPathHint ?? input.sessionRef.nativeSessionId)
       : null
@@ -116,7 +147,7 @@ export class PiCliRuntime implements CliRuntime {
       // shut down (`activeHandle` was still null at that point) — this
       // continuation owns cleanup instead of publishing a leaked process.
       await this.disposeProcessHandle(handle)
-      throw new Error('pi CLI runtime has been disposed.')
+      throw new Error(this.disposedMessage())
     }
     this.activeHandle = handle
     this.boundTargetKey = targetKey
@@ -133,13 +164,22 @@ export class PiCliRuntime implements CliRuntime {
   }
 
   async openSession(ref: CliSessionRef): Promise<CliSessionHydration> {
-    if (ref.runtimeId !== 'pi') throw new Error('Cannot open a non-pi session.')
+    if (ref.runtimeId !== this.runtimeId) {
+      throw new Error(
+        `Cannot open a session that is not a ${this.command} session.`,
+      )
+    }
     const target = ref.sessionPathHint ?? ref.nativeSessionId
     const handle = await this.startProcessHandle(target)
     try {
-      const response = await handle.transport.request('get_entries', {})
-      const { messages, compactionBoundaries } =
-        mapPiEntriesToHydration(response)
+      const response = await this.readSessionEntries(
+        handle,
+        ref.sessionPathHint,
+      )
+      const { messages, compactionBoundaries } = mapPiEntriesToHydration(
+        response,
+        this.runtimeId,
+      )
       return { ref, messages, compactionBoundaries }
     } finally {
       await this.disposeProcessHandle(handle)
@@ -240,7 +280,7 @@ export class PiCliRuntime implements CliRuntime {
   ): Promise<void> {}
 
   async sendTurn(input: CliTurnInput): Promise<void> {
-    if (this.disposed) throw new Error('pi CLI runtime has been disposed.')
+    if (this.disposed) throw new Error(this.disposedMessage())
     if (
       input.sessionRef &&
       (!this.activeSessionRef ||
@@ -248,22 +288,24 @@ export class PiCliRuntime implements CliRuntime {
           this.activeSessionRef.nativeSessionId)
     ) {
       throw new Error(
-        'pi session must be resumed with ensureReady before sending.',
+        `${this.command} session must be resumed with ensureReady before sending.`,
       )
     }
     const handle = this.activeHandle
-    if (!handle) throw new Error('pi runtime is not ready.')
+    if (!handle) throw new Error(this.notReadyMessage())
 
     resetPiMappingState(this.mappingState)
     this.turnTerminalEmitted = false
     this.cancelRequested = false
+    this.turnStartedAt = Date.now()
     this.emit({ type: 'run_state', state: 'running' })
 
+    let promptResponse: unknown
     try {
       await this.applySelectedModel(handle)
       await this.applySelectedThinkingLevel(handle)
       const { message, images } = toPiPrompt(input.content)
-      await handle.transport.request('prompt', {
+      promptResponse = await handle.transport.request('prompt', {
         message,
         ...(images.length > 0 ? { images } : {}),
       })
@@ -286,12 +328,20 @@ export class PiCliRuntime implements CliRuntime {
     // (or be given a real chance to) before returning, not merely be kicked
     // off in the background.
     if (!this.sessionBound) await this.attemptBindSession()
+
+    // Some runtimes answer a prompt they handled entirely on their own (a
+    // pure slash command, say) with "no agent was invoked" — no turn event
+    // will ever arrive for it, so the turn is closed out from the response
+    // instead. `settleTurn` is a no-op if events already closed it.
+    if (this.dialect.isPromptSettledWithoutAgentRun?.(promptResponse)) {
+      this.settleTurn()
+    }
   }
 
   async rewriteTurn(input: CliRewriteTurnInput): Promise<void> {
-    if (this.disposed) throw new Error('pi CLI runtime has been disposed.')
+    if (this.disposed) throw new Error(this.disposedMessage())
     if (!this.activeHandle || !this.activeSessionRef) {
-      throw new Error('pi runtime is not ready.')
+      throw new Error(this.notReadyMessage())
     }
     const activeRef = this.activeSessionRef
     const sameSession =
@@ -299,11 +349,23 @@ export class PiCliRuntime implements CliRuntime {
       (!!input.sessionRef.sessionPathHint &&
         input.sessionRef.sessionPathHint === activeRef.sessionPathHint)
     if (!sameSession) {
-      throw new Error('pi rewrite does not match the active session.')
+      throw new Error(
+        `${this.command} rewrite does not match the active session.`,
+      )
     }
 
     const handle = this.activeHandle
-    const entriesResponse = await handle.transport.request('get_entries', {})
+    // The file is resolved first: it is both where the fork is written and,
+    // for a session-file dialect, where the transcript is read from.
+    const state = await handle.transport.request('get_state', {})
+    const identity = extractPiSessionIdentity(state)
+    const sourceFile = activeRef.sessionPathHint ?? identity?.sessionFile
+    if (!sourceFile) {
+      throw new Error(
+        `${this.command} session file is unknown; cannot rewrite a turn.`,
+      )
+    }
+    const entriesResponse = await this.readSessionEntries(handle, sourceFile)
     const checkpoint = resolvePiRewriteCheckpoint(
       entriesResponse,
       input.sourceUserMessageId,
@@ -313,12 +375,6 @@ export class PiCliRuntime implements CliRuntime {
       0,
       checkpoint.userIndex,
     )
-    const state = await handle.transport.request('get_state', {})
-    const identity = extractPiSessionIdentity(state)
-    const sourceFile = activeRef.sessionPathHint ?? identity?.sessionFile
-    if (!sourceFile) {
-      throw new Error('pi session file is unknown; cannot rewrite a turn.')
-    }
 
     const nextRef = checkpoint.resumeAt
       ? await this.writeForkedSession({
@@ -336,6 +392,53 @@ export class PiCliRuntime implements CliRuntime {
       ...(input.selectedSkills ? { selectedSkills: input.selectedSkills } : {}),
       ...(this.activeSessionRef ? { sessionRef: this.activeSessionRef } : {}),
     })
+  }
+
+  /**
+   * The session transcript, in the `{ entries }` shape the entry mapping and
+   * the fork writer both consume. `historySource` decides where it comes
+   * from — see `PiRuntimeDialect`. Reading the file yields the same records
+   * `get_entries` does, minus the two file-level headers: `session` (which
+   * the fork writer regenerates) and omp's fixed-width `title` slot, which
+   * is physical framing rather than a transcript entry.
+   */
+  private async readSessionEntries(
+    handle: PiProcessHandle,
+    sessionFile: string | undefined,
+  ): Promise<unknown> {
+    if (this.dialect.historySource === 'rpc') {
+      return handle.transport.request('get_entries', {})
+    }
+    const file =
+      sessionFile ??
+      extractPiSessionIdentity(await handle.transport.request('get_state', {}))
+        ?.sessionFile
+    if (!file) {
+      throw new Error(
+        `${this.command} session file is unknown; cannot read the transcript.`,
+      )
+    }
+    const fs =
+      await loadDesktopNodeModule<typeof import('node:fs/promises')>(
+        'node:fs/promises',
+      )
+    const entries: unknown[] = []
+    for (const line of (await fs.readFile(file, 'utf8')).split('\n')) {
+      if (!line.trim()) continue
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(line)
+      } catch {
+        continue
+      }
+      const type =
+        parsed && typeof parsed === 'object'
+          ? (parsed as { type?: unknown }).type
+          : undefined
+      if (type === 'session' || type === 'title') continue
+      entries.push(parsed)
+    }
+    return { entries }
   }
 
   private async writeForkedSession({
@@ -372,7 +475,7 @@ export class PiCliRuntime implements CliRuntime {
       { flag: 'wx' },
     )
     return {
-      runtimeId: 'pi',
+      runtimeId: this.runtimeId,
       nativeSessionId: sessionId,
       sessionPathHint: sessionFile,
     }
@@ -387,20 +490,24 @@ export class PiCliRuntime implements CliRuntime {
   }
 
   async compact(): Promise<void> {
-    if (!this.activeHandle) throw new Error('pi runtime is not ready.')
+    if (!this.activeHandle) throw new Error(this.notReadyMessage())
     // Compaction waits on the summarization LLM call. Same as Codex:
     // `timeoutMs = 0` disables the transport default (30s).
     await this.activeHandle.transport.request('compact', {}, 0)
   }
 
   /** pi has no approval prompts in v1 — nothing is ever pending to answer. */
-  async respondApproval(_response: CliApprovalResponse): Promise<boolean> {
-    return false
+  async respondApproval(
+    _response: CliApprovalResponse,
+  ): Promise<ToolCallResponse | null> {
+    return null
   }
 
   /** pi has no user-question prompts in v1 — nothing is ever pending to answer. */
-  async respondQuestion(_response: CliQuestionResponse): Promise<boolean> {
-    return false
+  async respondQuestion(
+    _response: CliQuestionResponse,
+  ): Promise<ToolCallResponse | null> {
+    return null
   }
 
   subscribe(listener: CliRuntimeEventListener): () => void {
@@ -421,13 +528,14 @@ export class PiCliRuntime implements CliRuntime {
 
   private async resolveCommand(): Promise<string> {
     const env = (await loadLoginShellEnvironment()) as NodeJS.ProcessEnv
-    const cliPathOverride = getCliPathOverride(this.options.app, 'pi')
+    const cliPathOverride = getCliPathOverride(this.options.app, this.runtimeId)
     const resolved = await resolvePiCommand(
       env,
       process.platform,
       cliPathOverride,
+      this.command,
     )
-    if (!resolved) throw new Error(NOT_FOUND_MESSAGE)
+    if (!resolved) throw new Error(this.dialect.notFoundMessage)
     return resolved.command
   }
 
@@ -445,7 +553,11 @@ export class PiCliRuntime implements CliRuntime {
       args,
       cwd: this.options.vaultPath,
     })
-    const transport = new PiRpcTransport(process)
+    const transport = new PiRpcTransport(process, {
+      ...(this.dialect.negotiateProtocolVersion !== undefined
+        ? { negotiateProtocolVersion: this.dialect.negotiateProtocolVersion }
+        : {}),
+    })
     return { process, transport }
   }
 
@@ -522,12 +634,29 @@ export class PiCliRuntime implements CliRuntime {
       this.emit(mapped)
     }
 
-    if (isPiAgentSettled(event) && !this.turnTerminalEmitted) {
-      this.turnTerminalEmitted = true
-      const state = this.cancelRequested ? 'aborted' : 'completed'
-      this.cancelRequested = false
-      this.emit({ type: 'run_state', state })
+    if (this.dialect.isTurnSettled(event)) this.settleTurn()
+  }
+
+  /**
+   * Closes out the current turn exactly once, whichever way its end was
+   * learned — a terminal event, or a `prompt` response that says no agent
+   * turn will follow at all.
+   */
+  private settleTurn(): void {
+    if (this.turnTerminalEmitted) return
+    this.turnTerminalEmitted = true
+    const state = this.cancelRequested ? 'aborted' : 'completed'
+    this.cancelRequested = false
+    if (this.turnStartedAt !== null) {
+      // Before the terminal run state, which closes the turn's metrics
+      // window in CliConversationController.
+      this.emit({
+        type: 'turn_metrics',
+        durationMs: Math.max(0, Date.now() - this.turnStartedAt),
+      })
+      this.turnStartedAt = null
     }
+    this.emit({ type: 'run_state', state })
   }
 
   private handleTransportFatal(handle: PiProcessHandle, error: Error): void {
@@ -578,7 +707,7 @@ export class PiCliRuntime implements CliRuntime {
             identity && (identity.sessionId ?? identity.sessionFile)
           if (nativeSessionId) {
             const ref: CliSessionRef = {
-              runtimeId: 'pi',
+              runtimeId: this.runtimeId,
               nativeSessionId,
               ...(identity?.sessionFile
                 ? { sessionPathHint: identity.sessionFile }
@@ -614,10 +743,14 @@ export class PiCliRuntime implements CliRuntime {
     // predating the `provider/modelId` encoding) can't be applied safely —
     // leave pi on its current model rather than sending a broken request.
     if (!decoded) return
-    await handle.transport.request('set_model', {
+    // The response is the full Model object, which carries the new model's
+    // context window — the ring's denominator has to follow the switch.
+    const model = await handle.transport.request('set_model', {
       provider: decoded.provider,
       modelId: decoded.modelId,
     })
+    const window = extractPiContextWindow(model)
+    if (window !== null) this.contextWindowHint = window
     this.appliedModelId = this.modelId
     this.appliedThinkingLevel = null
   }

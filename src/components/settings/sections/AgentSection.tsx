@@ -1,7 +1,13 @@
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import { BookOpen, Copy, Cpu, Plus, Trash2, Wrench } from 'lucide-react'
 import { App, Platform } from 'obsidian'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 
 import { useLanguage } from '../../../contexts/language-context'
 import { usePlugin } from '../../../contexts/plugin-context'
@@ -10,6 +16,7 @@ import { getAssistantModelDisplayLabel } from '../../../core/agent/assistant-mod
 import { isDefaultAssistantId } from '../../../core/agent/default-assistant'
 import { getEnabledAssistantToolNames } from '../../../core/agent/tool-preferences'
 import { McpManager } from '../../../core/mcp/mcpManager'
+import { toModuleToolSetEnablement } from '../../../core/modules/moduleToolSetRegistry'
 import { humanizeSkillName } from '../../../core/skills/liteSkills'
 import { isSkillEnabledForAssistant } from '../../../core/skills/skillPolicy'
 import { useLiteSkillEntries } from '../../../hooks/useLiteSkillEntries'
@@ -17,9 +24,8 @@ import { Assistant } from '../../../types/assistant.types'
 import { McpServerState, McpServerStatus } from '../../../types/mcp.types'
 import { renderAssistantIcon } from '../../../utils/assistant-icon'
 import { ObsidianButton } from '../../common/ObsidianButton'
-import { ObsidianSetting } from '../../common/ObsidianSetting'
-import { ObsidianToggle } from '../../common/ObsidianToggle'
 import { ConfirmModal } from '../../modals/ConfirmModal'
+import { SortableCardGrid } from '../common/SortableCardGrid'
 import { AgentSkillsModal } from '../modals/AgentSkillsModal'
 import { AgentToolsModal } from '../modals/AgentToolsModal'
 import { AssistantsModal } from '../modals/AssistantsModal'
@@ -35,11 +41,22 @@ type AgentSectionProps = {
   app: App
 }
 
+const getAssistantId = (assistant: Assistant) => assistant.id
+
 export function AgentSection({ app }: AgentSectionProps) {
-  const { settings, setSettings } = useSettings()
+  const { settings, setSettings, updateSettings } = useSettings()
   const { t } = useLanguage()
   const plugin = usePlugin()
   const assistants = settings.assistants || []
+  const moduleToolSetRegistry = plugin.getModuleToolSetRegistry()
+  const moduleToolSetSnapshot = useSyncExternalStore(
+    moduleToolSetRegistry.subscribe,
+    moduleToolSetRegistry.getSnapshot,
+  )
+  const moduleToolSetEnablement = useMemo(
+    () => toModuleToolSetEnablement(moduleToolSetSnapshot),
+    [moduleToolSetSnapshot],
+  )
   const [mcpManager, setMcpManager] = useState<McpManager | null>(null)
   const [mcpServers, setMcpServers] = useState<McpServerState[]>([])
   const [mcpManagerLoading, setMcpManagerLoading] = useState(true)
@@ -169,16 +186,6 @@ export function AgentSection({ app }: AgentSectionProps) {
   const handleOpenSkillsModal = () => {
     const modal = new AgentSkillsModal(app, plugin)
     modal.open()
-  }
-
-  const handleToggleToolDisclosure = async (value: boolean) => {
-    await setSettings({
-      ...settings,
-      mcp: {
-        ...settings.mcp,
-        enableToolDisclosure: value,
-      },
-    })
   }
 
   const mcpTools = useMemo(
@@ -392,22 +399,6 @@ export function AgentSection({ app }: AgentSectionProps) {
             </div>
           </article>
         </div>
-
-        <ObsidianSetting
-          name={t(
-            'settings.agent.enableToolDisclosure',
-            'On-demand tool disclosure',
-          )}
-          desc={t(
-            'settings.agent.enableToolDisclosureDesc',
-            'Beta: expose large tool schemas only when the model asks for them.',
-          )}
-        >
-          <ObsidianToggle
-            value={settings.mcp.enableToolDisclosure}
-            onChange={(value) => void handleToggleToolDisclosure(value)}
-          />
-        </ObsidianSetting>
       </section>
 
       <section className="yolo-agent-block">
@@ -430,21 +421,19 @@ export function AgentSection({ app }: AgentSectionProps) {
           </div>
         </div>
 
-        <div className="yolo-agent-grid">
-          {assistants.map((assistant) => (
-            <article
-              key={assistant.id}
-              className="yolo-agent-card yolo-agent-card--clickable"
-              role="button"
-              tabIndex={0}
-              onClick={() => handleOpenAssistantsModal(assistant.id)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                  event.preventDefault()
-                  handleOpenAssistantsModal(assistant.id)
-                }
-              }}
-            >
+        <SortableCardGrid
+          className="yolo-agent-grid"
+          items={assistants}
+          getId={getAssistantId}
+          onOpen={(assistant) => handleOpenAssistantsModal(assistant.id)}
+          onReorder={(nextAssistants) =>
+            updateSettings((current) => ({
+              ...current,
+              assistants: nextAssistants,
+            }))
+          }
+          renderCard={(assistant) => (
+            <>
               <div className="yolo-agent-card-top">
                 <div className="yolo-agent-card-top-main">
                   <div className="yolo-agent-avatar">
@@ -527,9 +516,12 @@ export function AgentSection({ app }: AgentSectionProps) {
                 </span>
                 <span className="yolo-agent-meta-item">
                   <Wrench size={12} />
-                  {assistant.enableTools
-                    ? `${getEnabledAssistantToolNames(assistant).length} tools`
-                    : '0 tools'}
+                  {`${
+                    getEnabledAssistantToolNames(
+                      assistant,
+                      moduleToolSetEnablement,
+                    ).length
+                  } tools`}
                 </span>
                 <span className="yolo-agent-meta-item">
                   <BookOpen size={12} />
@@ -544,28 +536,30 @@ export function AgentSection({ app }: AgentSectionProps) {
                   } skills`}
                 </span>
               </div>
+            </>
+          )}
+          trailing={
+            <article
+              className="yolo-agent-create-card"
+              role="button"
+              tabIndex={0}
+              onClick={() => handleOpenAssistantsModal(undefined, true)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault()
+                  handleOpenAssistantsModal(undefined, true)
+                }
+              }}
+            >
+              <div className="yolo-agent-create-card-icon">
+                <Plus size={28} />
+              </div>
+              <div className="yolo-agent-create-card-text">
+                {t('settings.agent.newAgent', 'New agent')}
+              </div>
             </article>
-          ))}
-          <article
-            className="yolo-agent-create-card"
-            role="button"
-            tabIndex={0}
-            onClick={() => handleOpenAssistantsModal(undefined, true)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' || event.key === ' ') {
-                event.preventDefault()
-                handleOpenAssistantsModal(undefined, true)
-              }
-            }}
-          >
-            <div className="yolo-agent-create-card-icon">
-              <Plus size={28} />
-            </div>
-            <div className="yolo-agent-create-card-text">
-              {t('settings.agent.newAgent', 'New agent')}
-            </div>
-          </article>
-        </div>
+          }
+        />
       </section>
 
       <section className="yolo-agent-block">

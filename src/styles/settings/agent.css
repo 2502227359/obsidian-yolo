@@ -259,12 +259,6 @@ button.yolo-agent-mcp-config-copy {
   gap: 6px;
 }
 
-.yolo-agent-skill-summary-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--size-2-2);
-}
-
 .yolo-agent-skills-toolbar {
   margin: var(--size-4-2) 0;
   display: flex;
@@ -517,8 +511,29 @@ button.yolo-agent-mcp-config-copy {
   gap: var(--size-4-3);
 }
 
-.yolo-agent-tools-panel.is-disabled {
-  opacity: 0.64;
+.yolo-agent-panel-search {
+  flex: 0 1 220px;
+  min-width: 120px;
+}
+
+/* 面板标题行右侧的操作区：批量开关与搜索框。和左侧的统计分开放，
+ * 免得「全部启用」读起来像统计句子的延续。 */
+.yolo-agent-tools-panel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--size-4-3);
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.yolo-agent-tools-panel-actions > .yolo-agent-tool-group-bulk-toggle {
+  flex: none;
+  white-space: nowrap;
+}
+
+.yolo-agent-panel-search input {
+  width: 100%;
 }
 
 .yolo-agent-tools-panel-head {
@@ -545,6 +560,11 @@ button.yolo-agent-mcp-config-copy {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
   white-space: nowrap;
+}
+
+.yolo-agent-tools-panel-estimate + .yolo-agent-tools-panel-estimate::before {
+  content: '·';
+  margin-right: var(--size-2-2);
 }
 
 .yolo-agent-tools-panel-count {
@@ -576,6 +596,60 @@ button.yolo-agent-mcp-config-copy {
   display: inline-flex;
   align-items: baseline;
   gap: var(--size-4-2);
+}
+
+/* server 名承载启用状态。此前整行统一是 text-muted，全开和全关长得一样——
+ * 一个 agent 能不能用某个 MCP，是这一页最该一眼看出来的事。有工具启用时它是
+ * 一个活动的分组标题（text-normal），全部禁用时退到 text-faint，两态之间是
+ * 两级对比而不是零级。 */
+.yolo-agent-tool-group-name {
+  color: var(--text-normal);
+}
+
+.yolo-agent-tool-group.is-disabled .yolo-agent-tool-group-name {
+  color: var(--text-faint);
+}
+
+/* 折叠触发器就是 server 名本身。它和同一行里的披露/审批下拉是兄弟节点而不是
+ * 祖先，整行不能做成一个按钮——那样会嵌套按钮。 */
+button.yolo-agent-tool-group-name--toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--size-2-1);
+  padding: 0;
+  height: auto;
+  line-height: inherit;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  font-size: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+
+button.yolo-agent-tool-group-name--toggle:hover {
+  background: transparent;
+  color: var(--text-accent);
+}
+
+.yolo-agent-tool-group-chevron {
+  flex: 0 0 auto;
+  opacity: 0.7;
+  transition: transform var(--yolo-anim-duration-feedback)
+    var(--yolo-anim-ease-out);
+}
+
+.yolo-agent-tool-group.is-expanded .yolo-agent-tool-group-chevron {
+  transform: rotate(90deg);
+}
+
+/* 全部禁用时，token 估算、披露模式、审批模式描述的都是不会运行的工具，一起
+ * 淡下去，免得这一行看起来仍然「已配置、在生效」。「全部启用」是恢复它的唯一
+ * 入口，保持原有对比度，不跟着淡。 */
+.yolo-agent-tool-group.is-disabled .yolo-agent-tool-group-tokens,
+.yolo-agent-tool-group.is-disabled .yolo-agent-tool-group-disclosure,
+.yolo-agent-tool-group.is-disabled .yolo-agent-tool-group-count {
+  opacity: 0.55;
 }
 
 .yolo-agent-tool-group-tokens {
@@ -678,6 +752,20 @@ button.yolo-agent-tool-group-bulk-toggle:hover {
   .yolo-agent-tools-panel-head {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .yolo-agent-panel-search {
+    flex: none;
+    width: 100%;
+  }
+
+  .yolo-agent-tools-panel-actions {
+    width: 100%;
+  }
+
+  .yolo-agent-tools-panel-actions .yolo-agent-panel-search {
+    flex: 1 1 auto;
+    width: auto;
   }
 
   .yolo-agent-tools-panel .yolo-agent-tool-row {
@@ -1122,8 +1210,11 @@ button.yolo-agent-chip--more:hover {
   font-weight: var(--font-medium);
 }
 
+/* Keyboard focus only: a mouse press or drag also focuses the card, and that
+   focus must not leave it looking selected once the pointer moves away. */
 .yolo-agent-card:hover,
-.yolo-agent-card:focus-within {
+.yolo-agent-card:focus-visible,
+.yolo-agent-card:has(:focus-visible) {
   border-color: color-mix(in srgb, var(--interactive-accent) 55%, transparent);
   background: color-mix(
     in srgb,
@@ -1236,7 +1327,8 @@ button.yolo-agent-chip--more:hover {
 }
 
 .yolo-agent-card:hover .yolo-agent-card-menu-trigger,
-.yolo-agent-card:focus-within .yolo-agent-card-menu-trigger,
+.yolo-agent-card:focus-visible .yolo-agent-card-menu-trigger,
+.yolo-agent-card:has(:focus-visible) .yolo-agent-card-menu-trigger,
 .yolo-agent-card-menu-trigger:focus-visible {
   opacity: 1;
   pointer-events: auto;

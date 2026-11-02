@@ -1,6 +1,5 @@
 import type { App, TFile } from 'obsidian'
 
-import type { TodoItem } from '../../../core/agent/todos-from-messages'
 import type { CurrentFileViewState } from '../../../types/mentionable'
 
 /**
@@ -36,9 +35,23 @@ export type EditorSnapshotInjection = {
   selection?: EditorSnapshotSelection
 }
 
-export type TodoListInjection = {
-  type: 'todo-list'
-  todos: ReadonlyArray<TodoItem>
+/**
+ * Free-form description of the surface an editor is embedded in, supplied by
+ * whoever opened Quick Ask on it.
+ *
+ * A module's embedded editor is a window onto a document the host cannot see
+ * — a card inside a board, whose neighbours, position and sources are the
+ * whole point of the question being asked. Only the owner of that surface can
+ * describe it, so it hands over already-rendered text.
+ *
+ * A thunk rather than a string, for the same reason `browser-context` carries
+ * an `app`: the surface keeps changing while the panel is open, so it is read
+ * when the request is built. Asynchronous because describing a surface can
+ * mean reading files.
+ */
+export type SurfaceContextInjection = {
+  type: 'surface-context'
+  getText: () => string | Promise<string>
 }
 
 /**
@@ -59,5 +72,5 @@ export type BrowserContextInjection = {
 export type ContextualInjection =
   | CurrentFilePointerInjection
   | EditorSnapshotInjection
-  | TodoListInjection
+  | SurfaceContextInjection
   | BrowserContextInjection

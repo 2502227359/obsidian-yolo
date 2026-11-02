@@ -29,6 +29,7 @@ import {
   LLMResponseStreaming,
   ProviderMetadata,
   ResponseUsage,
+  ResponsesReplayItem,
   ToolCall,
   ToolCallDelta,
 } from '../../types/llm/response'
@@ -49,6 +50,11 @@ type StreamState = {
   streamedReasoningItemIds: Set<string>
   /** Hosted searches seen so far, re-emitted in full as each one completes. */
   hostedWebSearchCalls: Map<string, HostedWebSearchCall>
+  /**
+   * Finished output items by `output_index`. The Codex endpoint ends with an
+   * empty `output`, so these are the reply's only complete record there.
+   */
+  outputItems: ResponseOutputItem[]
 }
 
 type ReasoningSummaryPartAddedEvent = {
@@ -68,14 +74,6 @@ type ResponsesHostedTool = WebSearchTool | FileSearchTool | ComputerTool
 
 type ResponsesTool = FunctionTool | ResponsesHostedTool
 
-type RawResponsesHostedTool =
-  | { type: 'web_search' }
-  | ({
-      type: 'web_search_preview' | 'web_search_preview_2025_03_11'
-    } & Partial<WebSearchTool>)
-  | ({ type: 'file_search' } & Partial<FileSearchTool>)
-  | ({ type: 'computer-preview' } & Partial<ComputerTool>)
-
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null
 
@@ -86,16 +84,6 @@ const isFunctionRequestTool = (value: unknown): value is RequestTool => {
 
   const fn = value.function
   return isRecord(fn) && typeof fn.name === 'string' && isRecord(fn.parameters)
-}
-
-const toHostedTool = (tool: RawResponsesHostedTool): ResponsesHostedTool => {
-  if (tool.type === 'web_search') {
-    return {
-      type: 'web_search_preview',
-    }
-  }
-
-  return tool as ResponsesHostedTool
 }
 
 const toInputContent = (
@@ -156,6 +144,47 @@ const toFunctionCallItems = (
   }))
 }
 
+/**
+ * The reply's output items, kept to send back as they were — only when it
+ * reasoned, and only when every reasoning item carries its reasoning
+ * (`encrypted_content`, or DeepSeek's `content`): requests go out with
+ * `store: false`, so the API cannot look a bare reasoning item up by id.
+ */
+const toReplayOutput = (
+  output: readonly unknown[],
+): ResponsesReplayItem[] | null => {
+  const items = output as ResponsesReplayItem[]
+  const reasoningItems = items.filter((item) => item.type === 'reasoning')
+  if (reasoningItems.length === 0) {
+    return null
+  }
+  const replayable = reasoningItems.every(
+    (item) =>
+      typeof item.encrypted_content === 'string' ||
+      (Array.isArray(item.content) && item.content.length > 0),
+  )
+  return replayable ? items : null
+}
+
+/**
+ * The reply exactly as the API returned it, when the message carries it.
+ * Function calls the request no longer answers are left out, since a call
+ * without its output is rejected.
+ */
+const toReplayedAssistantItems = (
+  message: Extract<RequestMessage, { role: 'assistant' }>,
+): ResponseInputItem[] | null => {
+  const output = message.providerMetadata?.openaiResponses?.output
+  if (!output) {
+    return null
+  }
+  const callIds = new Set(message.tool_calls?.map((call) => call.id))
+  return output.filter(
+    (item) =>
+      item.type !== 'function_call' || callIds.has(item.call_id as string),
+  ) as unknown as ResponseInputItem[]
+}
+
 const toInputItems = (messages: RequestMessage[]): ResponseInput => {
   return messages.flatMap<ResponseInputItem>((message) => {
     switch (message.role) {
@@ -172,6 +201,10 @@ const toInputItems = (messages: RequestMessage[]): ResponseInput => {
           type: 'message',
         }
       case 'assistant': {
+        const replay = toReplayedAssistantItems(message)
+        if (replay) {
+          return replay
+        }
         const assistantMessage = toAssistantMessage(message)
         const toolCalls = toFunctionCallItems(message)
         return [...(assistantMessage ? [assistantMessage] : []), ...toolCalls]
@@ -226,12 +259,16 @@ const toTools = (
 
     if (isRecord(tool) && typeof tool.type === 'string') {
       switch (tool.type) {
+        // Hosted tools are forwarded verbatim: the transport that injected one
+        // owns its wire name. The OpenAI platform takes `web_search_preview`
+        // while the Codex backend only accepts `web_search` and rejects the
+        // preview type outright, so renaming here would break one of them.
         case 'web_search':
         case 'web_search_preview':
         case 'web_search_preview_2025_03_11':
         case 'file_search':
         case 'computer-preview':
-          mappedTools.push(toHostedTool(tool as RawResponsesHostedTool))
+          mappedTools.push(tool as unknown as ResponsesHostedTool)
           continue
       }
     }
@@ -459,7 +496,9 @@ export class ChatGPTOAuthResponsesAdapter {
       body.reasoning = reasoning
     }
 
-    if (reasoning.effort) {
+    // A reasoning model reasons at `auto` too, where no effort is sent; its
+    // reasoning is only replayable with the encrypted copy.
+    if (reasoning.effort || request.reasoningLevel !== undefined) {
       body.include = [
         'reasoning.encrypted_content',
       ] as unknown as ResponseCreateParams['include']
@@ -546,6 +585,11 @@ export class ChatGPTOAuthResponsesAdapter {
         ? (getHostedWebSearchCall(item) ?? [])
         : [],
     )
+    const replayOutput = toReplayOutput(response.output)
+    const providerMetadata: ProviderMetadata = {
+      ...(replayOutput ? { openaiResponses: { output: replayOutput } } : {}),
+      ...(hostedWebSearch.length > 0 ? { hostedWebSearch } : {}),
+    }
 
     return {
       id: response.id,
@@ -561,8 +605,8 @@ export class ChatGPTOAuthResponsesAdapter {
             ...(reasoningText ? { reasoning: reasoningText } : {}),
             ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
             ...(annotations.length > 0 ? { annotations } : {}),
-            ...(hostedWebSearch.length > 0
-              ? { providerMetadata: { hostedWebSearch } }
+            ...(Object.keys(providerMetadata).length > 0
+              ? { providerMetadata }
               : {}),
           },
         },
@@ -666,6 +710,7 @@ export class ChatGPTOAuthResponsesAdapter {
         return
       }
       case 'response.output_item.done': {
+        state.outputItems[event.output_index] = event.item
         if (event.item.type === 'reasoning') {
           if (state.streamedReasoningItemIds.has(event.item.id)) {
             return
@@ -719,6 +764,13 @@ export class ChatGPTOAuthResponsesAdapter {
         return
       }
       case 'response.completed': {
+        // `providerMetadata` is replaced whole by each chunk that carries it,
+        // so the replay goes out complete, with the search receipts.
+        const replayOutput = toReplayOutput(
+          event.response.output.length > 0
+            ? event.response.output
+            : state.outputItems.filter(Boolean),
+        )
         yield {
           id: event.response.id,
           created: event.response.created_at,
@@ -727,7 +779,20 @@ export class ChatGPTOAuthResponsesAdapter {
           choices: [
             {
               finish_reason: getFinishReason(event.response, state.sawToolCall),
-              delta: {},
+              delta: replayOutput
+                ? {
+                    providerMetadata: {
+                      openaiResponses: { output: replayOutput },
+                      ...(state.hostedWebSearchCalls.size > 0
+                        ? {
+                            hostedWebSearch: [
+                              ...state.hostedWebSearchCalls.values(),
+                            ],
+                          }
+                        : {}),
+                    },
+                  }
+                : {},
             },
           ],
           usage: toUsage(event.response.usage),
@@ -770,6 +835,7 @@ export class ChatGPTOAuthResponsesAdapter {
       reasoningSummaryIndices: new Map(),
       streamedReasoningItemIds: new Set(),
       hostedWebSearchCalls: new Map(),
+      outputItems: [],
     }
   }
 

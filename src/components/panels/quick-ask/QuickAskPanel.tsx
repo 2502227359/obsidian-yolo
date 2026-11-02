@@ -11,6 +11,7 @@ import React, {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react'
 import { v4 as uuidv4 } from 'uuid'
 
@@ -19,11 +20,17 @@ import { useLanguage } from '../../../contexts/language-context'
 import { useMcp } from '../../../contexts/mcp-context'
 import { useSettings } from '../../../contexts/settings-context'
 import { resolveAssistantTimeContextEnabled } from '../../../core/agent/assistant-capabilities'
+import type {
+  ChatModeSelectOptionValue,
+  ToolChatMode,
+} from '../../../core/agent/chat-mode'
+import { resolveChatModeRuntime } from '../../../core/agent/chat-runtime-profiles'
 import { getEnabledAssistantToolNames } from '../../../core/agent/tool-preferences'
 import { materializeTextEditPlan } from '../../../core/edits/textEditEngine'
 import { parseTextEditPlan } from '../../../core/edits/textEditPlan'
 import { LLMModelNotFoundException } from '../../../core/llm/exception'
 import { getChatModelClient } from '../../../core/llm/manager'
+import { toModuleToolSetEnablement } from '../../../core/modules/moduleToolSetRegistry'
 import { listLiteSkillEntries } from '../../../core/skills/liteSkills'
 import { isSkillEnabledForAssistant } from '../../../core/skills/skillPolicy'
 import type {
@@ -57,7 +64,11 @@ import {
 } from '../../../types/reasoning'
 import type { ToolCallResponse } from '../../../types/tool-call.types'
 import { renderAssistantIcon } from '../../../utils/assistant-icon'
-import type { EditorSnapshotInjection } from '../../../utils/chat/contextual-injections'
+import {
+  type ContextualInjection,
+  type EditorSnapshotInjection,
+  stampUserMessageInjectedContext,
+} from '../../../utils/chat/contextual-injections'
 import {
   getMentionableKey,
   serializeMentionable,
@@ -70,7 +81,7 @@ import { AssistantRenderStreamProvider } from '../../chat-view/assistant-render-
 import AssistantToolMessageGroupItem from '../../chat-view/AssistantToolMessageGroupItem'
 import {
   ChatModeSelect,
-  type ChatModeSelectOptionValue,
+  yoloPreferencePatch,
 } from '../../chat-view/chat-input/ChatModeSelect'
 import type { ChatUserInputRef } from '../../chat-view/chat-input/ChatUserInput'
 import MessageInputCore, {
@@ -84,7 +95,6 @@ import {
 } from '../../chat-view/chat-input/ReasoningSelect'
 import { SubmitButton } from '../../chat-view/chat-input/SubmitButton'
 import { editorStateToPlainText } from '../../chat-view/chat-input/utils/editor-state-to-plain-text'
-import { resolveChatModeRuntime } from '../../chat-view/chat-runtime-profiles'
 import { getChatSurfacePreset } from '../../chat-view/chat-surface-presets'
 import { LiveEdgeFollowProvider } from '../../chat-view/live-edge-follow-context'
 import { SharedConversationSurface } from '../../chat-view/SharedConversationSurface'
@@ -162,6 +172,12 @@ type QuickAskPanelPropsBase = {
   contextText: string
   fileTitle: string
   sourceFilePath?: string
+  /**
+   * Extra context from whoever opened this panel, injected after the editor
+   * snapshot (see QuickAskShowOptions.getSurfaceContext). Read when a request
+   * is built, not when the panel opens.
+   */
+  getSurfaceContext?: () => string | Promise<string>
   initialPrompt?: string
   initialMentionables?: Mentionable[]
   initialMode?: QuickAskLaunchMode
@@ -212,6 +228,7 @@ export function QuickAskPanel({
   contextText,
   fileTitle,
   sourceFilePath,
+  getSurfaceContext,
   initialPrompt,
   initialMentionables,
   initialMode,
@@ -240,6 +257,20 @@ export function QuickAskPanel({
   const { getMcpManager } = useMcp()
   const { createOrUpdateConversationImmediately, generateConversationTitle } =
     useChatHistory()
+
+  // Module tool sets: same registry `useSyncExternalStore` pattern used by the chat mode
+  // registry in `useChatStreamManager.ts`, reduced to what
+  // `getEnabledAssistantToolNames` needs so Quick Ask resolves the same
+  // enabled tool set the sidebar chat does.
+  const moduleToolSetRegistry = plugin.getModuleToolSetRegistry()
+  const moduleToolSetSnapshot = useSyncExternalStore(
+    moduleToolSetRegistry.subscribe,
+    moduleToolSetRegistry.getSnapshot,
+  )
+  const moduleToolSetEnablement = useMemo(
+    () => toModuleToolSetEnablement(moduleToolSetSnapshot),
+    [moduleToolSetSnapshot],
+  )
 
   const assistants = settings.assistants || []
   const currentAssistantId = settings.quickAskAssistantId
@@ -626,9 +657,8 @@ export function QuickAskPanel({
   }, [mentionables, selectionMentionable])
 
   // System prompt is intentionally minimal: Quick Ask's "current editor scene"
-  // (file path/title, cursor context, selection) is injected via the agent
-  // runtime's `contextualInjections` channel — see editorSnapshotInjection
-  // built below in the submit path.
+  // (file path/title, cursor context, selection) is stamped onto each user
+  // message as it is sent — see editorSnapshotInjection below.
   const requestContextBuilder = useMemo(() => {
     const globalSystemPrompt = settings.systemPrompt || ''
     const assistantPrompt = selectedAssistant?.systemPrompt || ''
@@ -693,6 +723,17 @@ export function QuickAskPanel({
       selectionMentionable,
       sourceFilePath,
     ])
+
+  // The surface's own description follows the editor snapshot: the snapshot is
+  // what the user is looking at, the surface is what it sits in.
+  const contextualInjections = useMemo<ContextualInjection[]>(() => {
+    const injections: ContextualInjection[] = []
+    if (editorSnapshotInjection) injections.push(editorSnapshotInjection)
+    if (getSurfaceContext) {
+      injections.push({ type: 'surface-context', getText: getSurfaceContext })
+    }
+    return injections
+  }, [editorSnapshotInjection, getSurfaceContext])
 
   const { autoScrollToBottom, forceScrollToBottom, isAutoFollowEnabled } =
     useAutoScroll({
@@ -943,19 +984,22 @@ export function QuickAskPanel({
 
       // Compile mentionables into promptContent up front so the title model
       // and the chat model see the same expanded context. Mirrors Chat.tsx.
-      let compiledMessages: ChatMessage[] = newMessages
+      const stampedUserMessage = await stampUserMessageInjectedContext(
+        userMessage,
+        contextualInjections,
+      )
+      let compiledMessages: ChatMessage[] = [
+        ...(options?.baseMessages ?? chatMessages),
+        stampedUserMessage,
+      ]
       try {
         const { promptContent } =
           await requestContextBuilder.compileUserMessagePrompt({
-            message: userMessage,
+            message: stampedUserMessage,
           })
-        const compiledUserMessage: ChatUserMessage = {
-          ...userMessage,
-          promptContent,
-        }
         compiledMessages = [
           ...(options?.baseMessages ?? chatMessages),
-          compiledUserMessage,
+          { ...stampedUserMessage, promptContent },
         ]
       } catch (error) {
         console.error('Failed to compile quick ask user message prompt', error)
@@ -1000,8 +1044,10 @@ export function QuickAskPanel({
           mode: isAgentMode ? 'agent' : 'ask',
           yoloEnabled,
           assistant: selectedAssistant,
-          assistantEnabledToolNames:
-            getEnabledAssistantToolNames(selectedAssistant),
+          assistantEnabledToolNames: getEnabledAssistantToolNames(
+            selectedAssistant,
+            moduleToolSetEnablement,
+          ),
         })
         const effectiveModel = model
         const disabledSkillNames = settings.skills?.disabledSkillIds ?? []
@@ -1038,16 +1084,13 @@ export function QuickAskPanel({
             mcpManager,
             abortSignal: abortController.signal,
             allowedToolNames: chatModeRuntime.allowedToolNames,
-            enableToolDisclosure: settings.mcp.enableToolDisclosure,
             toolPreferences: chatModeRuntime.toolPreferences,
             builtinCapabilityPreferences:
               chatModeRuntime.builtinCapabilityPreferences,
             toolServerPreferences: chatModeRuntime.toolServerPreferences,
             allowedSkillPaths,
-            toolCapabilityMode: chatModeRuntime.toolCapabilityMode,
-            contextualInjections: editorSnapshotInjection
-              ? [editorSnapshotInjection]
-              : [],
+            runtimeMode: chatModeRuntime.runtimeMode,
+            contextualInjections,
             requestParams: {
               deliveryMode: 'incremental',
               primaryRequestTimeoutMs:
@@ -1106,7 +1149,7 @@ export function QuickAskPanel({
       t,
       yoloEnabled,
       reasoningLevel,
-      editorSnapshotInjection,
+      contextualInjections,
     ],
   )
 
@@ -1489,14 +1532,21 @@ export function QuickAskPanel({
     [clampQuickAskMode, setSettings, settings],
   )
 
+  const quickAskYoloByMode = useMemo(
+    () => ({ agent: yoloEnabled }),
+    [yoloEnabled],
+  )
+
+  // Quick Ask offers Ask/Agent/Write only — Max is desktop chat surface
+  // territory — so the sole switch on offer is Agent's.
   const handleYoloChange = useCallback(
-    (enabled: boolean) => {
+    (mode: ToolChatMode, enabled: boolean) => {
       setYoloEnabled(enabled)
       void setSettings({
         ...settings,
         chatOptions: {
           ...settings.chatOptions,
-          agentYoloEnabled: enabled,
+          ...yoloPreferencePatch(mode, enabled),
         },
       })
     },
@@ -2392,7 +2442,7 @@ export function QuickAskPanel({
                             ? ['ask', 'agent', 'continue']
                             : ['ask', 'agent']
                         }
-                        yoloEnabled={yoloEnabled}
+                        yoloByMode={quickAskYoloByMode}
                         onYoloChange={handleYoloChange}
                         triggerLabel={modeTriggerLabel}
                         popoverClassName="yolo-quick-ask-mode-popover"

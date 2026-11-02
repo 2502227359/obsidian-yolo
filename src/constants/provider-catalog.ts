@@ -1,11 +1,12 @@
 import amazonBedrockLogo from '../assets/provider-icons/amazon-bedrock.svg'
 import anthropicLogo from '../assets/provider-icons/anthropic.svg'
-import apimartLogo from '../assets/provider-icons/apimart.svg'
 import azureOpenaiLogo from '../assets/provider-icons/azure-openai.svg'
 import cerebrasLogo from '../assets/provider-icons/cerebras.svg'
 import deepseekLogo from '../assets/provider-icons/deepseek.svg'
 import doubaoLogo from '../assets/provider-icons/doubao.svg'
+import fluxionLogo from '../assets/provider-icons/fluxion.svg'
 import geminiLogo from '../assets/provider-icons/gemini.svg'
+import githubCopilotLogo from '../assets/provider-icons/github-copilot.svg'
 import groqLogo from '../assets/provider-icons/groq.svg'
 import hunyuanLogo from '../assets/provider-icons/hunyuan.svg'
 import lmStudioLogo from '../assets/provider-icons/lm-studio.svg'
@@ -26,8 +27,8 @@ import xiaomimimoLogo from '../assets/provider-icons/xiaomimimo.svg'
 import zhipuLogo from '../assets/provider-icons/zhipu.svg'
 import { LLMProviderPresetType } from '../types/provider.types'
 
-// Picker categories from the V1-grid design. `custom` is rendered as a
-// dedicated last tile, not as part of any category list.
+// Picker categories. `custom` is rendered as a dedicated last tile, not as
+// part of any category list.
 export type ProviderPickerCategory = 'main' | 'cn' | 'gw' | 'cloud' | 'local'
 
 export type ProviderTint =
@@ -113,6 +114,13 @@ export const PROVIDER_CATALOG: Record<
     oauth: true,
     logo: geminiLogo,
   },
+  'github-copilot': {
+    monogram: 'GH',
+    tint: 'ink',
+    category: 'main',
+    oauth: true,
+    logo: githubCopilotLogo,
+  },
   mistral: {
     monogram: 'Mi',
     tint: 'rose',
@@ -160,14 +168,15 @@ export const PROVIDER_CATALOG: Record<
     logo: openrouterLogo,
     apiKeyUrl: 'https://openrouter.ai/keys',
   },
-  apimart: {
-    monogram: 'AM',
-    tint: 'ink',
+  fluxion: {
+    monogram: 'Fx',
+    tint: 'indigo',
     category: 'gw',
-    logo: apimartLogo,
+    logo: fluxionLogo,
     sponsor: true,
     // Referral link — see the "Sponsors" section in the README.
-    apiKeyUrl: 'https://go.apimart.ai/gh-obsidian-yolo',
+    apiKeyUrl:
+      'https://fluxionai.space/register?source=github&campaign=github-sidrune-yolo&promo=SDRYOLO',
   },
   'azure-openai': {
     monogram: 'Az',
@@ -275,8 +284,9 @@ const FLAT_ORDER: Exclude<LLMProviderPresetType, 'openai-compatible'>[] = [
   'claude-oauth',
   'gemini',
   'gemini-oauth',
+  'github-copilot',
   'openrouter',
-  'apimart',
+  'fluxion',
   'xai',
   'mistral',
   'perplexity',

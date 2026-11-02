@@ -87,22 +87,18 @@ export const assistantSchema = z.object({
   icon: assistantIconSchema.optional(),
   persona: agentPersonaSchema.optional(),
   modelId: z.string().optional(),
-  enableTools: z.boolean().optional(),
-  includeBuiltinTools: z.boolean().optional(),
   enabledToolNames: z.array(z.string()).optional(),
   toolPreferences: z
     .record(z.string(), assistantToolPreferenceSchema)
     .optional(),
   /**
    * Per-assistant enablement/approval for built-in capabilities, keyed by
-   * `BuiltinCapabilityId` (docs/plans/2026-08-15-tool-registry/master.md
-   * decision 15/16). Reuses `assistantToolPreferenceSchema`'s shape — same
+   * `BuiltinCapabilityId`. Reuses `assistantToolPreferenceSchema`'s shape — same
    * `{ enabled?, approvalMode? }` fields, just keyed by capability id
    * instead of a tool FQN. This is now the *only* place a built-in
    * capability's per-assistant state lives; `toolPreferences` /
    * `enabledToolNames` above are exclusively for remote MCP tools as of the
-   * `80_to_81` settings migration (D9,
-   * docs/plans/2026-08-15-tool-registry/phase2-migration.md D9).
+   * `80_to_81` settings migration.
    */
   builtinCapabilityPreferences: z
     .record(z.string(), assistantToolPreferenceSchema)
@@ -110,8 +106,6 @@ export const assistantSchema = z.object({
   toolServerPreferences: z
     .record(z.string(), assistantToolServerPreferenceSchema)
     .optional(),
-  // Legacy: per-assistant enabled skill list, keyed by canonical skill name.
-  enabledSkills: z.array(z.string()).optional(),
   // Per-assistant skill preferences, keyed by canonical skill *name*
   // (frontmatter `name`, trim-only, case-sensitive). Field/key names kept for
   // backwards compatibility; keys are skill names, not a separate id.

@@ -22,6 +22,7 @@ import type {
 import type { PromptSourceWatcher } from '../agent/promptSourceWatcher'
 import type { SubagentAcceptedResult } from '../agent/subagent/types'
 import type { BaseLLMProvider } from '../llm/base'
+import type { YoloModuleFileTextRendererV1 } from '../modules/types'
 import type { RagKnowledgeAccess } from '../rag/ragAccess'
 
 /** A translatable piece of UI text: an i18n key plus its English fallback. */
@@ -86,12 +87,55 @@ export type LocalToolCallResult =
  * circular dependency component containing `core/mcp/mcpManager.ts` — a
  * static import of `SubagentParentContext` from *this* file would pull every
  * capability and tool definition (all of which import `ToolContext`) back
- * into that cycle the moment `mcpManager.ts` calls into the registry
- * (docs/plans/2026-08-15-tool-registry/master.md, D6a fix).
+ * into that cycle the moment `mcpManager.ts` calls into the registry.
  */
 export type OpaqueSubagentParentContext = unknown
 
 export type BuiltinToolCategory = 'vault' | 'context' | 'external'
+
+/**
+ * The built-in chat modes a capability can be exposed in.
+ *
+ * Declared here rather than in the UI layer because `core/tools/` must not
+ * depend on `src/components/`, and this union is the one the tool registry is
+ * defined against. It is the single definition, not one of two: the UI layer's
+ * `BuiltinChatMode` (`components/chat-view/chat-input/ChatModeSelect`) is an
+ * alias of it.
+ */
+export type BuiltinChatModeId = 'ask' | 'agent' | 'max'
+
+/**
+ * What a running chat mode overrides about one capability's policy, for the
+ * duration of a single run.
+ *
+ * This is the mode's own trust contract, not a per-capability declaration:
+ * "Max is a real terminal" is a fact about Max, and putting it here keeps
+ * every capability free of per-mode tables. It is produced in exactly one place —
+ * `resolveChatModeRuntime` — and travels with the run.
+ */
+export type ChatModeCapabilityOverride = Readonly<{
+  /**
+   * The mode grants this capability unconditionally. Overrides both the
+   * global `settings.mcp.builtinCapabilityOptions[id].disabled` switch (read
+   * by `McpManager`, which gates the model's tool list *and* execution) and
+   * the assistant's own `builtinCapabilityPreferences` entry (read by
+   * `AgentToolGateway`). It does not override a tool's `isAvailable` —
+   * environment availability is not a trust question.
+   */
+  forceEnabled?: boolean
+  /**
+   * The mode permits "always allow for this chat" even though the capability
+   * declares `approval.allowAlwaysAllow: false`. Snapshotted onto each tool
+   * call request at creation time, never read live by the UI.
+   */
+  allowAlwaysAllow?: boolean
+}>
+
+/** Keyed by capability id. See {@link ChatModeCapabilityOverride}. */
+export type ChatModeCapabilityOverrides = ReadonlyMap<
+  string,
+  ChatModeCapabilityOverride
+>
 
 /**
  * Context available when building a tool's MCP protocol projection (i.e.
@@ -108,8 +152,7 @@ export type ToolCatalogContext = {
  * Context available when deciding whether a tool is usable in the current
  * environment (platform, provider/feature configuration, ...). Kept separate
  * from `ToolCatalogContext` (different inputs) and from capability enablement
- * (a user-authorization concern, not an environment one — see master.md
- * decision 18).
+ * (a user-authorization concern, not an environment one).
  */
 export type ToolAvailabilityContext = {
   settings?: YoloSettings
@@ -126,8 +169,7 @@ export type ToolAvailabilityContext = {
  * `_runContext` — so there was no live shape to hide, only a dead field to
  * remove). Every other field's type,
  * optionality, and comment is copied verbatim. Do NOT narrow this to a
- * per-tool slice here — that's an explicit non-goal for this phase (see
- * master.md decision 5 / §7).
+ * per-tool slice here — that's an explicit non-goal.
  */
 export type ToolContext = {
   app: App
@@ -152,7 +194,7 @@ export type ToolContext = {
   /**
    * Host-provided capability to dispatch a subagent run — the same
    * dependency-injection shape as `openApplyReview` / `ragAccess` above
-   * (master.md decision 5: `ToolContext` is DI; tools consume host
+   * (`ToolContext` is DI; tools consume host
    * capabilities through it rather than importing the implementation
    * themselves). `delegate_subagent` is this field's only consumer.
    *
@@ -186,6 +228,19 @@ export type ToolContext = {
    * unavailable regardless of `bashApprovalMode`.
    */
   bashReadOnly?: boolean
+  /**
+   * Looks up the module that owns a file extension's "what does this look
+   * like to a model" text form (`ModuleFileTextRendererRegistry.resolve`),
+   * e.g. `.yoloboard` → the whiteboard module's board-summary renderer.
+   * `fs_read` is this field's only consumer: a claimed extension is read and rendered instead of returned
+   * verbatim. Same DI shape as `ragAccess` / `openApplyReview` above — the
+   * tool consumes the host capability through `ToolContext`, it never reaches
+   * into `core/modules/` itself. Undefined (host/test contexts that never
+   * wire it up) behaves exactly like "nothing claimed this extension".
+   */
+  resolveModuleFileTextRenderer?: (
+    extension: string,
+  ) => YoloModuleFileTextRendererV1 | null
 }
 
 /**
@@ -198,6 +253,34 @@ export type ToolContext = {
  * `string`, defeating every completeness check this project exists to add).
  * `defineTool` below instantiates `Name` with the literal tool name.
  */
+/**
+ * What a call to this tool *did*, coarse enough to count. The chat surface
+ * groups a collapsed tool run by this value ("Read 2 files, 1 web lookup"),
+ * so it is declared on the tool like every other per-tool policy rather than
+ * kept in a name table beside the registry (AGENTS.md: nothing about a
+ * built-in tool gets a side table).
+ *
+ * `agentInternal` is for tools that act on the run itself rather than on the
+ * vault or the outside world (todo list, context compaction, subagent
+ * delegation, asking the user). They deliberately get no verb of their own in
+ * the summary line — naming one would add a clause the reader cannot act on —
+ * so they land in the same unnamed tail clause as unrecognizable calls. It is
+ * still an explicit declaration, not a lookup miss: there is no "unclassified"
+ * value, and every built-in tool must pick one of these.
+ */
+export const TOOL_SUMMARY_ACTIONS = [
+  'read',
+  'search',
+  'web',
+  'edit',
+  'virtualTerminal',
+  'terminal',
+  'analysis',
+  'agentInternal',
+] as const
+
+export type ToolSummaryAction = (typeof TOOL_SUMMARY_ACTIONS)[number]
+
 export type BuiltinToolDefinition<Name extends string = string> = {
   name: Name
   /**
@@ -211,10 +294,20 @@ export type BuiltinToolDefinition<Name extends string = string> = {
   /** Environment availability (platform, provider config, ...). Omitted = always available. */
   isAvailable?: (ctx: ToolAvailabilityContext) => boolean
   /**
+   * The argument that carries a real filesystem path — one that may point
+   * anywhere on the machine rather than inside the vault. Declared here so
+   * the vault-boundary approval in `AgentToolGateway` reads it off the tool
+   * itself instead of keeping a tool-name table of its own. Omitted for
+   * every tool whose paths are vault-relative.
+   */
+  filesystemPathArg?: string
+  /**
    * Chat-surface display label. Distinct from the owning capability's
    * `label`: the capability is "File Editing", its tools are "Edit" / "Write".
    */
   chatLabel: I18nText
+  /** How a call to this tool is counted in a collapsed tool-run summary. */
+  summaryAction: ToolSummaryAction
   /** Whether this tool's result can be dropped by `context_prune_tool_results`. */
   contextPrunable?: boolean
   execute: (
@@ -225,9 +318,8 @@ export type BuiltinToolDefinition<Name extends string = string> = {
 
 /**
  * A user-authorized capability: the thing a person actually enables/disables
- * and sets an approval tier for. Owns the tools it exposes to the model (see
- * master.md decision 13 — ownership flows capability -> tools, never the
- * reverse). `Id`/`Tools` are local generics for the same reason `Name` is
+ * and sets an approval tier for. Owns the tools it exposes to the model
+ * (ownership flows capability -> tools, never the reverse). `Id`/`Tools` are local generics for the same reason `Name` is
  * local on `BuiltinToolDefinition` above — see that type's doc comment.
  */
 export type BuiltinCapabilityDefinition<
@@ -240,6 +332,19 @@ export type BuiltinCapabilityDefinition<
   label: I18nText
   description?: I18nText
   category: BuiltinToolCategory
+  /**
+   * Which built-in chat modes expose this capability's tools to the model.
+   * The single source of truth for per-mode visibility: `resolveChatModeRuntime`
+   * filters an assistant's enabled tools through this field and nothing else,
+   * and no per-mode list of blocked capabilities or tool names may exist
+   * anywhere (the same rule that makes settings rows, approval policy, and
+   * persisted keys capability-derived).
+   *
+   * Module chat modes do not go through this field at all: their tool grant is
+   * self-declared (capability tier + mode tools, see
+   * `resolveAgentCapabilityProfile`), never narrowed per built-in mode.
+   */
+  chatModes: readonly BuiltinChatModeId[]
   defaultEnabled: boolean
   approval: {
     defaultMode: AssistantToolApprovalMode
@@ -247,7 +352,7 @@ export type BuiltinCapabilityDefinition<
     /** false = hide the "always allow for this conversation" button. */
     allowAlwaysAllow: boolean
   }
-  /** Whether the settings page has a dedicated configuration entry for this capability. Which modal opens is decided by the UI-layer wiring table (D4), not here. */
+  /** Whether the settings page has a dedicated configuration entry for this capability. Which modal opens is decided by the UI-layer wiring table, not here. */
   hasSettings: boolean
   tools: Tools
 }

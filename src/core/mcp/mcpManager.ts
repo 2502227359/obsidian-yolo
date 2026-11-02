@@ -11,7 +11,9 @@ import type { ChatMessage } from '../../types/chat'
 import type { ChatModelModality } from '../../types/chat-model.types'
 import {
   McpClient,
+  McpDiscoveredCatalog,
   McpServerConfig,
+  McpServerInfo,
   McpServerState,
   McpServerStatus,
   McpTool,
@@ -27,10 +29,11 @@ import type { RagKnowledgeAccess } from '../rag/ragAccess'
 import { executeBuiltinTool } from '../tools/dispatcher'
 import {
   getCapabilityForTool,
+  getCapabilityOverrideForTool,
   getToolDefinition,
   isBuiltinToolName,
 } from '../tools/registry'
-import type { ToolContext } from '../tools/types'
+import type { ChatModeCapabilityOverrides, ToolContext } from '../tools/types'
 
 import { InvalidToolNameException, McpNotAvailableException } from './exception'
 import type { InProcessToolServer } from './inProcessToolServer'
@@ -70,6 +73,25 @@ const MCP_CONNECTION_CLOSED_CODE = -32000
 const RECONNECT_WINDOW_MS = 60_000
 const RECONNECT_MAX_ATTEMPTS = 3
 
+/**
+ * The `serverInfo` an MCP server reported during `initialize`. Only `name` is
+ * required by the protocol; `title` and `description` were added later, so
+ * most existing servers leave them unset and the catalog falls back to `name`
+ * and then to the user's local server id.
+ */
+const readServerInfo = (client: McpClient): McpServerInfo | undefined => {
+  const info = client.getServerVersion()
+  if (!info?.name) {
+    return undefined
+  }
+  return {
+    name: info.name,
+    ...(info.title ? { title: info.title } : {}),
+    ...(info.description ? { description: info.description } : {}),
+    ...(info.version ? { version: info.version } : {}),
+  }
+}
+
 export class McpManager {
   static readonly TOOL_NAME_DELIMITER = '__' // Delimiter for tool name construction (serverName__toolName)
 
@@ -81,7 +103,21 @@ export class McpManager {
   private readonly ragAccess?: RagKnowledgeAccess
   private readonly promptSourceWatcher?: PromptSourceWatcher
   private readonly runSubagent?: NonNullable<ToolContext['runSubagent']>
+  private readonly moduleFileTextRendererResolver?: NonNullable<
+    ToolContext['resolveModuleFileTextRenderer']
+  >
   private settings: YoloSettings
+  private persistDiscoveredCatalogs?: (
+    catalogs: Record<string, McpDiscoveredCatalog>,
+  ) => void
+  /**
+   * This manager's own view of `settings.mcp.discoveredCatalogs`, and the sole
+   * writer of it. Persisting is asynchronous and only reaches `this.settings`
+   * a tick later, so servers connecting concurrently would each read a
+   * pre-write snapshot and clobber one another's entry. Owning the record here
+   * makes the read-modify-write synchronous.
+   */
+  private discoveredCatalogs: Record<string, McpDiscoveredCatalog>
   private unsubscribeFromSettings: () => void
   private defaultEnv: Record<string, string>
   private remoteTransportFactory: ReturnType<
@@ -136,11 +172,19 @@ export class McpManager {
   /**
    * Two independent gates, applied in sequence: persisted user enablement
    * (below), then, for tools already migrated into the registry, that
-   * tool's own `isAvailable(ctx)` (master.md §3.1b / decision 18 —
-   * environment availability is separate from user authorization).
+   * tool's own `isAvailable(ctx)` (environment availability is separate from
+   * user authorization).
+   *
+   * `capabilityForceEnabled` is the running chat mode's grant for *this* tool
+   * (see `ChatModeCapabilityOverride.forceEnabled`). It can lift the persisted
+   * gate but never the `isAvailable` one: Max forcing `terminal` on must not
+   * conjure a terminal on mobile.
    */
-  private isLocalToolEnabled(toolName: string): boolean {
-    if (!this.isLocalToolPersistedEnabled(toolName)) {
+  private isLocalToolEnabled(
+    toolName: string,
+    capabilityForceEnabled?: boolean,
+  ): boolean {
+    if (!this.isLocalToolPersistedEnabled(toolName, capabilityForceEnabled)) {
       return false
     }
 
@@ -163,20 +207,25 @@ export class McpManager {
   }
 
   /**
-   * As of the `80_to_81` settings migration (D9,
-   * docs/plans/2026-08-15-tool-registry/phase2-migration.md D9),
+   * As of the `80_to_81` settings migration,
    * `settings.mcp.builtinCapabilityOptions` is keyed by capability id — one
    * entry per capability, no more group-key-plus-members aggregation. This
    * collapses what used to be three special-cased group checks
    * (`web_ops`/`fs_edit_ops`/`memory_ops`) plus a generic fallback into a
    * single lookup through the tool's owning capability.
    */
-  private isLocalToolPersistedEnabled(toolName: string): boolean {
+  private isLocalToolPersistedEnabled(
+    toolName: string,
+    capabilityForceEnabled?: boolean,
+  ): boolean {
+    if (capabilityForceEnabled) {
+      return true
+    }
     const capability = getCapabilityForTool(toolName)
     if (!capability) {
       // Unknown/retired local short name (e.g. a pre-v79 `fs_list`) — no
       // capability owns it, so there is nothing to disable. Matches the
-      // pre-D9 fallthrough (`directDisabled` undefined => enabled).
+      // pre-`80_to_81` fallthrough (`directDisabled` undefined => enabled).
       return true
     }
     return !(
@@ -193,7 +242,9 @@ export class McpManager {
     registerSettingsListener,
     ragAccess,
     promptSourceWatcher,
+    persistDiscoveredCatalogs,
     runSubagent,
+    resolveModuleFileTextRenderer,
   }: {
     app: App
     pluginId: string
@@ -204,15 +255,24 @@ export class McpManager {
     ) => () => void
     ragAccess?: RagKnowledgeAccess
     promptSourceWatcher?: PromptSourceWatcher
+    persistDiscoveredCatalogs?: (
+      catalogs: Record<string, McpDiscoveredCatalog>,
+    ) => void
     runSubagent?: NonNullable<ToolContext['runSubagent']>
+    resolveModuleFileTextRenderer?: NonNullable<
+      ToolContext['resolveModuleFileTextRenderer']
+    >
   }) {
     this.app = app
     this.oauthController = new McpOAuthController(app, pluginId)
     this.openApplyReview = openApplyReview
     this.ragAccess = ragAccess
     this.promptSourceWatcher = promptSourceWatcher
+    this.persistDiscoveredCatalogs = persistDiscoveredCatalogs
     this.runSubagent = runSubagent
+    this.moduleFileTextRendererResolver = resolveModuleFileTextRenderer
     this.settings = settings
+    this.discoveredCatalogs = settings.mcp.discoveredCatalogs ?? {}
     this.unsubscribeFromSettings = registerSettingsListener((newSettings) => {
       void this.handleSettingsUpdate(newSettings).catch((error) => {
         console.error('[YOLO] Failed to handle MCP settings update:', error)
@@ -281,6 +341,20 @@ export class McpManager {
 
   public getServers() {
     return this.servers
+  }
+
+  /**
+   * Looks up the module-owned text form for a file extension (see
+   * `ToolContext['resolveModuleFileTextRenderer']`'s doc comment). `fs_read`
+   * reaches this through `ToolContext` on every builtin-tool call; the
+   * @mention `full` path in `requestContextBuilder.ts` needs the identical
+   * lookup outside of a tool call, so it's exposed here as well rather than
+   * threading a second, separate DI path down to the same registry.
+   */
+  public resolveModuleFileTextRenderer(
+    extension: string,
+  ): ReturnType<NonNullable<ToolContext['resolveModuleFileTextRenderer']>> {
+    return this.moduleFileTextRendererResolver?.(extension) ?? null
   }
 
   /**
@@ -428,16 +502,60 @@ export class McpManager {
     }
   }
 
+  /**
+   * Record what a server just reported about itself, so the model-facing tool
+   * catalog can be built from configuration alone (see
+   * `settings.mcp.discoveredCatalogs`). Writes only on an actual change: a
+   * stable setup therefore persists nothing after its first successful
+   * connect, and the frozen system-prompt snapshot is not evicted on every
+   * reconnect.
+   *
+   * Entries for servers no longer present in settings are pruned here rather
+   * than on removal — a server can be deleted while this manager is torn
+   * down, and the next connect is the first moment we are guaranteed to run.
+   */
+  private rememberDiscoveredCatalog(
+    serverName: string,
+    tools: readonly McpTool[],
+    serverInfo: McpServerInfo | undefined,
+  ): void {
+    if (!this.persistDiscoveredCatalogs) {
+      return
+    }
+    const configuredNames = new Set(
+      this.settings.mcp.servers.map((server) => server.id),
+    )
+    const existing = this.discoveredCatalogs
+    const next: Record<string, McpDiscoveredCatalog> = {}
+    for (const [name, catalog] of Object.entries(existing)) {
+      if (configuredNames.has(name)) {
+        next[name] = catalog
+      }
+    }
+    // Short (server-side) tool names, not FQNs: the record is already keyed by
+    // the local server id, and the FQN delimiter belongs to the catalog
+    // builder rather than to persisted data. Sorted because server order is
+    // not guaranteed stable across connects, and an unchanged server must not
+    // look like a change.
+    next[serverName] = {
+      ...(serverInfo ? { serverInfo } : {}),
+      toolNames: tools.map((tool) => tool.name).sort(),
+    }
+    if (isEqual(next, existing)) {
+      return
+    }
+    this.discoveredCatalogs = next
+    this.persistDiscoveredCatalogs(next)
+  }
+
   public async handleSettingsUpdate(settings: YoloSettings) {
     this.settings = settings
-    if (settings.mcp.enableToolDisclosure) {
-      for (const server of this.servers) {
-        if (
-          server.status === McpServerStatus.Connected &&
-          this.shouldPrewarmToolTokenCosts(server.name)
-        ) {
-          prewarmMcpServerToolTokenCosts(server.name, server.tools)
-        }
+    for (const server of this.servers) {
+      if (
+        server.status === McpServerStatus.Connected &&
+        this.shouldPrewarmToolTokenCosts(server.name)
+      ) {
+        prewarmMcpServerToolTokenCosts(server.name, server.tools)
       }
     }
     const updatedServers = settings.mcp.servers.map(
@@ -762,12 +880,15 @@ export class McpManager {
         prewarmMcpServerToolTokenCosts(name, toolList.tools)
       }
       signal?.removeEventListener('abort', abortListener)
+      const serverInfo = readServerInfo(client)
+      this.rememberDiscoveredCatalog(name, toolList.tools, serverInfo)
       return {
         name,
         config: serverConfig,
         status: McpServerStatus.Connected,
         client,
         tools: toolList.tools,
+        ...(serverInfo ? { serverInfo } : {}),
       }
     } catch (error) {
       signal?.removeEventListener('abort', abortListener)
@@ -883,8 +1004,8 @@ export class McpManager {
   }
 
   private getAvailableToolsCacheKey(
-    includeBuiltinTools: boolean,
     chatModelModalities: ChatModelModality[] | undefined,
+    capabilityOverrides: ChatModeCapabilityOverrides | undefined,
   ): string {
     // Modalities are part of the cache key because built-in tool schemas
     // (notably fs_read) are tailored per-model. Sort to be stable across the
@@ -892,11 +1013,20 @@ export class McpManager {
     const modalityFingerprint = chatModelModalities
       ? [...chatModelModalities].sort().join(',')
       : 'superset'
-    return `${includeBuiltinTools ? 'with_builtin' : 'mcp_only'}|${modalityFingerprint}`
+    // Only `forceEnabled` changes which tools are listed, so only it belongs
+    // in the key — an Agent run and a Max run must not share an entry, but
+    // two Max runs must.
+    const forcedFingerprint = capabilityOverrides
+      ? [...capabilityOverrides]
+          .filter(([, override]) => override.forceEnabled)
+          .map(([id]) => id)
+          .sort()
+          .join(',')
+      : ''
+    return `${modalityFingerprint}|${forcedFingerprint}`
   }
 
   private shouldPrewarmToolTokenCosts(serverName: string): boolean {
-    if (!this.settings.mcp.enableToolDisclosure) return false
     const assistants = this.settings.assistants ?? []
     // With no saved Agent yet, runtime still uses Auto. Otherwise an explicit
     // server policy on every Agent means the threshold budget is never read.
@@ -974,15 +1104,16 @@ export class McpManager {
   }
 
   public async listAvailableTools({
-    includeBuiltinTools = false,
     chatModelModalities,
+    capabilityOverrides,
   }: {
-    includeBuiltinTools?: boolean
     chatModelModalities?: ChatModelModality[]
+    /** The running chat mode's capability grant; see `AgentToolGateway`. */
+    capabilityOverrides?: ChatModeCapabilityOverrides
   } = {}): Promise<McpTool[]> {
     const cacheKey = this.getAvailableToolsCacheKey(
-      includeBuiltinTools,
       chatModelModalities,
+      capabilityOverrides,
     )
     const cached = this.availableToolsCache.get(cacheKey)
     if (cached) {
@@ -1008,27 +1139,31 @@ export class McpManager {
             }))
         })
 
-    const builtinTools = includeBuiltinTools
-      ? [
-          ...availableTools,
-          ...getLocalFileTools({
-            vaultBasePath: getVaultBasePath(this.app),
-            chatModelModalities,
-          })
-            .filter((tool) => this.isLocalToolEnabled(tool.name))
-            .map((tool) => ({
-              ...tool,
-              name: getToolName(getLocalFileToolServerName(), tool.name),
-            })),
-        ]
-      : availableTools
+    const builtinTools = getLocalFileTools({
+      vaultBasePath: getVaultBasePath(this.app),
+      chatModelModalities,
+    })
+      .filter((tool) =>
+        this.isLocalToolEnabled(
+          tool.name,
+          getCapabilityOverrideForTool(capabilityOverrides, tool.name)
+            ?.forceEnabled,
+        ),
+      )
+      .map((tool) => ({
+        ...tool,
+        name: getToolName(getLocalFileToolServerName(), tool.name),
+      }))
 
     // Registered in-process servers (see registerInProcessServer) are always
-    // surfaced, independent of includeBuiltinTools — that flag only gates the
-    // fixed local-file-tool set. A server only ends up in the registry
-    // because a caller explicitly opted in for this run, so listing its
-    // tools needs no separate opt-in flag.
-    const nextTools = [...builtinTools, ...this.listInProcessServerTools()]
+    // surfaced: a server only ends up in the registry because a caller
+    // explicitly opted in for this run, so listing its tools needs no
+    // separate opt-in flag.
+    const nextTools = [
+      ...availableTools,
+      ...builtinTools,
+      ...this.listInProcessServerTools(),
+    ]
 
     this.availableToolsCache.set(cacheKey, [...nextTools])
     return nextTools
@@ -1038,18 +1173,60 @@ export class McpManager {
     requestToolName: string,
     conversationId: string,
     requestArgs?: Record<string, unknown>,
+    /**
+     * Permissions this same approval also grants, beyond the call's own tool
+     * and argument-derived keys — today only the vault-boundary key, so that
+     * one "always allow" on a call reaching outside the vault covers every
+     * tool that can reach outside it.
+     */
+    extraAllowanceKeys?: readonly string[],
+  ): void {
+    const allowanceKey = this.buildExecutionAllowanceKey({
+      requestToolName,
+      requestArgs,
+    })
+    for (const key of [
+      allowanceKey,
+      requestToolName,
+      ...(extraAllowanceKeys ?? []),
+    ]) {
+      this.grantExecutionAllowance(key, conversationId)
+    }
+  }
+
+  /**
+   * Adds a bare allowance key to a conversation's granted set. The set is the
+   * same one `allowToolForConversation` writes and `isToolExecutionAllowed`
+   * reads; this is simply the "grant exactly this permission" entry point,
+   * for permissions that are not derived from a tool name plus arguments.
+   */
+  public grantExecutionAllowance(
+    allowanceKey: string,
+    conversationId: string,
   ): void {
     let allowedTools = this.allowedToolsByConversation.get(conversationId)
     if (!allowedTools) {
       allowedTools = new Set<string>()
       this.allowedToolsByConversation.set(conversationId, allowedTools)
     }
-    const allowanceKey = this.buildExecutionAllowanceKey({
-      requestToolName,
-      requestArgs,
-    })
     allowedTools.add(allowanceKey)
-    allowedTools.add(requestToolName)
+  }
+
+  /**
+   * Exact membership test for one allowance key — deliberately *not*
+   * `isToolExecutionAllowed`, which also honors the bare tool name. A
+   * standing "always allow this tool" must not silently satisfy a distinct
+   * permission such as the vault boundary.
+   */
+  public isExecutionAllowanceGranted(
+    allowanceKey: string,
+    conversationId?: string,
+  ): boolean {
+    if (!conversationId) return false
+    return (
+      this.allowedToolsByConversation.get(conversationId)?.has(allowanceKey) ??
+      false
+    )
   }
 
   public isToolExecutionAllowed({
@@ -1057,16 +1234,22 @@ export class McpManager {
     conversationId,
     requestArgs,
     requireAutoExecution = false,
+    capabilityForceEnabled,
   }: {
     requestToolName: string
     conversationId?: string
     requestArgs?: Record<string, unknown>
     requireAutoExecution?: boolean
+    /**
+     * The running chat mode grants this call's capability unconditionally;
+     * see `ChatModeCapabilityOverride.forceEnabled`.
+     */
+    capabilityForceEnabled?: boolean
   }): boolean {
     try {
       const { serverName, toolName } = parseToolName(requestToolName)
       if (serverName === getLocalFileToolServerName()) {
-        if (!this.isLocalToolEnabled(toolName)) {
+        if (!this.isLocalToolEnabled(toolName, capabilityForceEnabled)) {
           return false
         }
       } else if (this.inProcessServers.has(serverName)) {
@@ -1131,6 +1314,7 @@ export class McpManager {
     subagentParentContext,
     bashApprovalMode,
     bashReadOnly,
+    capabilityForceEnabled,
   }: {
     name: string
     args?: Record<string, unknown> | undefined
@@ -1148,6 +1332,14 @@ export class McpManager {
     bashApprovalMode?: AssistantToolApprovalMode
     /** Forces the structurally read-only bash variant; see tool-gateway.ts. */
     bashReadOnly?: boolean
+    /**
+     * The running chat mode grants this call's capability unconditionally.
+     * Callers that reach here without the gateway (post-approval execution,
+     * the chat UI's recovery path) read it off the request's own
+     * `metadata.executionConstraints` snapshot, exactly as they do for
+     * `bashReadOnly`.
+     */
+    capabilityForceEnabled?: boolean
   }): Promise<ToolCallResponse> {
     const toolAbortController = new AbortController()
     if (id !== undefined) {
@@ -1172,7 +1364,7 @@ export class McpManager {
       const parsedArgs: Record<string, unknown> | undefined = args
 
       if (serverName === getLocalFileToolServerName()) {
-        if (!this.isLocalToolEnabled(toolName)) {
+        if (!this.isLocalToolEnabled(toolName, capabilityForceEnabled)) {
           throw new Error(`Built-in tool ${toolName} is disabled`)
         }
         // Every built-in tool executes through the registry dispatcher.
@@ -1181,7 +1373,7 @@ export class McpManager {
         //
         // `localFileTools.ts` must never import the *dispatcher*. It does
         // read the registry (its `getLocalFileTools()` catalog is built from
-        // `getMcpTool` projections since D6b), and each tool's
+        // `getMcpTool` projections), and each tool's
         // `definition.ts` imports shared helpers back out of it — so an
         // import of `dispatcher.ts` there would close a module-init cycle
         // through every definition. That cycle already broke `fs_read`'s
@@ -1216,6 +1408,7 @@ export class McpManager {
             promptSourceWatcher: this.promptSourceWatcher,
             bashApprovalMode,
             bashReadOnly,
+            resolveModuleFileTextRenderer: this.moduleFileTextRendererResolver,
           },
         )
         if (localResult.status === ToolCallResponseStatus.Success) {

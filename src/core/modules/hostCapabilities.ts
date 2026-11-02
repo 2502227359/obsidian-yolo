@@ -22,6 +22,10 @@ import type {
   ModuleConfigV1,
 } from './moduleConfig'
 import {
+  type ModuleFileTextRendererContributionSinkV1,
+  snapshotModuleFileTextRenderer,
+} from './moduleFileTextRendererRegistry'
+import {
   ModuleI18nCapabilityProvider,
   type ModuleI18nCapabilityProviderV1,
 } from './moduleI18n'
@@ -29,6 +33,10 @@ import {
   type ModulePathsCapabilityProviderV1,
   UNAVAILABLE_MODULE_PATHS_CAPABILITY_PROVIDER,
 } from './modulePaths'
+import {
+  type ModulePdfCapabilityProviderV1,
+  UNAVAILABLE_MODULE_PDF_CAPABILITY_PROVIDER,
+} from './modulePdf'
 import type {
   ModulePrivateStorageCapabilityProviderV1,
   ModulePrivateStorageScopeV1,
@@ -39,6 +47,11 @@ import {
   UNAVAILABLE_MODULE_SETTINGS_CAPABILITY_PROVIDER,
 } from './moduleSettingsContributions'
 import { assertModuleId } from './moduleStore'
+import {
+  MAX_MODULE_TOOL_SETS_PER_MODULE,
+  type ModuleToolSetContributionSinkV1,
+  snapshotModuleToolSet,
+} from './moduleToolSetRegistry'
 import {
   type ModuleUiCapabilityProviderV1,
   UNAVAILABLE_MODULE_UI_CAPABILITY_PROVIDER,
@@ -53,7 +66,10 @@ import type {
   YoloModuleBackgroundV1,
   YoloModuleCapabilitiesV1,
   YoloModuleChatModeV1,
+  YoloModuleChatSelectionV1,
   YoloModuleChatV1,
+  YoloModuleFileTextRendererV1,
+  YoloModuleToolSetV1,
 } from './types'
 
 export type ModuleHostCapabilityProviderV1 = {
@@ -168,6 +184,7 @@ type CoreModuleHostCapabilityProviderOptions = {
   config?: ModuleConfigCapabilityProviderV1
   i18n?: ModuleI18nCapabilityProviderV1
   paths?: ModulePathsCapabilityProviderV1
+  pdf?: ModulePdfCapabilityProviderV1
   privateStorage?: ModulePrivateStorageCapabilityProviderV1
   settings?: ModuleSettingsCapabilityProviderV1
   ui?: ModuleUiCapabilityProviderV1
@@ -188,6 +205,7 @@ export class CoreModuleHostCapabilityProvider
   private readonly now: () => number
   private readonly i18n: ModuleI18nCapabilityProviderV1
   private readonly paths: ModulePathsCapabilityProviderV1
+  private readonly pdf: ModulePdfCapabilityProviderV1
   private readonly privateStorage: ModulePrivateStorageCapabilityProviderV1
   private readonly settings: ModuleSettingsCapabilityProviderV1
   private readonly ui: ModuleUiCapabilityProviderV1
@@ -206,6 +224,7 @@ export class CoreModuleHostCapabilityProvider
     config = UNAVAILABLE_MODULE_CONFIG_CAPABILITY_PROVIDER,
     i18n = new ModuleI18nCapabilityProvider(),
     paths = UNAVAILABLE_MODULE_PATHS_CAPABILITY_PROVIDER,
+    pdf = UNAVAILABLE_MODULE_PDF_CAPABILITY_PROVIDER,
     privateStorage = UNAVAILABLE_MODULE_PRIVATE_STORAGE_CAPABILITY_PROVIDER,
     settings = UNAVAILABLE_MODULE_SETTINGS_CAPABILITY_PROVIDER,
     ui = UNAVAILABLE_MODULE_UI_CAPABILITY_PROVIDER,
@@ -226,6 +245,7 @@ export class CoreModuleHostCapabilityProvider
     this.config = config
     this.i18n = i18n
     this.paths = paths
+    this.pdf = pdf
     this.privateStorage = privateStorage
     this.settings = settings
     this.ui = ui
@@ -252,6 +272,7 @@ export class CoreModuleHostCapabilityProvider
     const config = this.config.create(moduleId, lifecycle)
     const i18n = this.i18n.create(moduleId, lifecycle)
     const paths = this.paths.create(moduleId, lifecycle)
+    const pdf = this.pdf.create(moduleId, lifecycle)
     const privateStorage = this.privateStorage.create(moduleId, lifecycle)
     const settings = this.settings.create(moduleId, lifecycle)
     const ui = this.ui.create(moduleId, lifecycle)
@@ -266,6 +287,7 @@ export class CoreModuleHostCapabilityProvider
         config: config.api,
         i18n: i18n.api,
         paths: paths.api,
+        pdf: pdf.api,
         privateStorage: privateStorage.api,
         settings: settings.api,
         ui: ui.api,
@@ -284,6 +306,7 @@ export class CoreModuleHostCapabilityProvider
         background.activate()
         chat.activate()
         paths.activate()
+        pdf.activate()
         privateStorage.activate()
         settings.activate()
         ui.activate()
@@ -307,6 +330,10 @@ export type ModuleChatCapabilityProviderV1 = Readonly<{
 
 export type ModuleChatCapabilityProviderOptions = Readonly<{
   sink: ModuleChatModeContributionSinkV1
+  toolSetSink: ModuleToolSetContributionSinkV1
+  fileTextRendererSink: ModuleFileTextRendererContributionSinkV1
+  /** Puts a validated selection into the chat (`YoloModuleChatV1.addSelection`). */
+  addSelection: (selection: YoloModuleChatSelectionV1) => Promise<void>
 }>
 
 export class CoreModuleChatCapabilityProvider
@@ -319,6 +346,9 @@ export class CoreModuleChatCapabilityProvider
       moduleId,
       lifecycle,
       sink: this.options.sink,
+      toolSetSink: this.options.toolSetSink,
+      fileTextRendererSink: this.options.fileTextRendererSink,
+      addSelection: this.options.addSelection,
     })
   }
 }
@@ -330,6 +360,14 @@ export const UNAVAILABLE_MODULE_CHAT_CAPABILITY_PROVIDER: ModuleChatCapabilityPr
         registerMode: () => {
           throw new Error('Module chat capability is unavailable')
         },
+        registerToolSet: () => {
+          throw new Error('Module chat capability is unavailable')
+        },
+        registerFileTextRenderer: () => {
+          throw new Error('Module chat capability is unavailable')
+        },
+        addSelection: () =>
+          Promise.reject(new Error('Module chat capability is unavailable')),
       }),
       commit: () => undefined,
       activate: () => undefined,
@@ -347,10 +385,16 @@ function createModuleChatCapability({
   moduleId,
   lifecycle,
   sink,
+  toolSetSink,
+  fileTextRendererSink,
+  addSelection,
 }: {
   moduleId: string
   lifecycle: ModuleLifecycleScope
   sink: ModuleChatModeContributionSinkV1
+  toolSetSink: ModuleToolSetContributionSinkV1
+  fileTextRendererSink: ModuleFileTextRendererContributionSinkV1
+  addSelection: (selection: YoloModuleChatSelectionV1) => Promise<void>
 }): {
   api: YoloModuleChatV1
   commit(): void
@@ -359,6 +403,9 @@ function createModuleChatCapability({
   assertModuleId(moduleId, 'Module id')
   const staged = new Map<string, YoloModuleChatModeV1>()
   const published = new Set<string>()
+  const stagedToolSets = new Map<string, YoloModuleToolSetV1>()
+  const publishedToolSets = new Set<string>()
+  const publishedRenderers = new Set<YoloModuleFileTextRendererV1>()
   let active = true
   let committed = false
   let activationComplete = false
@@ -366,8 +413,15 @@ function createModuleChatCapability({
     active = false
     activationComplete = false
     staged.clear()
+    stagedToolSets.clear()
     for (const id of published) sink.remove(moduleId, id)
     published.clear()
+    for (const id of publishedToolSets) toolSetSink.remove(moduleId, id)
+    publishedToolSets.clear()
+    for (const renderer of publishedRenderers) {
+      fileTextRendererSink.remove(moduleId, renderer)
+    }
+    publishedRenderers.clear()
   })
   const assertActive = (): void => {
     if (!active) throw new Error(`Module "${moduleId}" is no longer active`)
@@ -389,6 +443,41 @@ function createModuleChatCapability({
       }
       staged.set(snapshot.id, snapshot)
     },
+    registerToolSet: (set) => {
+      assertActive()
+      if (committed) {
+        throw new Error('Module tool sets are already committed')
+      }
+      const snapshot = snapshotModuleToolSet(set)
+      if (stagedToolSets.has(snapshot.id)) {
+        throw new Error(`Duplicate module tool set id "${snapshot.id}"`)
+      }
+      if (stagedToolSets.size >= MAX_MODULE_TOOL_SETS_PER_MODULE) {
+        throw new Error(
+          `Module "${moduleId}" cannot register more than ${MAX_MODULE_TOOL_SETS_PER_MODULE} tool sets`,
+        )
+      }
+      stagedToolSets.set(snapshot.id, snapshot)
+    },
+    // Published immediately rather than staged to `commit()`: a renderer is
+    // not part of the frozen contribution set the way a mode or a tool set
+    // is — it answers a read that can arrive at any time, it carries no id
+    // to collide on within a module, and it hands back its own disposer so a
+    // module may retire one mid-life.
+    registerFileTextRenderer: (renderer) => {
+      assertActive()
+      const snapshot = snapshotModuleFileTextRenderer(renderer)
+      fileTextRendererSink.add(moduleId, snapshot)
+      publishedRenderers.add(snapshot)
+      return () => {
+        if (!publishedRenderers.delete(snapshot)) return
+        fileTextRendererSink.remove(moduleId, snapshot)
+      }
+    },
+    addSelection: async (selection) => {
+      assertActive()
+      await addSelection(snapshotChatSelection(selection))
+    },
   })
   return {
     api,
@@ -403,6 +492,14 @@ function createModuleChatCapability({
         sink.add(moduleId, mode)
       }
       staged.clear()
+      for (const [id, set] of stagedToolSets) {
+        // Added before `add` can throw on a contested id, so the lifecycle
+        // disposer still revokes the sets that did publish. `remove` is
+        // owner-guarded, so revoking an id we lost is a no-op.
+        publishedToolSets.add(id)
+        toolSetSink.add(moduleId, set)
+      }
+      stagedToolSets.clear()
     },
     activate: () => {
       assertActive()
@@ -412,6 +509,24 @@ function createModuleChatCapability({
       activationComplete = true
     },
   }
+}
+
+function snapshotChatSelection(
+  selection: YoloModuleChatSelectionV1,
+): YoloModuleChatSelectionV1 {
+  const { path, text, page } = selection
+  if (typeof path !== 'string' || path.length === 0) {
+    throw new TypeError('Module chat selection path must be a string')
+  }
+  if (typeof text !== 'string' || text.trim().length === 0) {
+    throw new TypeError('Module chat selection text must not be empty')
+  }
+  if (page !== undefined && !(Number.isInteger(page) && page >= 1)) {
+    throw new TypeError('Module chat selection page must be a positive integer')
+  }
+  return Object.freeze(
+    page === undefined ? { path, text } : { path, text, page },
+  )
 }
 
 function createModuleBackgroundCapability({

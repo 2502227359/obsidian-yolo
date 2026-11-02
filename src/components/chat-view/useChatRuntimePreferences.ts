@@ -5,12 +5,18 @@ import {
   SetStateAction,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
 } from 'react'
 import { v4 as uuidv4 } from 'uuid'
 
+import type {
+  BuiltinChatMode,
+  ChatMode,
+  ToolChatMode,
+} from '../../core/agent/chat-mode'
 import { DEFAULT_ASSISTANT_ID } from '../../core/agent/default-assistant'
 import {
   type ChatRuntimeId,
@@ -25,8 +31,9 @@ import type { ReasoningLevel } from '../../types/reasoning'
 import { AcknowledgementModal } from '../modals/AcknowledgementModal'
 
 import {
-  type BuiltinChatMode,
-  type ChatMode,
+  readYoloPreference,
+  resolveYoloByMode,
+  yoloPreferencePatch,
 } from './chat-input/ChatModeSelect'
 import {
   beginChatRuntimeNavigation,
@@ -53,7 +60,7 @@ function useLatestRef<T>(value: T) {
 /**
  * `handleRuntimeChange` 的运行时切换编排与 CLI 编排 hook（在本 hook 之后
  * 才调用）纠缠——这部分不是「偏好」的所有权问题，是 hooks 顺序本身的
- * 依赖倒置，架构治理第三步分期 B 的范围之外（见设计文档约束 6）。继续用
+ * 依赖倒置。继续用
  * 与 `useChatInputController.lateStateRef` 相同的惯例经 late ref 注入，
  * 但只承载 CLI 编排相关的量——偏好七件套已经改由
  * `ConversationPreferencesController` 直接持有,不再需要 late 绑定。
@@ -115,8 +122,12 @@ function computeInitialSnapshot(
   const chatMode: ChatMode =
     seeded?.chatMode ?? settings.chatOptions.chatMode ?? 'agent'
   const persistedChatMode: ChatMode = seeded?.persistedChatMode ?? chatMode
+  // The global default for the trust profile this mode reads — Max's when
+  // starting in Max, Agent's otherwise.
   const yoloEnabled =
-    seeded?.yoloEnabled ?? settings.chatOptions.agentYoloEnabled ?? false
+    seeded?.yoloEnabled ??
+    readYoloPreference(settings.chatOptions, chatMode) ??
+    false
   const conversationModelId =
     seeded?.conversationModelId ??
     (() => {
@@ -256,9 +267,13 @@ export function useChatRuntimePreferences({
     [setSettings, settings],
   )
 
+  // The global default is stored per trust profile, so the mode being toggled
+  // decides which field is written — see `yoloPreferenceKeyForMode`.
   const persistPreferredYolo = useCallback(
-    async (enabled: boolean) => {
-      if ((settings.chatOptions.agentYoloEnabled ?? false) === enabled) {
+    async (mode: ToolChatMode, enabled: boolean) => {
+      if (
+        (readYoloPreference(settings.chatOptions, mode) ?? false) === enabled
+      ) {
         return
       }
 
@@ -267,7 +282,7 @@ export function useChatRuntimePreferences({
           ...settings,
           chatOptions: {
             ...settings.chatOptions,
-            agentYoloEnabled: enabled,
+            ...yoloPreferencePatch(mode, enabled),
           },
         })
       } catch (error: unknown) {
@@ -365,6 +380,22 @@ export function useChatRuntimePreferences({
     preferencesController.getSnapshot,
   )
 
+  const yoloByMode = useMemo(
+    () =>
+      resolveYoloByMode(
+        preferencesSnapshot.chatMode,
+        preferencesSnapshot.yoloEnabled,
+        preferencesSnapshot.conversationOverrides,
+        settings.chatOptions,
+      ),
+    [
+      preferencesSnapshot.chatMode,
+      preferencesSnapshot.conversationOverrides,
+      preferencesSnapshot.yoloEnabled,
+      settings.chatOptions,
+    ],
+  )
+
   // 会话恢复/新建/分支时，assistant 可能来自一个已被删除的旧值——回退到
   // 当前可用的 assistant，与迁移前 useEffect 的语义一致，只是写入目标换成
   // 了 controller。
@@ -408,8 +439,11 @@ export function useChatRuntimePreferences({
     [preferencesController],
   )
 
+  // `mode` 是被拨动的那张卡片，不一定是当前模式——Agent 与 Max 卡片各自
+  // 带一个开关。首次「完全访问」确认弹窗保护的是「第一次打开 YOLO」这件
+  // 事本身，与在哪张卡片上打开无关，因此两者都要弹。
   const handleYoloChange = useCallback(
-    (enabled: boolean) => {
+    (mode: ToolChatMode, enabled: boolean) => {
       if (enabled && !settings.chatOptions.fullAccessWarningConfirmed) {
         new AcknowledgementModal(app, {
           title: t(
@@ -447,14 +481,14 @@ export function useChatRuntimePreferences({
           ),
           confirmTone: 'warning',
           onConfirm: () => {
-            preferencesController.toggleYolo(true)
+            preferencesController.toggleYolo(mode, true)
             void (async () => {
               try {
                 await setSettings({
                   ...settings,
                   chatOptions: {
                     ...settings.chatOptions,
-                    agentYoloEnabled: true,
+                    ...yoloPreferencePatch(mode, true),
                     fullAccessWarningConfirmed: true,
                   },
                 })
@@ -470,8 +504,8 @@ export function useChatRuntimePreferences({
         return
       }
 
-      preferencesController.toggleYolo(enabled)
-      void persistPreferredYolo(enabled)
+      preferencesController.toggleYolo(mode, enabled)
+      void persistPreferredYolo(mode, enabled)
     },
     [
       app,
@@ -628,6 +662,11 @@ export function useChatRuntimePreferences({
     yoloEnabled: preferencesSnapshot.yoloEnabled,
     conversationOverrides: preferencesSnapshot.conversationOverrides,
 
+    // 模式选择器要同时显示 Agent 与 Max 两张卡片的开关。快照里只存当前模式
+    // 那一份（运行时读的就是它），另一模式的值由同一对纯函数从会话覆盖与
+    // 全局默认派生出来——不在快照里再存一份并行状态。
+    yoloByMode,
+
     // 原始字段 setter（Dispatch<SetStateAction<T>> 同构）+ 每会话 Ref 缓存：
     // 供 useYoloChatSession / useCliRuntimeOrchestration / useChatDomainActions
     // 等消费 hook 的会话生命周期逻辑直接替换原 useState setter。
@@ -651,7 +690,7 @@ export function useChatRuntimePreferences({
     switchConversation: preferencesController.switchConversation,
 
     // controller 实例本身：供 useChatInputController 直接注入（跨渲染稳定，
-    // 不需要 late ref）——见架构治理第三步分期 C1，消灭事件处理器中的偏好
+    // 不需要 late ref），消灭事件处理器中的偏好
     // 残留 late 绑定。
     preferencesController,
 

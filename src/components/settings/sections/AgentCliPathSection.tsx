@@ -117,6 +117,36 @@ export function AgentCliPathSection({ app }: AgentCliPathSectionProps) {
         )}
         placeholder="/opt/homebrew/bin/pi"
       />
+      <CliPathRow
+        app={app}
+        runtimeId="omp"
+        name={t('settings.agent.ompCliPathName', 'omp CLI path')}
+        desc={t(
+          'settings.agent.ompCliPathDesc',
+          'Custom path to the omp executable — paste the output of "which omp" ("where omp" on Windows). Leave empty to auto-detect. Stored on this device only.',
+        )}
+        placeholder="~/.local/bin/omp"
+      />
+      <CliPathRow
+        app={app}
+        runtimeId="grok"
+        name={t('settings.agent.grokCliPathName', 'Grok CLI path')}
+        desc={t(
+          'settings.agent.grokCliPathDesc',
+          'Custom path to the grok executable — paste the output of "which grok" ("where grok" on Windows). Leave empty to auto-detect. Stored on this device only.',
+        )}
+        placeholder="~/.grok/bin/grok"
+      />
+      <CliPathRow
+        app={app}
+        runtimeId="codebuddy"
+        name={t('settings.agent.codebuddyCliPathName', 'CodeBuddy CLI path')}
+        desc={t(
+          'settings.agent.codebuddyCliPathDesc',
+          'Custom path to the codebuddy executable — paste the output of "which codebuddy" ("where codebuddy" on Windows). Leave empty to auto-detect. Stored on this device only.',
+        )}
+        placeholder="/usr/local/bin/codebuddy"
+      />
     </>
   )
 }

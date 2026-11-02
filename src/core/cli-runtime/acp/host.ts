@@ -1,10 +1,11 @@
 /* eslint-disable @typescript-eslint/no-deprecated -- `ClientSideConnection` is the SDK's stable single-class
    client-side facade; the newer `client()`/context-builder API adds session-management helpers this host doesn't
-   need, since orchestration already lives in `AcpCliRuntime`. See phase1-acp-hermes.md's SDK-adoption decision. */
+   need, since orchestration already lives in `AcpCliRuntime`. */
 import type {
   AgentCapabilities,
   Client,
   ClientSideConnection,
+  InitializeResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
   SessionUpdate,
@@ -34,6 +35,13 @@ export type AcpHostOptions = Readonly<{
   /** Re-resolved right before each spawn so a later install/path-override change is picked up. */
   resolveProcessOptions: () => Promise<Omit<AcpProcessOptions, 'runtimeId'>>
   createProcess?: (options: AcpProcessOptions) => Promise<AcpProcessLike>
+  /**
+   * Optional agent-specific authentication policy. Runs after initialize and
+   * before the connection is published or any session is created. Returning
+   * undefined skips authentication; a returned method is validated against
+   * the agent's advertised methods before it is sent.
+   */
+  selectAuthMethod?: (init: InitializeResponse) => string | undefined
 }>
 
 /**
@@ -48,6 +56,17 @@ export class AcpHost {
   private connectPromise: Promise<ClientSideConnection> | null = null
   private agentCapabilities: AgentCapabilities | undefined
   private readonly sessionHandlers = new Map<string, AcpSessionHandlers>()
+  /**
+   * The last command list an agent advertised for a session nothing was
+   * listening to yet. A session's id is known only once `session/new` or
+   * `session/load` returns, but agents advertise commands while answering
+   * either (CodeBuddy sends them before `session/load` resolves), and the
+   * list stays current until the agent sends another. So the latest one is
+   * kept and handed over when the session is registered; transcript updates
+   * are not, since `session/load` replays history the live sink must not
+   * see again.
+   */
+  private readonly unclaimedCommands = new Map<string, SessionUpdate>()
   private readonly fatalListeners = new Set<(error: Error) => void>()
   private fatalError: Error | null = null
   private disposed = false
@@ -61,6 +80,11 @@ export class AcpHost {
   /** Registers the live sink for one session id; returns the unregister function. */
   registerSession(sessionId: string, handlers: AcpSessionHandlers): () => void {
     this.sessionHandlers.set(sessionId, handlers)
+    const commands = this.unclaimedCommands.get(sessionId)
+    if (commands) {
+      this.unclaimedCommands.delete(sessionId)
+      handlers.onUpdate(commands)
+    }
     return () => {
       if (this.sessionHandlers.get(sessionId) === handlers) {
         this.sessionHandlers.delete(sessionId)
@@ -138,6 +162,11 @@ export class AcpHost {
     }
     this.process = process
     process.onExit(() => {
+      // A failed connection shuts its process down before a retry can spawn.
+      // Some process implementations report that exit asynchronously, so an
+      // old callback can arrive after the retry has already published a new
+      // process. Only the currently-owned generation may invalidate the host.
+      if (this.process !== process) return
       const stderr = process.getStderrSnapshot()
       this.handleFatal(
         new Error(
@@ -164,6 +193,19 @@ export class AcpHost {
         clientInfo: { name: this.options.clientName, version: '1.0.0' },
       })
       if (this.disposed) throw new Error('ACP host is disposed.')
+      const authMethodId = this.options.selectAuthMethod?.(init)
+      if (authMethodId) {
+        const advertised = (init.authMethods ?? []).some(
+          (method) => method.id === authMethodId,
+        )
+        if (!advertised) {
+          throw new Error(
+            `${this.options.runtimeId} selected authentication method "${authMethodId}" was not advertised by the ACP agent.`,
+          )
+        }
+        await connection.authenticate({ methodId: authMethodId })
+        if (this.disposed) throw new Error('ACP host is disposed.')
+      }
       this.agentCapabilities = init.agentCapabilities
       this.connection = connection
       // A successful (re)connect supersedes any earlier fatal state.
@@ -184,7 +226,14 @@ export class AcpHost {
         return handlers.onRequestPermission(params)
       },
       sessionUpdate: async (params) => {
-        this.sessionHandlers.get(params.sessionId)?.onUpdate(params.update)
+        const handlers = this.sessionHandlers.get(params.sessionId)
+        if (handlers) {
+          handlers.onUpdate(params.update)
+        } else if (
+          params.update.sessionUpdate === 'available_commands_update'
+        ) {
+          this.unclaimedCommands.set(params.sessionId, params.update)
+        }
       },
     }
   }

@@ -1,8 +1,17 @@
-import { ChatMessage, ChatUserMessage } from '../../types/chat'
+import {
+  ChatConversationCompactionState,
+  ChatMessage,
+  ChatUserMessage,
+} from '../../types/chat'
 import { ToolCallResponseStatus } from '../../types/tool-call.types'
 
 import { backgroundTaskCompletionBus } from './background-task/completion-bus'
-import { AgentService, RUNNING_PERSIST_MIN_INTERVAL_MS } from './service'
+import {
+  AgentSessionService,
+  RUNNING_PERSIST_MIN_INTERVAL_MS,
+  mergeVisibleMessages,
+  resolveVisibleHistoryPrefix,
+} from './service'
 import { subagentRuntimeRegistry } from './subagent/runtime-registry'
 import { subagentTaskRegistry } from './subagent/task-registry'
 import type { SubagentTaskRecord } from './subagent/types'
@@ -15,7 +24,10 @@ type MockRuntimeInstance = {
     () => void,
     [(snapshot: { messages: ChatMessage[] }) => void]
   >
-  emitSnapshot: (messages: ChatMessage[]) => void
+  emitSnapshot: (
+    messages: ChatMessage[],
+    compaction?: ChatConversationCompactionState,
+  ) => void
   resolveRun: () => void
   rejectRun: (error: Error) => void
   getRunInput: () => AgentRuntimeRunInput | null
@@ -33,7 +45,7 @@ type AgentServiceInternals = {
 }
 
 const getAgentServiceInternals = (
-  service: AgentService,
+  service: AgentSessionService,
 ): AgentServiceInternals => service as unknown as AgentServiceInternals
 
 const runtimeInstances: MockRuntimeInstance[] = []
@@ -43,7 +55,7 @@ jest.mock('./native-runtime', () => ({
     let subscriber:
       | ((snapshot: {
           messages: ChatMessage[]
-          compaction: []
+          compaction: ChatConversationCompactionState
           pendingCompactionAnchorMessageId: null
         }) => void)
       | null = null
@@ -67,10 +79,10 @@ jest.mock('./native-runtime', () => ({
           subscriber = null
         }
       }),
-      emitSnapshot: (messages) => {
+      emitSnapshot: (messages, compaction = []) => {
         subscriber?.({
           messages,
-          compaction: [],
+          compaction,
           pendingCompactionAnchorMessageId: null,
         })
       },
@@ -130,21 +142,19 @@ const createStreamingMessages = (): ChatMessage[] => [
   },
 ]
 
-describe('AgentService abort handling', () => {
+describe('AgentSessionService abort handling', () => {
   beforeEach(() => {
     runtimeInstances.length = 0
   })
 
   it('marks streaming assistant and active tool calls as aborted immediately', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const abortController = new AbortController()
 
     const runPromise = service.run({
       conversationId: 'conversation-1',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: {
         conversationId: 'conversation-1',
@@ -188,15 +198,13 @@ describe('AgentService abort handling', () => {
   })
 
   it('preserves aborted state when a late snapshot still reports streaming', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const abortController = new AbortController()
 
     const runPromise = service.run({
       conversationId: 'conversation-2',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: {
         conversationId: 'conversation-2',
@@ -239,7 +247,7 @@ describe('AgentService abort handling', () => {
   })
 
   it('keeps the existing branch in place while a branch retry is starting', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const userMessage: ChatMessage = {
       role: 'user',
       id: 'user-1',
@@ -277,9 +285,7 @@ describe('AgentService abort handling', () => {
     const runPromise = service.run({
       conversationId: 'conversation-3',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: {
         conversationId: 'conversation-3',
@@ -337,15 +343,13 @@ describe('AgentService abort handling', () => {
   })
 
   it('aborting a single tool call keeps the run alive (issue #338)', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const mcpAbortToolCall = jest.fn()
 
     const runPromise = service.run({
       conversationId: 'conversation-parallel',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: {
         conversationId: 'conversation-parallel',
@@ -408,7 +412,7 @@ describe('AgentService abort handling', () => {
   })
 })
 
-describe('AgentService assistant render stream separation', () => {
+describe('AgentSessionService assistant render stream separation', () => {
   const makeStreamingAssistantMessage = (
     content: string,
     options?: Partial<Extract<ChatMessage, { role: 'assistant' }>>,
@@ -436,7 +440,7 @@ describe('AgentService assistant render stream separation', () => {
   })
 
   it('keeps pure display deltas out of the conversation snapshot and routes them to the render stream', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const publishedStates: ChatMessage[][] = []
     service.subscribe(
       'conv-streaming-publish',
@@ -450,9 +454,7 @@ describe('AgentService assistant render stream separation', () => {
     const runPromise = service.run({
       conversationId: 'conv-streaming-publish',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-streaming-publish', [userMessage]),
     })
@@ -513,7 +515,7 @@ describe('AgentService assistant render stream separation', () => {
   })
 
   it('folds the first appearance of content back into the snapshot', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const publishedStates: ChatMessage[][] = []
     service.subscribe(
       'conv-first-appearance',
@@ -527,9 +529,7 @@ describe('AgentService assistant render stream separation', () => {
     const runPromise = service.run({
       conversationId: 'conv-first-appearance',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-first-appearance', [userMessage]),
     })
@@ -560,7 +560,7 @@ describe('AgentService assistant render stream separation', () => {
   // 按 `length` 判定时，provider 先吐出的换行/空格会白白消耗掉唯一一次折回，
   // 等真正的第一个可见字符到来时反而只走 stream，gate 整段生成期间不翻转。
   it('folds on the first visible character, not on leading whitespace', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const publishedStates: ChatMessage[][] = []
     service.subscribe(
       'conv-whitespace-first',
@@ -574,9 +574,7 @@ describe('AgentService assistant render stream separation', () => {
     const runPromise = service.run({
       conversationId: 'conv-whitespace-first',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-whitespace-first', [userMessage]),
     })
@@ -611,7 +609,7 @@ describe('AgentService assistant render stream separation', () => {
   })
 
   it('folds on the first visible reasoning character, not on leading whitespace', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const publishedStates: ChatMessage[][] = []
     service.subscribe(
       'conv-whitespace-reasoning',
@@ -625,9 +623,7 @@ describe('AgentService assistant render stream separation', () => {
     const runPromise = service.run({
       conversationId: 'conv-whitespace-reasoning',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-whitespace-reasoning', [userMessage]),
     })
@@ -655,7 +651,7 @@ describe('AgentService assistant render stream separation', () => {
   // 事务顺序：最终值 → 结构快照 → 定格。终态值必须是最终值本身，而不是最后
   // 一个 delta——provider 的最终结果可能重写正文、规范化 reasoning。
   it('settles the stream on the final value, after the structural snapshot', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const events: string[] = []
     service.subscribe(
       'conv-terminal-final',
@@ -679,9 +675,7 @@ describe('AgentService assistant render stream separation', () => {
     const runPromise = service.run({
       conversationId: 'conv-terminal-final',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-terminal-final', [userMessage]),
     })
@@ -730,7 +724,7 @@ describe('AgentService assistant render stream separation', () => {
   })
 
   it('notifies run summary subscribers on semantic events only, never on display deltas', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const summarySubscriber = jest.fn()
     service.subscribeToRunSummaries(summarySubscriber)
     // Initial emit on subscribe.
@@ -745,9 +739,7 @@ describe('AgentService assistant render stream separation', () => {
     const runPromise = service.run({
       conversationId: 'conv-summary-routing',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-summary-routing', [userMessage]),
     })
@@ -793,7 +785,7 @@ describe('AgentService assistant render stream separation', () => {
   })
 
   it('publishes tool call request changes immediately and cancels pending streaming publish', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const subscriber = jest.fn()
     service.subscribe('conv-tool-request-publish', subscriber, {
       emitCurrent: false,
@@ -803,9 +795,7 @@ describe('AgentService assistant render stream separation', () => {
     const runPromise = service.run({
       conversationId: 'conv-tool-request-publish',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-tool-request-publish', [userMessage]),
     })
@@ -843,7 +833,7 @@ describe('AgentService assistant render stream separation', () => {
   })
 
   it('publishes completion immediately and cancels pending streaming publish', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const subscriber = jest.fn()
     service.subscribe('conv-complete-publish', subscriber, {
       emitCurrent: false,
@@ -853,9 +843,7 @@ describe('AgentService assistant render stream separation', () => {
     const runPromise = service.run({
       conversationId: 'conv-complete-publish',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-complete-publish', [userMessage]),
     })
@@ -883,7 +871,7 @@ describe('AgentService assistant render stream separation', () => {
   })
 
   it('publishes abort immediately and cancels pending streaming publish', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const subscriber = jest.fn()
     service.subscribe('conv-abort-publish', subscriber, { emitCurrent: false })
 
@@ -891,9 +879,7 @@ describe('AgentService assistant render stream separation', () => {
     const runPromise = service.run({
       conversationId: 'conv-abort-publish',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-abort-publish', [userMessage]),
     })
@@ -1031,7 +1017,7 @@ const makeFailedSubagentTaskRecord = (): SubagentTaskRecord => {
   }
 }
 
-describe('AgentService dropConversation', () => {
+describe('AgentSessionService dropConversation', () => {
   beforeEach(() => {
     runtimeInstances.length = 0
     jest.useFakeTimers()
@@ -1044,7 +1030,7 @@ describe('AgentService dropConversation', () => {
 
   it('drops in-memory conversation state without persisting a deleted empty state', () => {
     const persistConversationMessages = jest.fn().mockResolvedValue(undefined)
-    const service = new AgentService({ persistConversationMessages })
+    const service = new AgentSessionService({ persistConversationMessages })
     const internals = getAgentServiceInternals(service)
     const subscriber = jest.fn()
     const stateFeedSubscriber = jest.fn()
@@ -1104,7 +1090,7 @@ describe('AgentService dropConversation', () => {
 
   it('does not let stale reads, subscriptions, or writes recreate a dropped conversation', async () => {
     const persistConversationMessages = jest.fn().mockResolvedValue(undefined)
-    const service = new AgentService({ persistConversationMessages })
+    const service = new AgentSessionService({ persistConversationMessages })
     const internals = getAgentServiceInternals(service)
 
     service.replaceConversationMessages('conv-no-revive', [
@@ -1143,9 +1129,7 @@ describe('AgentService dropConversation', () => {
     await service.run({
       conversationId: 'conv-no-revive',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-no-revive', [
         makeUserMessage('u3', 'run'),
@@ -1159,7 +1143,7 @@ describe('AgentService dropConversation', () => {
   })
 
   it('does not create a conversation entry when checking an unknown running state', () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const internals = getAgentServiceInternals(service)
 
     expect(service.isRunning('conv-never-created')).toBe(false)
@@ -1169,15 +1153,13 @@ describe('AgentService dropConversation', () => {
   it('does not recreate a dropped conversation when an aborted run settles', async () => {
     const persistConversationMessages = jest.fn().mockResolvedValue(undefined)
     const abortToolCall = jest.fn()
-    const service = new AgentService({ persistConversationMessages })
+    const service = new AgentSessionService({ persistConversationMessages })
     const internals = getAgentServiceInternals(service)
     const userMessage = makeUserMessage('u1', 'run')
     const runPromise = service.run({
       conversationId: 'conv-running-drop',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: {
         conversationId: 'conv-running-drop',
@@ -1222,7 +1204,7 @@ describe('AgentService dropConversation', () => {
   })
 
   it('ignores background subagent completions after a conversation was dropped', () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const internals = getAgentServiceInternals(service)
     const record = {
       ...makeFailedSubagentTaskRecord(),
@@ -1255,7 +1237,7 @@ describe('AgentService dropConversation', () => {
   })
 })
 
-describe('AgentService conversation persistence flush', () => {
+describe('AgentSessionService conversation persistence flush', () => {
   beforeEach(() => {
     jest.useFakeTimers()
   })
@@ -1267,7 +1249,7 @@ describe('AgentService conversation persistence flush', () => {
 
   it('persists the latest conversation state before returning', async () => {
     const persistConversationMessages = jest.fn().mockResolvedValue(undefined)
-    const service = new AgentService({ persistConversationMessages })
+    const service = new AgentSessionService({ persistConversationMessages })
     const message = makeUserMessage('u-flush', 'persist me')
 
     service.replaceConversationMessages('conv-flush', [message], [], {
@@ -1287,7 +1269,7 @@ describe('AgentService conversation persistence flush', () => {
   })
 })
 
-describe('AgentService conversation persistence cadence', () => {
+describe('AgentSessionService conversation persistence cadence', () => {
   const makeStreamingAssistantMessage = (
     content: string,
   ): Extract<ChatMessage, { role: 'assistant' }> => ({
@@ -1319,7 +1301,7 @@ describe('AgentService conversation persistence cadence', () => {
   // conversation first, then the run starts.
   const startRun = async (conversationId: string) => {
     const persistConversationMessages = jest.fn().mockResolvedValue(undefined)
-    const service = new AgentService({ persistConversationMessages })
+    const service = new AgentSessionService({ persistConversationMessages })
     const userMessage = makeUserMessage('u1', 'hello')
 
     service.replaceConversationMessages(conversationId, [userMessage], [], {
@@ -1333,9 +1315,7 @@ describe('AgentService conversation persistence cadence', () => {
     const runPromise = service.run({
       conversationId,
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput(conversationId, [userMessage]),
     })
@@ -1468,19 +1448,17 @@ describe('AgentService conversation persistence cadence', () => {
   })
 })
 
-describe('AgentService main activity summary', () => {
+describe('AgentSessionService main activity summary', () => {
   beforeEach(() => {
     runtimeInstances.length = 0
   })
 
   it('marks a live runtime as active, abortable, and queueable', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const runPromise = service.run({
       conversationId: 'conv-live',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-live', [makeUserMessage('u1', 'hello')]),
     })
@@ -1500,7 +1478,7 @@ describe('AgentService main activity summary', () => {
   })
 
   it('marks pending approval and awaiting user input as active but not queueable', () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
 
     service.replaceConversationMessages('conv-pending', [
       makeUserMessage('u1', 'hi'),
@@ -1530,7 +1508,7 @@ describe('AgentService main activity summary', () => {
   })
 
   it('marks foreground running tool calls as active without treating background results as active', () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
 
     service.replaceConversationMessages('conv-tool', [
       makeUserMessage('u1', 'hi'),
@@ -1557,7 +1535,7 @@ describe('AgentService main activity summary', () => {
   })
 
   it('aborts foreground tool calls without an active runtime and leaves background results untouched', () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     service.replaceConversationMessages('conv-stop-tool', [
       makeUserMessage('u1', 'hi'),
       makeToolMessage(ToolCallResponseStatus.Running),
@@ -1586,7 +1564,7 @@ describe('AgentService main activity summary', () => {
   })
 
   it('calls the registered foreground aborter when stopping main activity', () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const abort = jest.fn()
     service.replaceConversationMessages('conv-tracker', [
       makeUserMessage('u1', 'hi'),
@@ -1604,9 +1582,9 @@ describe('AgentService main activity summary', () => {
   })
 })
 
-describe('AgentService background subagent results', () => {
+describe('AgentSessionService background subagent results', () => {
   it('persists live transcript fallback before compacting completed registry records', () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const record = makeFailedSubagentTaskRecord()
     subagentTaskRegistry.register(record)
     service.startBackgroundTaskResultListener()
@@ -1700,13 +1678,13 @@ const makeAssistantToolMessages = ({
   ]
 }
 
-describe('AgentService continuation input', () => {
+describe('AgentSessionService continuation input', () => {
   beforeEach(() => {
     runtimeInstances.length = 0
   })
 
   it('drops stale requestMessages when continuing after approved tool calls', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const userMessage = makeUserMessage('u1', 'dispatch once')
     const staleRequestMessages = [userMessage]
     const callTool = jest.fn().mockResolvedValue({
@@ -1720,9 +1698,7 @@ describe('AgentService continuation input', () => {
     const runPromise = service.run({
       conversationId: 'conv-approve-cont',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: {
         conversationId: 'conv-approve-cont',
@@ -1774,7 +1750,7 @@ describe('AgentService continuation input', () => {
   })
 
   it('approveToolCall passes the persisted executionConstraints.bashReadOnly to mcpManager.callTool', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const userMessage = makeUserMessage('u1', 'dispatch once')
     const callTool = jest.fn().mockResolvedValue({
       status: ToolCallResponseStatus.Success,
@@ -1784,9 +1760,7 @@ describe('AgentService continuation input', () => {
     const runPromise = service.run({
       conversationId: 'conv-approve-bashro',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: {
         conversationId: 'conv-approve-bashro',
@@ -1822,7 +1796,7 @@ describe('AgentService continuation input', () => {
   })
 
   it('approveToolCall ignores allowForConversation when the persisted approvalPolicy is always-require-user', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const userMessage = makeUserMessage('u1', 'dispatch once')
     const allowToolForConversation = jest.fn()
     const callTool = jest.fn().mockResolvedValue({
@@ -1834,9 +1808,7 @@ describe('AgentService continuation input', () => {
     const runPromise = service.run({
       conversationId: 'conv-approve-locked',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: {
         conversationId: 'conv-approve-locked',
@@ -1873,16 +1845,14 @@ describe('AgentService continuation input', () => {
   })
 
   it('drops stale requestMessages when continuing after answered user questions', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const userMessage = makeUserMessage('u1', 'ask then continue')
     const staleRequestMessages = [userMessage]
 
     const runPromise = service.run({
       conversationId: 'conv-answer-cont',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: {
         conversationId: 'conv-answer-cont',
@@ -1930,13 +1900,13 @@ describe('AgentService continuation input', () => {
   })
 })
 
-describe('AgentService mid-run user message queue', () => {
+describe('AgentSessionService mid-run user message queue', () => {
   beforeEach(() => {
     runtimeInstances.length = 0
   })
 
   it('returns idle when no run is active', () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const result = service.enqueueUserMessage(
       'conv-idle',
       makeUserMessage('u1', 'hello'),
@@ -1946,13 +1916,11 @@ describe('AgentService mid-run user message queue', () => {
   })
 
   it('enqueues a message while a run is active', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const runPromise = service.run({
       conversationId: 'conv-1',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-1', [makeUserMessage('u1', 'hello')]),
     })
@@ -1968,13 +1936,11 @@ describe('AgentService mid-run user message queue', () => {
   })
 
   it('refuses enqueue when a tool call is pending approval', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const runPromise = service.run({
       conversationId: 'conv-approval',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-approval', [makeUserMessage('u1', 'hi')]),
     })
@@ -2005,13 +1971,11 @@ describe('AgentService mid-run user message queue', () => {
   })
 
   it('drains the queue when the runtime hits an llm_request boundary', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const runPromise = service.run({
       conversationId: 'conv-drain',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-drain', [makeUserMessage('u1', 'hi')]),
     })
@@ -2037,7 +2001,7 @@ describe('AgentService mid-run user message queue', () => {
   })
 
   it('preserves prior conversation history after a queued message is drained', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const priorUser = makeUserMessage('u0', 'earlier question')
     const priorAssistant: ChatMessage = {
       role: 'assistant',
@@ -2049,9 +2013,7 @@ describe('AgentService mid-run user message queue', () => {
     const runPromise = service.run({
       conversationId: 'conv-drain-history',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-drain-history', [
         priorUser,
@@ -2093,13 +2055,11 @@ describe('AgentService mid-run user message queue', () => {
   })
 
   it('atomically removes a message while it is still queued', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const runPromise = service.run({
       conversationId: 'conv-remove',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-remove', [makeUserMessage('u1', 'hi')]),
     })
@@ -2121,13 +2081,11 @@ describe('AgentService mid-run user message queue', () => {
   })
 
   it('cannot remove a message after the runtime has drained it', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const runPromise = service.run({
       conversationId: 'conv-remove-drained',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-remove-drained', [
         makeUserMessage('u1', 'hi'),
@@ -2150,13 +2108,11 @@ describe('AgentService mid-run user message queue', () => {
   })
 
   it('refuses enqueue for non-default branches', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const runPromise = service.run({
       conversationId: 'conv-branch',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: {
         conversationId: 'conv-branch',
@@ -2179,13 +2135,11 @@ describe('AgentService mid-run user message queue', () => {
   })
 
   it('clears the queue and emits an abort event when aborted', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const runPromise = service.run({
       conversationId: 'conv-abort',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-abort', [makeUserMessage('u1', 'hi')]),
     })
@@ -2208,13 +2162,11 @@ describe('AgentService mid-run user message queue', () => {
   })
 
   it('starts a continuation run when the queue still has messages after run completion', async () => {
-    const service = new AgentService()
+    const service = new AgentSessionService()
     const runPromise = service.run({
       conversationId: 'conv-cont',
       loopConfig: {
-        enableTools: true,
         maxAutoIterations: 100,
-        includeBuiltinTools: true,
       },
       input: buildBaseRunInput('conv-cont', [makeUserMessage('u1', 'hi')]),
     })
@@ -2251,64 +2203,9 @@ describe('AgentService mid-run user message queue', () => {
 
     secondRuntime.resolveRun()
   })
-
-  it('refuses enqueue when the active run is on the single-turn fast path', async () => {
-    const service = new AgentService()
-    const runPromise = service.run({
-      conversationId: 'conv-fast',
-      loopConfig: {
-        enableTools: false,
-        maxAutoIterations: 1,
-        includeBuiltinTools: false,
-      },
-      input: buildBaseRunInput('conv-fast', [makeUserMessage('u1', 'hi')]),
-    })
-    const runtime = runtimeInstances[0]
-
-    const result = service.enqueueUserMessage(
-      'conv-fast',
-      makeUserMessage('u2', 'follow-up'),
-    )
-    expect(result).toBe('idle')
-    expect(service.peekPendingUserMessages('conv-fast')).toEqual([])
-
-    runtime.resolveRun()
-    await runPromise
-  })
-
-  it('does not schedule continuation for fast-path runs even if the queue is non-empty', async () => {
-    const service = new AgentService()
-    const runPromise = service.run({
-      conversationId: 'conv-fast-cont',
-      loopConfig: {
-        enableTools: false,
-        maxAutoIterations: 1,
-        includeBuiltinTools: false,
-      },
-      input: buildBaseRunInput('conv-fast-cont', [makeUserMessage('u1', 'hi')]),
-    })
-    const firstRuntime = runtimeInstances[0]
-
-    // Bypass the enqueue API guard to simulate any path that could leave a
-    // message queued under a fast-path run. The continuation guard must keep
-    // us from looping forever even in that scenario.
-    const runKey = 'conv-fast-cont::__default__'
-
-    ;(service as any).pendingUserMessagesByKey.set(runKey, [
-      makeUserMessage('u2', 'orphan'),
-    ])
-
-    firstRuntime.resolveRun()
-    await runPromise
-
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
-
-    // No continuation run should have spawned.
-    expect(runtimeInstances.length).toBe(1)
-  })
 })
 
-describe('AgentService subagent approval routing', () => {
+describe('AgentSessionService subagent approval routing', () => {
   type FakeRuntime = {
     findToolCall: jest.Mock
     setToolCallResponse: jest.Mock
@@ -2391,7 +2288,7 @@ describe('AgentService subagent approval routing', () => {
 
   it('approveToolCall routes to the subagent runtime, executes, and resumes', async () => {
     const { toolCallId, runtime, mcpManager, resumeRun } = registerEntry()
-    const service = new AgentService()
+    const service = new AgentSessionService()
 
     const ok = await service.approveToolCall({
       conversationId: 'irrelevant-parent-conv',
@@ -2421,7 +2318,7 @@ describe('AgentService subagent approval routing', () => {
 
   it('approveToolCall with allowForConversation scopes the allow to the parent conv', async () => {
     const { toolCallId, mcpManager } = registerEntry()
-    const service = new AgentService()
+    const service = new AgentSessionService()
 
     await service.approveToolCall({
       conversationId: 'irrelevant',
@@ -2433,12 +2330,13 @@ describe('AgentService subagent approval routing', () => {
       'yolo_local__fs_edit',
       'conv-parent',
       undefined,
+      [],
     )
   })
 
   it('rejectToolCall routes to the subagent runtime and resumes', () => {
     const { toolCallId, runtime, mcpManager, resumeRun } = registerEntry()
-    const service = new AgentService()
+    const service = new AgentSessionService()
 
     const ok = service.rejectToolCall({
       conversationId: 'irrelevant',
@@ -2457,7 +2355,7 @@ describe('AgentService subagent approval routing', () => {
   it('approveToolCall surfaces callTool errors as Error response', async () => {
     const { toolCallId, runtime, mcpManager } = registerEntry()
     mcpManager.callTool.mockRejectedValueOnce(new Error('boom'))
-    const service = new AgentService()
+    const service = new AgentSessionService()
 
     await service.approveToolCall({
       conversationId: 'irrelevant',
@@ -2480,7 +2378,7 @@ describe('AgentService subagent approval routing', () => {
     const { toolCallId, runtime } = registerEntry()
     // Simulate a race: the call was already resolved before approve fired.
     runtime.findToolCall.mockReturnValueOnce(null)
-    const service = new AgentService()
+    const service = new AgentSessionService()
 
     const ok = await service.approveToolCall({
       conversationId: 'irrelevant',
@@ -2488,5 +2386,427 @@ describe('AgentService subagent approval routing', () => {
     })
 
     expect(ok).toBe(false)
+  })
+})
+
+/**
+ * 修复前 `mergeVisibleMessages` 的等价重建：每次调用都在整段 `baseMessages`
+ * 里重新定位锚点、整段切片，再对「前缀 + 响应」整体做一次折叠。折叠本身直接
+ * 复用现在的 `mergeVisibleMessages`——前缀传空数组时它就退化成原实现里那唯一
+ * 的一次整体折叠，所以这个 oracle 不需要复制任何折叠逻辑，也不会随实现漂移。
+ */
+const legacyMergeVisibleMessages = (
+  previousVisibleMessages: ChatMessage[],
+  baseMessages: ChatMessage[],
+  anchorMessageId: string | undefined,
+  responseMessages: ChatMessage[],
+): ChatMessage[] => {
+  const anchorIndex = anchorMessageId
+    ? baseMessages.findIndex((message) => message.id === anchorMessageId)
+    : -1
+  const nextMessages =
+    anchorIndex === -1
+      ? responseMessages
+      : [...baseMessages.slice(0, anchorIndex + 1), ...responseMessages]
+
+  return mergeVisibleMessages(previousVisibleMessages, [], nextMessages)
+}
+
+const createUserHistoryMessage = (id: string): ChatUserMessage => ({
+  role: 'user',
+  id,
+  content: null,
+  promptContent: id,
+  mentionables: [],
+})
+
+const createAssistantHistoryMessage = (
+  id: string,
+  content: string,
+  generationState: 'streaming' | 'completed' | 'aborted' = 'completed',
+): ChatMessage => ({
+  role: 'assistant',
+  id,
+  content,
+  metadata: { generationState },
+})
+
+const createToolHistoryMessage = (
+  id: string,
+  toolCallId: string,
+  status: ToolCallResponseStatus,
+): ChatMessage => ({
+  role: 'tool',
+  id,
+  toolCalls: [
+    {
+      request: { id: toolCallId, name: 'local:fs_read' },
+      response: { status } as never,
+    },
+  ],
+})
+
+describe('visible history prefix merging', () => {
+  it('resolves the prefix up to and including the anchor', () => {
+    const baseMessages = [
+      createUserHistoryMessage('user-1'),
+      createAssistantHistoryMessage('assistant-1', 'first answer'),
+      createUserHistoryMessage('user-2'),
+    ]
+
+    expect(resolveVisibleHistoryPrefix(baseMessages, 'user-2')).toEqual(
+      baseMessages,
+    )
+    expect(resolveVisibleHistoryPrefix(baseMessages, 'user-1')).toEqual([
+      baseMessages[0],
+    ])
+    // 锚点不在历史里、或根本没有锚点时，可见历史完全交给运行时快照决定。
+    expect(resolveVisibleHistoryPrefix(baseMessages, 'missing')).toEqual([])
+    expect(resolveVisibleHistoryPrefix(baseMessages, undefined)).toEqual([])
+  })
+
+  it('matches the pre-fix merge result across a multi-chunk stream', () => {
+    const baseMessages = [
+      createUserHistoryMessage('user-1'),
+      createAssistantHistoryMessage('assistant-1', 'first answer'),
+      createToolHistoryMessage(
+        'tool-history',
+        'tool-call-history',
+        ToolCallResponseStatus.Success,
+      ),
+      createUserHistoryMessage('user-2'),
+    ]
+    const anchorMessageId = 'user-2'
+    const prefix = resolveVisibleHistoryPrefix(baseMessages, anchorMessageId)
+
+    const snapshots: ChatMessage[][] = [
+      [createAssistantHistoryMessage('assistant-2', 'a', 'streaming')],
+      [createAssistantHistoryMessage('assistant-2', 'ab', 'streaming')],
+      [createAssistantHistoryMessage('assistant-2', 'abc', 'streaming')],
+      [
+        createAssistantHistoryMessage('assistant-2', 'abc', 'completed'),
+        createToolHistoryMessage(
+          'tool-2',
+          'tool-call-2',
+          ToolCallResponseStatus.Running,
+        ),
+      ],
+      [
+        createAssistantHistoryMessage('assistant-2', 'abc', 'completed'),
+        createToolHistoryMessage(
+          'tool-2',
+          'tool-call-2',
+          ToolCallResponseStatus.Success,
+        ),
+        createAssistantHistoryMessage('assistant-3', 'done', 'streaming'),
+      ],
+    ]
+
+    let current: ChatMessage[] = [...baseMessages]
+    let legacy: ChatMessage[] = [...baseMessages]
+
+    for (const snapshot of snapshots) {
+      current = mergeVisibleMessages(current, prefix, snapshot)
+      legacy = legacyMergeVisibleMessages(
+        legacy,
+        baseMessages,
+        anchorMessageId,
+        snapshot,
+      )
+      expect(current).toEqual(legacy)
+    }
+
+    // 结构共享不变式：前缀里的消息必须仍是原来那几个对象，而不是副本。
+    baseMessages.forEach((message, index) => {
+      expect(current[index]).toBe(message)
+    })
+    expect(current).not.toBe(baseMessages)
+  })
+
+  it('still folds an aborted turn back onto a late snapshot', () => {
+    const baseMessages = [
+      createUserHistoryMessage('user-1'),
+      createUserHistoryMessage('user-2'),
+    ]
+    const anchorMessageId = 'user-2'
+    const prefix = resolveVisibleHistoryPrefix(baseMessages, anchorMessageId)
+
+    const runningSnapshot: ChatMessage[] = [
+      createAssistantHistoryMessage('assistant-1', 'partial', 'streaming'),
+      createToolHistoryMessage(
+        'tool-1',
+        'tool-call-1',
+        ToolCallResponseStatus.Running,
+      ),
+    ]
+
+    const merged = mergeVisibleMessages(baseMessages, prefix, runningSnapshot)
+    expect(merged).toEqual(
+      legacyMergeVisibleMessages(
+        baseMessages,
+        baseMessages,
+        anchorMessageId,
+        runningSnapshot,
+      ),
+    )
+
+    // 用户中断：可见状态里这一轮被标记成 aborted。
+    const abortedMessages: ChatMessage[] = [
+      ...prefix,
+      createAssistantHistoryMessage('assistant-1', 'partial', 'aborted'),
+      createToolHistoryMessage(
+        'tool-1',
+        'tool-call-1',
+        ToolCallResponseStatus.Aborted,
+      ),
+    ]
+
+    // 中断之后仍有迟到的快照报 streaming / running，折叠必须把它按住。
+    const afterAbort = mergeVisibleMessages(
+      abortedMessages,
+      prefix,
+      runningSnapshot,
+    )
+
+    expect(afterAbort).toEqual(
+      legacyMergeVisibleMessages(
+        abortedMessages,
+        baseMessages,
+        anchorMessageId,
+        runningSnapshot,
+      ),
+    )
+    expect(afterAbort[2]).toMatchObject({
+      role: 'assistant',
+      metadata: { generationState: 'aborted' },
+    })
+    expect(afterAbort[3]).toMatchObject({
+      role: 'tool',
+      toolCalls: [{ response: { status: ToolCallResponseStatus.Aborted } }],
+    })
+  })
+
+  it('falls back to the snapshot alone when the anchor is not in the history', () => {
+    const baseMessages = [createUserHistoryMessage('user-1')]
+    const snapshot = [
+      createAssistantHistoryMessage('assistant-1', 'answer', 'streaming'),
+    ]
+
+    for (const anchorMessageId of [undefined, 'missing']) {
+      const prefix = resolveVisibleHistoryPrefix(baseMessages, anchorMessageId)
+      expect(mergeVisibleMessages(baseMessages, prefix, snapshot)).toEqual(
+        legacyMergeVisibleMessages(
+          baseMessages,
+          baseMessages,
+          anchorMessageId,
+          snapshot,
+        ),
+      )
+    }
+  })
+})
+
+describe('AgentSessionService streaming merge cost', () => {
+  beforeEach(() => {
+    runtimeInstances.length = 0
+  })
+
+  it('stops rescanning the history prefix on every streaming chunk', async () => {
+    let historyIdReads = 0
+    const createCountedUserMessage = (id: string): ChatUserMessage => {
+      const message: Record<string, unknown> = {
+        role: 'user',
+        content: null,
+        promptContent: id,
+        mentionables: [],
+      }
+      Object.defineProperty(message, 'id', {
+        enumerable: true,
+        get: () => {
+          historyIdReads += 1
+          return id
+        },
+      })
+      return message as unknown as ChatUserMessage
+    }
+
+    const history: ChatMessage[] = Array.from({ length: 60 }, (_, index) =>
+      index % 2 === 0
+        ? createCountedUserMessage(`user-${index}`)
+        : createAssistantHistoryMessage(
+            `assistant-${index}`,
+            `answer ${index}`,
+          ),
+    )
+    history.push(createCountedUserMessage('user-anchor'))
+
+    const service = new AgentSessionService()
+    const runPromise = service.run({
+      conversationId: 'conversation-merge-cost',
+      loopConfig: {
+        maxAutoIterations: 100,
+      },
+      input: {
+        conversationId: 'conversation-merge-cost',
+        messages: history,
+      } as never,
+    })
+
+    const runtime = runtimeInstances[0]
+    // 第一个快照是结构事件（消息数变了），照常整段发布一次。
+    runtime.emitSnapshot([
+      createAssistantHistoryMessage('assistant-answer', 'a', 'streaming'),
+    ])
+
+    const readsAfterFirstSnapshot = historyIdReads
+    const chunkCount = 30
+    for (let index = 2; index <= chunkCount + 1; index += 1) {
+      runtime.emitSnapshot([
+        createAssistantHistoryMessage(
+          'assistant-answer',
+          'a'.repeat(index),
+          'streaming',
+        ),
+      ])
+    }
+
+    // 纯正文增量不再触碰历史前缀里的任何一条消息：修复前每个 chunk 都要为了
+    // 定位锚点把整段历史重新扫一遍。
+    expect(historyIdReads).toBe(readsAfterFirstSnapshot)
+
+    const state = service.getState('conversation-merge-cost')
+    expect(state.messages).toHaveLength(history.length + 1)
+    expect(state.messages.at(-1)).toMatchObject({
+      id: 'assistant-answer',
+      content: 'a'.repeat(chunkCount + 1),
+    })
+    history.forEach((message, index) => {
+      expect(state.messages[index]).toBe(message)
+    })
+
+    runtime.resolveRun()
+    await runPromise
+  })
+
+  it('resolves a new prefix for the next run instead of reusing the old one', async () => {
+    const firstUserMessage = createUserHistoryMessage('user-1')
+    const service = new AgentSessionService()
+
+    const firstRun = service.run({
+      conversationId: 'conversation-merge-anchor',
+      loopConfig: {
+        maxAutoIterations: 100,
+      },
+      input: {
+        conversationId: 'conversation-merge-anchor',
+        messages: [firstUserMessage],
+      } as never,
+    })
+
+    const firstRuntime = runtimeInstances[0]
+    const firstAnswer = createAssistantHistoryMessage(
+      'assistant-1',
+      'first answer',
+    )
+    firstRuntime.emitSnapshot([firstAnswer])
+    firstRuntime.resolveRun()
+    await firstRun
+
+    expect(service.getState('conversation-merge-anchor').messages).toEqual([
+      firstUserMessage,
+      firstAnswer,
+    ])
+
+    // 第二轮的锚点是新的用户消息，前缀必须跟着扩展到它为止。
+    const secondUserMessage = createUserHistoryMessage('user-2')
+    const secondRun = service.run({
+      conversationId: 'conversation-merge-anchor',
+      loopConfig: {
+        maxAutoIterations: 100,
+      },
+      input: {
+        conversationId: 'conversation-merge-anchor',
+        messages: [firstUserMessage, firstAnswer, secondUserMessage],
+      } as never,
+    })
+
+    const secondRuntime = runtimeInstances[1]
+    const secondAnswer = createAssistantHistoryMessage(
+      'assistant-2',
+      'second answer',
+    )
+    secondRuntime.emitSnapshot([secondAnswer])
+
+    expect(service.getState('conversation-merge-anchor').messages).toEqual([
+      firstUserMessage,
+      firstAnswer,
+      secondUserMessage,
+      secondAnswer,
+    ])
+
+    secondRuntime.resolveRun()
+    await secondRun
+  })
+
+  it('keeps the full prefix after the runtime compacts mid-run', async () => {
+    const history: ChatMessage[] = [
+      createUserHistoryMessage('user-1'),
+      createAssistantHistoryMessage('assistant-1', 'first answer'),
+      createUserHistoryMessage('user-2'),
+    ]
+
+    const service = new AgentSessionService()
+    const runPromise = service.run({
+      conversationId: 'conversation-merge-compaction',
+      loopConfig: {
+        maxAutoIterations: 100,
+      },
+      input: {
+        conversationId: 'conversation-merge-compaction',
+        messages: history,
+      } as never,
+    })
+
+    const runtime = runtimeInstances[0]
+    const compaction: ChatConversationCompactionState = [
+      {
+        anchorMessageId: 'assistant-1',
+        summary: 'summary of the earlier turns',
+        compactedAt: 1,
+      },
+    ]
+    runtime.emitSnapshot(
+      [createAssistantHistoryMessage('assistant-2', 'after compaction')],
+      compaction,
+    )
+
+    const state = service.getState('conversation-merge-compaction')
+    // 压缩只改变送给模型的上下文，可见历史前缀照旧完整保留。
+    expect(state.messages).toEqual([
+      ...history,
+      createAssistantHistoryMessage('assistant-2', 'after compaction'),
+    ])
+    expect(state.compaction).toEqual(compaction)
+
+    // 压缩之后继续流式输出，前缀仍然逐条引用相同——run 内缓存的前缀不会被
+    // 压缩事件带偏。
+    runtime.emitSnapshot(
+      [
+        createAssistantHistoryMessage(
+          'assistant-2',
+          'after compaction and more',
+          'streaming',
+        ),
+      ],
+      compaction,
+    )
+    const nextState = service.getState('conversation-merge-compaction')
+    history.forEach((message, index) => {
+      expect(nextState.messages[index]).toBe(message)
+    })
+    expect(nextState.messages).toHaveLength(history.length + 1)
+
+    runtime.resolveRun()
+    await runPromise
   })
 })

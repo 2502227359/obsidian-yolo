@@ -17,7 +17,7 @@ function sha256(bytes) {
 
 /**
  * Builds a minimal but complete runtime-components tree under `root`: the
- * 3 asset-less components plus `embedding-engine` with one declared asset,
+ * 4 asset-less components plus `embedding-engine` with one declared asset,
  * mirroring exactly what `npm run runtime:build` produces (registry.json,
  * each component.config.json, each dist/entry.js, and the asset's local
  * source file at the same path `runtimeComponentAssetSources.mjs` maps
@@ -26,7 +26,12 @@ function sha256(bytes) {
  * reads.
  */
 async function writeRuntimeComponentFixture(root) {
-  const entryBytes = { tokenizer: 't', 'pdf-engine': 'p', 'bash-engine': 'b' }
+  const entryBytes = {
+    tokenizer: 't',
+    'pdf-engine': 'p',
+    'bash-engine': 'b',
+    'claude-agent-sdk': 'c',
+  }
   const assetBytes = Buffer.from('fixture wasm bytes')
   const components = []
   for (const [id, content] of Object.entries(entryBytes)) {
@@ -146,6 +151,29 @@ test('validateModuleConfig rejects schemas the client cannot parse', () => {
   assert.throws(
     () => validateModuleConfig(config, 'learning'),
     /data schema is invalid/,
+  )
+})
+
+// Every shipped client parses the signed Feed with `parseModule`
+// (src/core/distribution/distributionFeed.ts), which throws on a module
+// declaring no data schema — and one bad module fails the whole Feed, so a
+// released module with `{}` would cost older clients update discovery
+// entirely. This gate is that contract's mirror: relaxing it publishes a
+// module the Feed cannot carry.
+test('validateModuleConfig rejects the empty schemas the signed Feed cannot carry', () => {
+  const config = {
+    id: 'whiteboard',
+    icon: 'layout-grid',
+    localizations: {
+      en: { name: 'Whiteboard', description: 'An infinite canvas.' },
+    },
+    hostApi: '^1.8.0',
+    platforms: ['desktop', 'mobile'],
+    dataSchemas: {},
+  }
+  assert.throws(
+    () => validateModuleConfig(config, 'whiteboard'),
+    /Module config is invalid/,
   )
 })
 

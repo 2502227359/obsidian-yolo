@@ -3,7 +3,10 @@ import type { App } from 'obsidian'
 import type { ChatMessage } from '../../types/chat'
 import type { ContentPart } from '../../types/llm/request'
 import type { ResponseUsage } from '../../types/llm/response'
-import type { ToolEditSummary } from '../../types/tool-call.types'
+import type {
+  ToolCallResponse,
+  ToolEditSummary,
+} from '../../types/tool-call.types'
 
 import type { CliChatMode } from './permission-profile'
 
@@ -13,7 +16,15 @@ import type { CliChatMode } from './permission-profile'
  * never drift; adding a runtime means adding one entry here (plus a
  * `CliRuntimeDescriptor` in `registry.ts` and a factory in `coordinator.ts`).
  */
-export const CLI_RUNTIME_IDS = ['claude-code', 'codex', 'hermes', 'pi'] as const
+export const CLI_RUNTIME_IDS = [
+  'claude-code',
+  'codex',
+  'hermes',
+  'pi',
+  'omp',
+  'grok',
+  'codebuddy',
+] as const
 export type CliRuntimeId = (typeof CLI_RUNTIME_IDS)[number]
 export type ChatRuntimeId = 'yolo' | CliRuntimeId
 
@@ -38,6 +49,16 @@ export type ConversationRef = YoloConversationRef | CliSessionRef
 
 export const isCliSessionRef = (ref: ConversationRef): ref is CliSessionRef =>
   ref.runtimeId !== 'yolo'
+
+/**
+ * The conversation id a CLI session's chat state is keyed under wherever a
+ * conversation id is asked for — notably its edit review snapshots, which the
+ * runtime that saw the edit writes and the chat surface showing the edit
+ * reads. Derived from the provider-native session, the one identity both
+ * sides hold.
+ */
+export const getCliSessionConversationId = (ref: CliSessionRef): string =>
+  `${ref.runtimeId}:${ref.nativeSessionId}`
 
 export type CliSessionHydration = {
   ref: CliSessionRef
@@ -183,6 +204,17 @@ export type CliRuntimeRunState =
   | 'error'
 
 /**
+ * The run states a runtime adapter is allowed to report. The waiting states are
+ * deliberately absent: the conversation controller derives them from the
+ * pending approval / question cards, so no adapter can leave the run state and
+ * the card it belongs to disagreeing.
+ */
+export type CliRuntimeReportedRunState = Exclude<
+  CliRuntimeRunState,
+  'waiting_for_approval' | 'waiting_for_user'
+>
+
+/**
  * Run states in which a CLI conversation still owns a live provider process,
  * so it must outlive its view and stay visible to background monitoring.
  */
@@ -241,7 +273,7 @@ export type CliRuntimeEvent =
     }
   | {
       type: 'run_state'
-      state: CliRuntimeRunState
+      state: CliRuntimeReportedRunState
       error?: string
     }
   | {
@@ -265,6 +297,10 @@ export type CliRuntimeEvent =
   | {
       type: 'compaction_boundary'
       boundary: Omit<CliCompactionBoundary, 'afterMessageId'>
+    }
+  | {
+      /** What `listSkills` answers changed: the agent advertised new skills. */
+      type: 'skills_changed'
     }
 
 export type CliApprovalDecision =
@@ -335,8 +371,26 @@ export type CliRuntime = {
   sendTurn(input: CliTurnInput): Promise<void>
   rewriteTurn(input: CliRewriteTurnInput): Promise<void>
   cancel(): Promise<void>
-  respondApproval(response: CliApprovalResponse): Promise<boolean>
-  respondQuestion(response: CliQuestionResponse): Promise<boolean>
+  /**
+   * Answer a pending approval / question and report **what the card becomes**.
+   *
+   * `null` means the request is no longer live (already answered, turn gone) —
+   * the caller treats it as stale. Any other value is the settled response the
+   * host publishes onto that card immediately, before the provider says
+   * anything: `Running` when the tool is about to run, `Success` for a grant
+   * with no follow-up of its own, `Rejected` when declined.
+   *
+   * That the card must stop showing its buttons the moment it is answered is a
+   * host-side fact, so the host applies it. A runtime only declares the
+   * meaning, which is the part it alone knows — it cannot forget the step,
+   * because the return value is the step.
+   */
+  respondApproval(
+    response: CliApprovalResponse,
+  ): Promise<ToolCallResponse | null>
+  respondQuestion(
+    response: CliQuestionResponse,
+  ): Promise<ToolCallResponse | null>
   subscribe(listener: CliRuntimeEventListener): () => void
   dispose(): Promise<void>
 }

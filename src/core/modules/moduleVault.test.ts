@@ -15,6 +15,7 @@ import { ModuleLifecycleScope } from './lifecycleScope'
 import {
   ObsidianModuleVaultCapabilityProvider,
   UNAVAILABLE_MODULE_VAULT_CAPABILITY_PROVIDER,
+  describeEntry,
   normalizeModuleVaultPath,
 } from './moduleVault'
 
@@ -89,6 +90,7 @@ function createApp(entries: Array<TFile | TFolder>) {
       }),
       read: jest.fn(async (path: string) => `content:${path}`),
       readBinary: jest.fn(async () => binary),
+      getResourcePath: jest.fn((path: string) => `app://vault/${path}?1`),
       remove: jest.fn(async (path: string) => void byPath.delete(path)),
       rmdir: jest.fn(async (path: string) => void byPath.delete(path)),
     },
@@ -97,8 +99,28 @@ function createApp(entries: Array<TFile | TFolder>) {
       refs.delete(ref)
     }),
   }
+  const fileManager = {
+    generateMarkdownLink: jest.fn(
+      (file: TFile, sourcePath: string, subpath?: string, alias?: string) =>
+        `[[${file.path}${subpath ?? ''}|${alias ?? `from ${sourcePath}`}]]`,
+    ),
+    getAvailablePathForAttachment: jest.fn(
+      async (fileName: string, sourcePath: string) =>
+        `${sourcePath.split('/').slice(0, -1).join('/')}/attachments/${fileName}`,
+    ),
+    // "Same folder as current file"; Obsidian's root folder is '/'.
+    getNewFileParent: jest.fn((sourcePath: string) => {
+      const parent = sourcePath.split('/').slice(0, -1).join('/')
+      return Object.assign(createFolder(parent || '/', []), {
+        isRoot: () => !parent,
+      })
+    }),
+  }
+  const workspace = {
+    getActiveFile: jest.fn((): TFile | null => null),
+  }
   return {
-    app: { vault } as unknown as App,
+    app: { vault, fileManager, workspace } as unknown as App,
     binary,
     emit: (event: string, ...args: unknown[]) => {
       for (const ref of [...refs]) {
@@ -108,6 +130,7 @@ function createApp(entries: Array<TFile | TFolder>) {
     refs,
     registerRef,
     vault,
+    workspace,
   }
 }
 
@@ -134,11 +157,22 @@ describe('normalizeModuleVaultPath', () => {
   })
 })
 
+describe('describeEntry', () => {
+  it("reports Obsidian's root folder as the Host API root path ''", () => {
+    // Root paths handed to modules must round-trip back into the vault API,
+    // which rejects '/' as non vault-relative.
+    const root = createFolder('/', [])
+    const described = describeEntry(root)
+    expect(described.path).toBe('')
+    expect(() => normalizeModuleVaultPath(described.path, true)).not.toThrow()
+  })
+})
+
 describe('ObsidianModuleVaultCapabilityProvider', () => {
   it('returns immutable entry DTOs and copied file content', async () => {
     const file = createFile('notes/card.md', 10, 20)
     const folder = createFolder('notes', [file])
-    const { app, binary, vault } = createApp([folder, file])
+    const { app, binary, vault, workspace } = createApp([folder, file])
     const lifecycle = new ModuleLifecycleScope()
     const capability = new ObsidianModuleVaultCapabilityProvider(app).create(
       'notes',
@@ -178,6 +212,49 @@ describe('ObsidianModuleVaultCapabilityProvider', () => {
       capability.api.readBinary('unindexed/secret.json'),
     ).rejects.toThrow('file not found')
     expect(vault.adapter.exists).toHaveBeenCalled()
+
+    // Media/link cards point an <img>/<audio>/<video> at this, so it must be
+    // the same app:// URL Obsidian's own embeds use — and it must apply the
+    // same path validation as every other vault call.
+    expect(capability.api.getResourceUrl('notes\\card.md')).toBe(
+      'app://vault/notes/card.md?1',
+    )
+    expect(() => capability.api.getResourceUrl('../escape.png')).toThrow(
+      'dot segments',
+    )
+
+    // Links are Obsidian's own, written for the given source; a path that is
+    // no file has no link, and a subpath is only ever a `#` fragment.
+    expect(
+      capability.api.generateLink('notes/card.md', 'boards/b.yoloboard', '#x'),
+    ).toBe('[[notes/card.md#x|from boards/b.yoloboard]]')
+    expect(
+      capability.api.generateLink('notes/card.md', '', '#page=2', 'card, p.2'),
+    ).toBe('[[notes/card.md#page=2|card, p.2]]')
+    expect(capability.api.generateLink('notes/missing.md', '')).toBeNull()
+
+    // An attachment's place is the user's attachment setting, asked of
+    // Obsidian for the document it belongs to; only a bare file name is one.
+    await expect(
+      capability.api.getAvailableAttachmentPath('x.png', 'boards/b.yoloboard'),
+    ).resolves.toBe('boards/attachments/x.png')
+    await expect(
+      capability.api.getAvailableAttachmentPath(
+        '../x.png',
+        'boards/b.yoloboard',
+      ),
+    ).rejects.toThrow('must be a file name')
+
+    // A new file's place is the user's new-note setting, asked of Obsidian
+    // for the active file; Obsidian's root folder comes back as ''.
+    expect(capability.api.getNewFileParent()).toBe('')
+    workspace.getActiveFile.mockReturnValueOnce(file)
+    expect(capability.api.getNewFileParent()).toBe('notes')
+
+    expect(() =>
+      capability.api.generateLink('notes/card.md', '', 'page=1'),
+    ).toThrow('must start with "#"')
+
     lifecycle.dispose()
     expect(() => capability.api.getEntry('notes')).toThrow('not active')
     await expect(capability.api.exists('notes')).rejects.toThrow('not active')

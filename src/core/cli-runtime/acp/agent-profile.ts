@@ -1,4 +1,9 @@
-import type { CliRuntimeId } from '../types'
+import type {
+  AvailableCommand,
+  InitializeResponse,
+} from '@agentclientprotocol/sdk'
+
+import type { CliPermissionProfileUpdate, CliRuntimeId } from '../types'
 
 export type AcpResolvedCommand = Readonly<{
   command: string
@@ -27,6 +32,11 @@ export type AcpAgentProfile = Readonly<{
     cliPathOverride?: string,
   ): Promise<AcpResolvedCommand | null>
   /**
+   * Optional authentication policy applied after ACP initialization and
+   * before the host exposes a usable connection.
+   */
+  selectAuthMethod?(init: InitializeResponse): string | undefined
+  /**
    * Slash command text this agent understands as a manual-compaction
    * trigger (e.g. Hermes's `/compress`), sent as an ordinary
    * `session/prompt`. `AcpCliRuntime` has no ACP-level compaction call to
@@ -34,4 +44,41 @@ export type AcpAgentProfile = Readonly<{
    * expose one leave it `undefined` and `compact()` throws.
    */
   compactCommand?: string
+  /**
+   * Translates the product's permission profile (Agent/Plan + YOLO) into one
+   * of the session mode ids this agent advertises in its `session/new` /
+   * `session/load` response, which `AcpCliRuntime` then applies with
+   * `session/set_mode`.
+   *
+   * ACP deliberately leaves mode ids up to each agent — the protocol carries
+   * an id, a name and a description, but no machine-readable semantics — so
+   * the mapping cannot be derived and has to be declared per agent here.
+   * Agents that advertise no modes (or no mode matching a given profile)
+   * leave this undefined / return `null`, and their own default policy
+   * stands.
+   */
+  resolveSessionModeId?(update: CliPermissionProfileUpdate): string | null
+  /**
+   * The value id this agent's `thought_level` config option uses for "decide
+   * for me", which is what the product's `auto` reasoning level means.
+   *
+   * ACP defines the `thought_level` *category* but leaves its value ids to
+   * each agent (CodeBuddy uses `enabled`, alongside explicit `low`/`high`/…
+   * levels), and no field in the option marks which one is the agent's own
+   * default. So, exactly like `resolveSessionModeId` above, this cannot be
+   * derived and has to be declared. Agents that leave it undefined keep
+   * `auto` as a no-op: the picker still shows the explicit levels, and
+   * selecting `auto` leaves the agent on whatever it last had.
+   */
+  autoThoughtLevelValueId?: string
+  /**
+   * Which of the commands this agent advertises (`available_commands_update`)
+   * are skills, offered in the skills picker and sent as `/name` prompt text.
+   *
+   * ACP's command list mixes skills with the agent's own terminal commands
+   * (login, keybindings, status line…), which mean nothing in a chat pane,
+   * and has no field telling them apart. Agents that leave this undefined
+   * offer no skills.
+   */
+  isSkillCommand?(command: AvailableCommand): boolean
 }>

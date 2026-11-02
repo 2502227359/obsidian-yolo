@@ -83,7 +83,9 @@ describe('ChatGPTOAuthResponsesAdapter', () => {
     expect(request.instructions).toBe('You are helpful.')
   })
 
-  it('maps hosted web search tools to responses web search preview tools', () => {
+  // The Codex backend rejects `web_search_preview`, so the hosted tool type the
+  // transport injected is forwarded untouched.
+  it('forwards hosted web search tools under the requested type', () => {
     const request = adapter.buildRequest({
       model: 'gpt-5.4',
       stream: false,
@@ -96,7 +98,7 @@ describe('ChatGPTOAuthResponsesAdapter', () => {
       ],
     })
 
-    expect(request.tools).toEqual([{ type: 'web_search_preview' }])
+    expect(request.tools).toEqual([{ type: 'web_search' }])
   })
 
   it('keeps standard Responses sampling and output limit fields by default', () => {
@@ -194,6 +196,15 @@ describe('ChatGPTOAuthResponsesAdapter', () => {
 
       expect(request).not.toHaveProperty('reasoning')
       expect(request).not.toHaveProperty('include')
+    })
+
+    it('asks for encrypted reasoning when the model reasons at auto', () => {
+      const request = adapter.buildRequest(
+        minimalRequest({ reasoningLevel: 'auto' }),
+      )
+
+      expect(request).not.toHaveProperty('reasoning')
+      expect(request.include).toEqual(['reasoning.encrypted_content'])
     })
 
     it('sets include when reasoning_effort shorthand is "none"', () => {
@@ -714,5 +725,118 @@ describe('ChatGPTOAuthResponsesAdapter — DeepSeek Responses semantics', () => 
       ),
     ]
     expect(chunks[0].choices[0].delta.reasoning).toBe('let me search')
+  })
+})
+
+describe('ChatGPTOAuthResponsesAdapter — reasoning replay', () => {
+  const adapter = new ChatGPTOAuthResponsesAdapter()
+  const reasoning = {
+    id: 'rs_1',
+    type: 'reasoning',
+    summary: [],
+    encrypted_content: 'enc',
+  }
+  const functionCall = {
+    id: 'fc_1',
+    type: 'function_call',
+    call_id: 'call_1',
+    name: 'read',
+    arguments: '{"path":"a.md"}',
+    status: 'completed',
+  }
+  const responseWith = (output: unknown[]) =>
+    ({
+      id: 'resp_1',
+      created_at: 1,
+      model: 'gpt-test',
+      status: 'completed',
+      output,
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    }) as unknown as Response
+
+  it('keeps the output of a reply that reasoned', () => {
+    expect(
+      adapter.parseResponse(responseWith([reasoning, functionCall])).choices[0]
+        .message.providerMetadata,
+    ).toEqual({ openaiResponses: { output: [reasoning, functionCall] } })
+  })
+
+  it('keeps nothing when a reasoning item carries no reasoning', () => {
+    const bare = { id: 'rs_1', type: 'reasoning', summary: [] }
+    expect(
+      adapter.parseResponse(responseWith([bare, functionCall])).choices[0]
+        .message.providerMetadata,
+    ).toBeUndefined()
+  })
+
+  // The Codex endpoint ends with an empty `output`; the finished items only
+  // arrive as `output_item.done`.
+  it('keeps the streamed items when the terminal output is empty', () => {
+    const state = adapter.createStreamState()
+    const events = [
+      { type: 'response.output_item.done', output_index: 0, item: reasoning },
+      {
+        type: 'response.output_item.done',
+        output_index: 1,
+        item: functionCall,
+      },
+      { type: 'response.completed', response: responseWith([]) },
+    ] as unknown as ResponseStreamEvent[]
+    const chunks = events.flatMap((event) => [
+      ...adapter.parseStreamEvent(event, state),
+    ])
+    expect(chunks.at(-1)?.choices[0].delta.providerMetadata).toEqual({
+      openaiResponses: { output: [reasoning, functionCall] },
+    })
+  })
+
+  it('sends the output back as input items', () => {
+    const request = adapter.buildRequest({
+      model: 'gpt-test',
+      messages: [
+        { role: 'user', content: 'read it' },
+        {
+          role: 'assistant',
+          content: '',
+          providerMetadata: {
+            openaiResponses: { output: [reasoning, functionCall] },
+          },
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'read',
+              arguments: '{"path":"a.md"}',
+            } as never,
+          ],
+        },
+        {
+          role: 'tool',
+          tool_call: { id: 'call_1', name: 'read' } as never,
+          content: 'text',
+        },
+      ],
+    })
+    expect(request.input).toEqual([
+      { role: 'user', content: 'read it', type: 'message' },
+      reasoning,
+      functionCall,
+      { type: 'function_call_output', call_id: 'call_1', output: 'text' },
+    ])
+  })
+
+  it('leaves out a function call the request no longer answers', () => {
+    const request = adapter.buildRequest({
+      model: 'gpt-test',
+      messages: [
+        {
+          role: 'assistant',
+          content: '',
+          providerMetadata: {
+            openaiResponses: { output: [reasoning, functionCall] },
+          },
+        },
+      ],
+    })
+    expect(request.input).toEqual([reasoning])
   })
 })

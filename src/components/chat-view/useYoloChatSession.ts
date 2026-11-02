@@ -14,6 +14,8 @@ import { v4 as uuidv4 } from 'uuid'
 import { useLanguage } from '../../contexts/language-context'
 import { usePlugin } from '../../contexts/plugin-context'
 import { useSettings } from '../../contexts/settings-context'
+import type { ChatMode } from '../../core/agent/chat-mode'
+import { isModuleChatMode } from '../../core/agent/chat-mode'
 import { DEFAULT_ASSISTANT_ID } from '../../core/agent/default-assistant'
 import type { AgentConversationRunSummary } from '../../core/agent/service'
 import {
@@ -46,12 +48,12 @@ import {
 } from '../../utils/chat/selection-mentionables'
 
 import {
-  type ChatMode,
   chatModeForSave,
-  isModuleChatMode,
   normalizePersistedChatMode,
   normalizeYoloEnabled,
+  readYoloPreference,
   resolveEffectiveChatMode,
+  yoloPreferencePatch,
 } from './chat-input/ChatModeSelect'
 import { editorStateToPlainText } from './chat-input/utils/editor-state-to-plain-text'
 import type { ChatSessionController } from './ChatSessionController'
@@ -93,7 +95,7 @@ export const serializeActiveBranchByUserMessageId = (
 
 export type UseYoloChatSessionParams = {
   /**
-   * 消息态八件套的唯一 owner——见架构治理第三步分期 C1。历史消息编辑/删除/
+   * 消息态八件套的唯一 owner。历史消息编辑/删除/
    * 分支命令直接调用其命令 API；`loadYoloConversation`/`handleNewChat`
    * 仍经下方各 setX props 写入（同一批函数，指向 controller 方法）。
    */
@@ -464,7 +466,7 @@ export function useYoloChatSession({
         const effectiveOverrides = {
           ...(conversationOverrides ?? {}),
           chatMode: chatModeForSave(persistedChatMode),
-          agentYoloEnabled: yoloEnabled,
+          ...yoloPreferencePatch(persistedChatMode, yoloEnabled),
         }
         await createOrUpdateConversation(
           currentConversationId,
@@ -511,7 +513,7 @@ export function useYoloChatSession({
    * 分支切换只改这一项元数据，因此只写这一项。
    *
    * 附带写一份 UI 手里的 messages 是数据覆盖风险：生成期间正文走 assistant
-   * render stream，UI 快照可能落后整个生成阶段，而这条写入与 AgentService 的
+   * render stream，UI 快照可能落后整个生成阶段，而这条写入与 AgentSessionService 的
    * 最终持久化不共享同一条串行链——它若后落地，数据库就会留下被截断的正文。
    */
   const persistActiveBranchSelection = useCallback(async () => {
@@ -540,7 +542,7 @@ export function useYoloChatSession({
         const effectiveOverrides = {
           ...(conversationOverrides ?? {}),
           chatMode: chatModeForSave(persistedChatMode),
-          agentYoloEnabled: yoloEnabled,
+          ...yoloPreferencePatch(persistedChatMode, yoloEnabled),
         }
         await createOrUpdateConversationImmediately(
           currentConversationId,
@@ -605,7 +607,7 @@ export function useYoloChatSession({
     [],
   )
 
-  // 消息态写入已收编进 ChatSessionController（架构治理第三步分期 C1）——
+  // 消息态写入已收编进 ChatSessionController——
   // 本函数只做 Notice/焦点/高亮释放等 UI 反应，翻译 controller 命令的
   // 类型化返回结果。
   const removeHistoricalUserMessage = useCallback(
@@ -727,10 +729,13 @@ export function useYoloChatSession({
           loadedPersistedChatMode,
           moduleChatModeSnapshot,
         )
+        // Read the trust profile belonging to the mode this conversation was
+        // saved in, not whichever one happens to be current.
         const loadedYoloEnabled = normalizeYoloEnabled(
           conversation.overrides?.chatMode,
-          conversation.overrides?.agentYoloEnabled,
-          settings.chatOptions.agentYoloEnabled ?? false,
+          readYoloPreference(conversation.overrides, loadedPersistedChatMode),
+          readYoloPreference(settings.chatOptions, loadedPersistedChatMode) ??
+            false,
         )
         const modelFromRef =
           conversation.conversationModelId ??
@@ -903,77 +908,85 @@ export function useYoloChatSession({
           ref,
           isCurrent: isCurrentNavigation,
         })
-        if (!result || !result.hydration) return
-        const modePreference = resolveCliModePreference(
-          settings,
-          ref.runtimeId,
-          overrides,
-        )
-        await prepareCliConversation({
-          controller: result.controller,
-          scope: cliRuntimeScope,
-          runtimeId: ref.runtimeId,
-          settings,
-          permissionProfile: modePreference,
-        })
-        if (!isCurrentNavigation()) return
-        lastCliRuntimeIdRef.current = ref.runtimeId
-        activeRuntimeIdRef.current = ref.runtimeId
-        setRequestedRuntimeId(ref.runtimeId)
-        persistChatRuntimePreference(ref.runtimeId)
-        setCliConversationController(result.controller)
-        setCliConversationId(conversationId)
-        // A historical CLI session's own `ChatConversationCliSession` is
-        // authoritative on which Hermes profile it lives under; no record
-        // means the default profile (see `ChatConversationCliSession.profileId`).
-        // Unless a fallback occurred — in the `openCliSessionForNavigation()`
-        // peek above or in `prepareCliConversation()`'s own `ensureReady()`
-        // load — because the stored profile no longer resolves (see
-        // `AcpCliRuntimeOptions.sessionRecovery`). Either way the *fallback*
-        // session is what's actually live, so both the header and
-        // conversation storage must reflect it instead of the now-dead
-        // requested profile — this reads the controller's settled snapshot,
-        // not just the first load's hydration, to catch a fallback from
-        // either load (see `resolveHermesSessionFallbackUpdate`).
-        const fallbackUpdate = resolveHermesSessionFallbackUpdate(
-          ref.runtimeId,
-          result.controller.getSnapshot(),
-        )
-        setHermesProfileId(
-          fallbackUpdate
-            ? fallbackUpdate.hermesProfileId
-            : ref.runtimeId === 'hermes'
-              ? ref.profileId
-              : undefined,
-        )
-        const restoredOverrides = overrides ?? null
-        setConversationOverrides(restoredOverrides)
-        conversationOverridesRef.current.set(conversationId, restoredOverrides)
-        setCliChatMode(modePreference.mode)
-        setCliYoloEnabled(modePreference.yoloEnabled)
-        prunePrePlanCliMode(
-          prePlanCliModeByConversationRef,
-          conversationId,
-          ref.runtimeId,
-          modePreference.mode,
-        )
-        if (fallbackUpdate) {
-          void createOrTouchCliConversation(
+        if (!result) return
+        try {
+          const modePreference = resolveCliModePreference(
+            settings,
+            ref.runtimeId,
+            overrides,
+          )
+          await prepareCliConversation({
+            controller: result.controller,
+            scope: cliRuntimeScope,
+            runtimeId: ref.runtimeId,
+            settings,
+            permissionProfile: modePreference,
+          })
+          if (!isCurrentNavigation()) return
+          result.commit()
+          lastCliRuntimeIdRef.current = ref.runtimeId
+          activeRuntimeIdRef.current = ref.runtimeId
+          setRequestedRuntimeId(ref.runtimeId)
+          persistChatRuntimePreference(ref.runtimeId)
+          setCliConversationController(result.controller)
+          setCliConversationId(conversationId)
+          // A historical CLI session's own `ChatConversationCliSession` is
+          // authoritative on which Hermes profile it lives under; no record
+          // means the default profile (see `ChatConversationCliSession.profileId`).
+          // Unless a fallback occurred — in the `openCliSessionForNavigation()`
+          // peek above or in `prepareCliConversation()`'s own `ensureReady()`
+          // load — because the stored profile no longer resolves (see
+          // `AcpCliRuntimeOptions.sessionRecovery`). Either way the *fallback*
+          // session is what's actually live, so both the header and
+          // conversation storage must reflect it instead of the now-dead
+          // requested profile — this reads the controller's settled snapshot,
+          // not just the first load's hydration, to catch a fallback from
+          // either load (see `resolveHermesSessionFallbackUpdate`).
+          const fallbackUpdate = resolveHermesSessionFallbackUpdate(
+            ref.runtimeId,
+            result.controller.getSnapshot(),
+          )
+          setHermesProfileId(
+            fallbackUpdate
+              ? fallbackUpdate.hermesProfileId
+              : ref.runtimeId === 'hermes'
+                ? ref.profileId
+                : undefined,
+          )
+          const restoredOverrides = overrides ?? null
+          setConversationOverrides(restoredOverrides)
+          conversationOverridesRef.current.set(
             conversationId,
-            fallbackUpdate.cliSession,
             restoredOverrides,
-          ).catch((error: unknown) => {
-            console.error(
-              '[YOLO] Failed to persist Hermes fallback session',
-              error,
-            )
-          })
-        }
-        if (result.overlayError) {
-          console.warn('[YOLO] Failed to restore CLI conversation metadata', {
+          )
+          setCliChatMode(modePreference.mode)
+          setCliYoloEnabled(modePreference.yoloEnabled)
+          prunePrePlanCliMode(
+            prePlanCliModeByConversationRef,
             conversationId,
-            error: result.overlayError.message,
-          })
+            ref.runtimeId,
+            modePreference.mode,
+          )
+          if (fallbackUpdate) {
+            void createOrTouchCliConversation(
+              conversationId,
+              fallbackUpdate.cliSession,
+              restoredOverrides,
+            ).catch((error: unknown) => {
+              console.error(
+                '[YOLO] Failed to persist Hermes fallback session',
+                error,
+              )
+            })
+          }
+          if (result.overlayError) {
+            console.warn('[YOLO] Failed to restore CLI conversation metadata', {
+              conversationId,
+              error: result.overlayError.message,
+            })
+          }
+        } finally {
+          result.release()
         }
       }
 
@@ -1259,9 +1272,9 @@ export function useYoloChatSession({
     ],
   )
 
-  // 消息态/偏好切换/AgentService 注册/持久化全部收编进
+  // 消息态/偏好切换/AgentSessionService 注册/持久化全部收编进
   // ChatSessionController.branchFromAssistantGroup（含分支缺口修复：分支的
-  // 消息现在会注册进 AgentService 内存态,不再只写 React state + 磁盘）。
+  // 消息现在会注册进 AgentSessionService 内存态,不再只写 React state + 磁盘）。
   // 本函数只解析 policy（settings / module 注册表 / i18n 都不下放进
   // controller）并翻译结果为 UI 反应。
   const handleAssistantMessageGroupBranch = useCallback(
@@ -1288,7 +1301,7 @@ export function useYoloChatSession({
       )
       const nextYoloEnabled = normalizeYoloEnabled(
         nextOverrides?.chatMode,
-        nextOverrides?.agentYoloEnabled,
+        readYoloPreference(nextOverrides, nextPersistedChatMode),
         yoloEnabled,
       )
       const resolvedConversationModelId =
@@ -1384,8 +1397,9 @@ export function useYoloChatSession({
     }
   }, [agentService, currentConversationId])
 
-  // When the user aborts a run, restore the most recently queued message into
-  // the input box so its content is not silently lost. If multiple messages
+  // When queued messages are dropped (the user aborts, or the run ends on a
+  // tool call awaiting the user), restore the most recently queued message
+  // into the input box so its content is not silently lost. If multiple messages
   // were queued, only the latest is restored (it best reflects the user's
   // current intent); a notice surfaces the count of dropped earlier entries.
   useEffect(() => {
@@ -1446,7 +1460,7 @@ export function useYoloChatSession({
       (conversationId) => {
         if (conversationId !== currentConversationId) return
         if (agentService.isRunning(conversationId)) return
-        // Pull the latest messages directly from AgentService — the React
+        // Pull the latest messages directly from AgentSessionService — the React
         // closure's `chatMessages` is stale at this point because the result
         // was just appended synchronously and React hasn't re-rendered yet.
         const latestMessages = agentService.getState(conversationId).messages

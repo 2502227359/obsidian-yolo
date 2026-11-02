@@ -1,9 +1,10 @@
 import type { RequestUrlParam, RequestUrlResponse } from 'obsidian'
 import { requestUrl } from 'obsidian'
 
+import { sha256Hex } from '../../utils/crypto/sha256'
 import type { ConfirmedModuleCandidate } from '../modules/moduleInstallationCoordinator'
 import type { ModuleService } from '../modules/moduleService'
-import type { ModuleRecord } from '../modules/types'
+import type { ModuleCatalogEntry, ModuleRecord } from '../modules/types'
 
 import {
   type ReleaseNotesByLanguage,
@@ -26,11 +27,25 @@ export type ModuleUpdateOffer = Readonly<{
   name: string
   currentVersion: string
   latestVersion: string
+  /**
+   * Needs the Host API of the pending core update, so it cannot be installed
+   * from here: it is shown beside that core update, and installed by
+   * `installAll` once the new core is running.
+   */
+  awaitingCoreUpdate: boolean
   releaseNotes: ReleaseNotesByLanguage | null
   notesUnavailable: boolean
   status: ModuleUpdateStatus
   progress: number
   error?: string
+}>
+
+export type InstalledModuleUpdate = Readonly<{
+  moduleId: string
+  name: string
+  version: string
+  /** Where the installed version's release notes are, read on demand. */
+  releaseNotes?: ModuleCatalogEntry['releaseNotes']
 }>
 
 type ModuleUpdateRequest = (
@@ -55,6 +70,8 @@ export class ModuleUpdateController {
     string,
     ReturnType<typeof setTimeout>
   >()
+  /** Pending `waitForSettledModules` calls, released on disposal. */
+  private readonly settleWaiters = new Set<() => void>()
   private disposed = false
 
   constructor(private readonly options: ModuleUpdateControllerOptions) {}
@@ -68,6 +85,7 @@ export class ModuleUpdateController {
   }
 
   async refresh(): Promise<void> {
+    await this.waitForSettledModules()
     if (this.disposed) return
     const previous = new Map(this.offers.map((offer) => [offer.key, offer]))
     const muted = this.options.getMutedVersions()
@@ -75,8 +93,8 @@ export class ModuleUpdateController {
     this.candidates.clear()
 
     for (const module of this.options.service.getSnapshot().modules) {
-      if (!isPromptableUpdate(module)) continue
-      const latestVersion = module.catalog!.version
+      const latestVersion = offeredVersion(module)
+      if (latestVersion === null) continue
       const key = offerKey(module.id, latestVersion)
       if (
         this.dismissedForSession.has(key) ||
@@ -84,9 +102,12 @@ export class ModuleUpdateController {
       ) {
         continue
       }
-      const candidate = this.options.service.getInstallCandidate(module.id)
-      if (!candidate || candidate.expectedVersion !== latestVersion) continue
-      this.candidates.set(key, candidate)
+      const awaitingCoreUpdate = !isPromptableUpdate(module)
+      if (!awaitingCoreUpdate) {
+        const candidate = this.options.service.getInstallCandidate(module.id)
+        if (!candidate || candidate.expectedVersion !== latestVersion) continue
+        this.candidates.set(key, candidate)
+      }
       const current = previous.get(key)
       next.push(
         current ??
@@ -97,6 +118,7 @@ export class ModuleUpdateController {
             name: module.name,
             currentVersion: module.installed!.version,
             latestVersion,
+            awaitingCoreUpdate,
             releaseNotes: null,
             notesUnavailable: false,
             status: 'available',
@@ -109,8 +131,83 @@ export class ModuleUpdateController {
     await Promise.allSettled(next.map((offer) => this.loadNotes(offer.key)))
     if (this.options.getAutoDownloadEnabled()) {
       for (const offer of this.offers) {
-        if (offer.status === 'available') void this.prepare(offer.key)
+        if (offer.status === 'available' && !offer.awaitingCoreUpdate) {
+          void this.prepare(offer.key)
+        }
       }
+    }
+  }
+
+  /**
+   * Installs every module update the toast would offer, without offering it.
+   *
+   * Automatic updating runs on it, and so does the follow-up to a core update:
+   * a coordinated release ships its modules' updates beside the core's, and a
+   * module that needs the new Host API only becomes installable once the new
+   * core is running. The user's one click on the core update is the consent
+   * for these, so nothing is shown before. A module skipped with "don't remind
+   * me" stays skipped unless `skipMuted` is off, which automatic updating
+   * turns off: it never asks, so there is nothing to skip. A failure leaves
+   * that module to the ordinary toast on the next `refresh`.
+   */
+  async installAll(
+    options: Readonly<{ skipMuted: boolean }>,
+  ): Promise<readonly InstalledModuleUpdate[]> {
+    await this.waitForSettledModules()
+    if (this.disposed) return []
+    const muted = options.skipMuted ? this.options.getMutedVersions() : {}
+    const installed: InstalledModuleUpdate[] = []
+    for (const module of this.options.service.getSnapshot().modules) {
+      if (!isPromptableUpdate(module)) continue
+      const latestVersion = module.catalog!.version
+      if (muted[module.id] === latestVersion) continue
+      const candidate = this.options.service.getInstallCandidate(module.id)
+      if (!candidate || candidate.expectedVersion !== latestVersion) continue
+      try {
+        await this.options.service.install(candidate)
+      } catch (error) {
+        console.error(
+          `[YOLO] Following the core update failed for module "${module.id}"`,
+          error,
+        )
+        continue
+      }
+      installed.push(
+        Object.freeze({
+          moduleId: module.id,
+          name: module.name,
+          version: latestVersion,
+          ...(module.catalog!.releaseNotes
+            ? { releaseNotes: module.catalog!.releaseNotes }
+            : {}),
+        }),
+      )
+    }
+    return installed
+  }
+
+  /** The release notes of a version `installAll` installed, or null. */
+  async loadInstalledNotes(
+    update: InstalledModuleUpdate,
+  ): Promise<ReleaseNotesByLanguage | null> {
+    if (!update.releaseNotes) return null
+    try {
+      return await fetchModuleReleaseNotes({
+        descriptor: update.releaseNotes,
+        version: update.version,
+        request: this.options.request ?? requestUrl,
+        subtleCrypto: this.options.subtleCrypto,
+      })
+    } catch {
+      return null
+    }
+  }
+
+  /** Installs the offers that can be installed now, one after another. */
+  async updateAll(): Promise<void> {
+    for (const offer of this.offers) {
+      if (offer.awaitingCoreUpdate || offer.status === 'success') continue
+      await this.update(offer.key)
     }
   }
 
@@ -127,6 +224,7 @@ export class ModuleUpdateController {
 
   async update(key: string): Promise<void> {
     let offer = this.find(key)
+    if (offer.awaitingCoreUpdate) return
     if (offer.status !== 'ready') {
       await this.prepare(key)
       offer = this.find(key)
@@ -147,11 +245,38 @@ export class ModuleUpdateController {
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    for (const settle of [...this.settleWaiters]) settle()
     for (const timer of this.successTimers.values()) clearTimeout(timer)
     this.successTimers.clear()
     this.listeners.clear()
     this.candidates.clear()
     this.offers = Object.freeze([])
+  }
+
+  /**
+   * Resolves once the module snapshot is no longer loading. Startup runs
+   * several module refreshes concurrently, and while one is loading no module
+   * has an install candidate, so reading the snapshot then would silently drop
+   * every update until the next launch. Only the latest refresh publishes a
+   * settled status, so a settled snapshot is a complete one.
+   */
+  private waitForSettledModules(): Promise<void> {
+    const { service } = this.options
+    if (this.disposed || service.getSnapshot().status !== 'loading') {
+      return Promise.resolve()
+    }
+    return new Promise((resolve) => {
+      const settle = () => {
+        if (!this.disposed && service.getSnapshot().status === 'loading') {
+          return
+        }
+        unsubscribe()
+        this.settleWaiters.delete(settle)
+        resolve()
+      }
+      const unsubscribe = service.subscribe(settle)
+      this.settleWaiters.add(settle)
+    })
   }
 
   private async prepare(key: string): Promise<void> {
@@ -181,7 +306,9 @@ export class ModuleUpdateController {
     const module = this.options.service
       .getSnapshot()
       .modules.find((value) => value.id === offer.moduleId)
-    const descriptor = module?.catalog?.releaseNotes
+    const descriptor = offer.awaitingCoreUpdate
+      ? module?.catalog?.awaitingCoreUpdate?.releaseNotes
+      : module?.catalog?.releaseNotes
     if (!descriptor) {
       this.patch(key, { notesUnavailable: true })
       return
@@ -258,11 +385,9 @@ export async function fetchModuleReleaseNotes({
   if (bytes.byteLength !== descriptor.byteSize) {
     throw new Error('Module release note byte size mismatch')
   }
-  const digest = await subtleCrypto.digest('SHA-256', bytes)
-  const hex = [...new Uint8Array(digest)]
-    .map((value) => value.toString(16).padStart(2, '0'))
-    .join('')
-  if (hex !== descriptor.sha256.toLowerCase()) {
+  if (
+    (await sha256Hex(bytes, subtleCrypto)) !== descriptor.sha256.toLowerCase()
+  ) {
     throw new Error('Module release note SHA-256 mismatch')
   }
   const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes).trim()
@@ -283,6 +408,15 @@ function isPromptableUpdate(module: ModuleRecord): boolean {
       module.installed &&
       module.catalog,
   )
+}
+
+/** The version a module's update offer is for, or null when it has none. */
+function offeredVersion(module: ModuleRecord): string | null {
+  if (isPromptableUpdate(module)) return module.catalog!.version
+  const awaiting = module.catalog?.awaitingCoreUpdate
+  return awaiting && module.enabled === true && module.installed
+    ? awaiting.version
+    : null
 }
 
 function offerKey(moduleId: string, version: string): string {

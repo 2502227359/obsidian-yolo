@@ -1,4 +1,7 @@
-import { applyAnthropicPromptCache } from './anthropicPromptCache'
+import {
+  applyAnthropicPromptCache,
+  isPromptCachingEnabled,
+} from './anthropicPromptCache'
 
 type Payload = Parameters<typeof applyAnthropicPromptCache>[0] & {
   system?: unknown
@@ -148,5 +151,38 @@ describe('applyAnthropicPromptCache', () => {
     const snapshot = JSON.parse(JSON.stringify(input))
     applyAnthropicPromptCache(input)
     expect(input).toEqual(snapshot)
+  })
+})
+
+describe('isPromptCachingEnabled', () => {
+  it('is enabled when the setting is unset', () => {
+    expect(isPromptCachingEnabled(undefined)).toBe(true)
+    expect(isPromptCachingEnabled({})).toBe(true)
+  })
+
+  it('is disabled only when explicitly set to false', () => {
+    expect(isPromptCachingEnabled({ promptCaching: false })).toBe(false)
+    expect(isPromptCachingEnabled({ promptCaching: true })).toBe(true)
+  })
+})
+
+describe('applyAnthropicPromptCache on a replayed reply', () => {
+  it('puts the breakpoint on the last block that is not thinking', () => {
+    const payload = applyAnthropicPromptCache({
+      messages: [
+        { role: 'user', content: 'hi' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'partial' },
+            { type: 'thinking', thinking: 'cut off', signature: 'sig' },
+          ],
+        },
+      ],
+    })
+    expect(payload.messages[1].content).toEqual([
+      { type: 'text', text: 'partial', cache_control: { type: 'ephemeral' } },
+      { type: 'thinking', thinking: 'cut off', signature: 'sig' },
+    ])
   })
 })

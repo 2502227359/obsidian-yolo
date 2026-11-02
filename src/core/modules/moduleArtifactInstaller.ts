@@ -1,5 +1,7 @@
 import { type DataAdapter, normalizePath } from 'obsidian'
 
+import { runSerialByKey } from '../../utils/async/serialQueue'
+
 import {
   type ModuleArtifactDescriptor,
   collectInstallableModuleFiles,
@@ -15,11 +17,11 @@ import {
   type ModuleStore,
   assertModuleId,
   assertModulePathSegment,
-  isModuleHostApiRange,
   normalizeModuleArtifactFilePath,
   parseModuleArtifactManifest,
   selectModuleManifestVariant,
 } from './moduleStore'
+import { isModuleHostApiRange } from './officialModuleCatalog'
 
 export type ModuleArtifactDownloadRequest = Readonly<{
   kind: 'manifest' | 'artifact'
@@ -45,28 +47,22 @@ export type ModuleArtifactInstallerOptions = {
 
 export type ModuleArtifactProgressListener = (progress: number) => void
 
-const adapterQueues = new WeakMap<object, Map<string, Promise<void>>>()
 let transactionSequence = 0
 
 /** Downloads and promotes an immutable module version without activating it. */
 export class ModuleArtifactInstaller {
-  constructor(private readonly options: ModuleArtifactInstallerOptions) {
-    if (!options || typeof options.download !== 'function') {
-      throw new Error('Module artifact installer options are invalid')
-    }
-  }
+  constructor(private readonly options: ModuleArtifactInstallerOptions) {}
 
   install(
     descriptor: ModuleArtifactDescriptor,
     signal?: AbortSignal,
     onProgress?: ModuleArtifactProgressListener,
   ): Promise<ModuleArtifactManifest> {
-    assertAbortSignal(signal)
     throwIfAborted(signal)
     const subtleCrypto = this.options.subtleCrypto ?? globalThis.crypto?.subtle
     if (!subtleCrypto) throw new Error('Web Crypto SHA-256 is unavailable')
     const snapshot = snapshotDescriptor(descriptor)
-    return enqueue(
+    return runSerialByKey(
       this.options.adapter,
       moduleLockKey(this.options.store.pluginDir, snapshot.id),
       () => this.installUnlocked(snapshot, subtleCrypto, signal, onProgress),
@@ -77,12 +73,11 @@ export class ModuleArtifactInstaller {
     descriptor: ModuleArtifactDescriptor,
     signal?: AbortSignal,
   ): Promise<ModuleArtifactManifest> {
-    assertAbortSignal(signal)
     throwIfAborted(signal)
     const subtleCrypto = this.options.subtleCrypto ?? globalThis.crypto?.subtle
     if (!subtleCrypto) throw new Error('Web Crypto SHA-256 is unavailable')
     const snapshot = snapshotDescriptor(descriptor)
-    return enqueue(
+    return runSerialByKey(
       this.options.adapter,
       moduleLockKey(this.options.store.pluginDir, snapshot.id),
       () => this.repairUnlocked(snapshot, subtleCrypto, signal),
@@ -454,18 +449,6 @@ function reportProgress(
   }
 }
 
-function assertAbortSignal(signal: AbortSignal | undefined): void {
-  if (
-    signal !== undefined &&
-    (!signal ||
-      typeof signal !== 'object' ||
-      typeof signal.aborted !== 'boolean' ||
-      typeof signal.addEventListener !== 'function')
-  ) {
-    throw new TypeError('Module artifact install signal is invalid')
-  }
-}
-
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted)
     throw new Error('Module artifact installation was aborted')
@@ -710,27 +693,4 @@ function downloadSourceName(url: string): string {
   if (url.startsWith('https://updates.yoloapp.dev/')) return 'Cloudflare Pages'
   if (url.startsWith('https://github.com/')) return 'GitHub'
   return 'official source'
-}
-
-function enqueue<T>(
-  adapter: object,
-  key: string,
-  operation: () => Promise<T>,
-): Promise<T> {
-  let queues = adapterQueues.get(adapter)
-  if (!queues) {
-    queues = new Map()
-    adapterQueues.set(adapter, queues)
-  }
-  const previous = queues.get(key) ?? Promise.resolve()
-  const result = previous.then(operation)
-  const settled = result.then(
-    () => undefined,
-    () => undefined,
-  )
-  queues.set(key, settled)
-  void settled.finally(() => {
-    if (queues?.get(key) === settled) queues.delete(key)
-  })
-  return result
 }

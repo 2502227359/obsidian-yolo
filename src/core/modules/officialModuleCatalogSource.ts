@@ -1,6 +1,5 @@
 import type { ModuleArtifactDescriptor } from './moduleArtifactVerifier'
 import {
-  MODULE_CATALOG_LOCALES,
   type ModuleCatalogLocale,
   type ModuleCatalogLocaleSource,
   readModuleCatalogLocale,
@@ -12,7 +11,7 @@ import {
   type OfficialModuleCatalogV1,
   type OfficialModuleCatalogVersion,
   type OfficialModuleCompatibility,
-  compareOfficialModuleVersions,
+  compareModuleVersions,
   getOfficialModuleVersionCompatibilityIssues,
 } from './officialModuleCatalog'
 import type { ModuleCatalogEntry, ModuleCatalogSource } from './types'
@@ -44,19 +43,7 @@ export class OfficialModuleCatalogSource implements ModuleCatalogSource {
     null
   private catalog: OfficialModuleCatalogV1 | null = null
 
-  constructor(private readonly options: OfficialModuleCatalogSourceOptions) {
-    if (
-      !options ||
-      !options.client ||
-      typeof options.client.load !== 'function' ||
-      typeof options.client.loadFresh !== 'function' ||
-      typeof options.getCompatibility !== 'function' ||
-      (typeof options.locale !== 'function' &&
-        !MODULE_CATALOG_LOCALES.includes(options.locale))
-    ) {
-      throw new Error('Official module catalog source options are invalid')
-    }
-  }
+  constructor(private readonly options: OfficialModuleCatalogSourceOptions) {}
 
   load(): Promise<ReadonlyArray<ModuleCatalogEntry>> {
     if (this.catalog) return this.resolve(this.catalog)
@@ -186,23 +173,45 @@ export class OfficialModuleCatalogSource implements ModuleCatalogSource {
         )
       }
 
-      const newerThanActive =
+      // A resolved candidate answers "which version would this catalog install
+      // or repair for the module", not "is there something newer". Resolving
+      // the already active version is what lets a rebuilt artifact of that same
+      // version be repaired from the catalog's current descriptor; it never
+      // turns into an update offer, because the catalog entry still carries the
+      // very same version and `resolveStatus` only reports `update-available`
+      // for a strictly newer one.
+      const installable =
         compatibility.activeVersion === undefined ||
-        compareOfficialModuleVersions(
-          latest.version,
-          compatibility.activeVersion,
-        ) > 0
-      if (compatibilityIssues.length === 0 && newerThanActive) {
+        compareModuleVersions(latest.version, compatibility.activeVersion) >= 0
+      if (compatibilityIssues.length === 0 && installable) {
         resolvedVersions[module.id] = latest
         entries.push(catalogEntry(module, latest.version, locale))
       } else {
+        const entry = catalogEntry(
+          module,
+          compatibility.activeVersion ?? '',
+          locale,
+          compatibilityIssues,
+        )
+        const awaitsCore =
+          compatibility.activeVersion !== undefined &&
+          compatibilityIssues.length === 1 &&
+          compatibilityIssues[0].kind === 'host-api' &&
+          compareModuleVersions(latest.version, compatibility.activeVersion) > 0
         entries.push(
-          catalogEntry(
-            module,
-            compatibility.activeVersion ?? '',
-            locale,
-            compatibilityIssues,
-          ),
+          awaitsCore
+            ? Object.freeze({
+                ...entry,
+                awaitingCoreUpdate: Object.freeze({
+                  version: latest.version,
+                  ...(latest.releaseNotes
+                    ? {
+                        releaseNotes: Object.freeze({ ...latest.releaseNotes }),
+                      }
+                    : {}),
+                }),
+              })
+            : entry,
         )
       }
     }

@@ -85,7 +85,9 @@ const createMockMcpManager = (tools: unknown[] = []): McpManager =>
   ({
     listAvailableTools: jest.fn().mockResolvedValue(tools),
     getJsSandboxSettings: jest.fn(() => ({})),
-    getSettingsSnapshot: jest.fn(() => ({})),
+    getSettingsSnapshot: jest.fn(() => ({
+      mcp: { servers: [], discoveredCatalogs: {} },
+    })),
   }) as unknown as McpManager
 
 describe('AgentLlmTurnExecutor', () => {
@@ -144,8 +146,6 @@ describe('AgentLlmTurnExecutor', () => {
         mcpManager: createMockMcpManager(),
         conversationId: 'conv-1',
         messages: [],
-        enableTools: false,
-        includeBuiltinTools: false,
         onAssistantMessage: (message) => {
           log.push(
             `assistant:${message.id}:${message.content}:${message.metadata?.generationState}`,
@@ -246,8 +246,6 @@ describe('AgentLlmTurnExecutor', () => {
       mcpManager,
       conversationId: 'conv-1',
       messages: [],
-      enableTools: false,
-      includeBuiltinTools: false,
       requestParams: {
         deliveryMode: 'incremental',
         primaryRequestTimeoutMs: 20000,
@@ -258,11 +256,11 @@ describe('AgentLlmTurnExecutor', () => {
 
     await executor.run()
 
+    // No `runtimeMode` given, so the run defaults to Agent and carries Agent's
+    // routing text, which does not vary with the tool list.
     expect(generateRequestMessages).toHaveBeenCalledWith(
       expect.objectContaining({
-        runtimeModePrompt: expect.stringContaining(
-          'file editing, path operations, and terminal commands',
-        ),
+        runtimeModePrompt: expect.stringContaining('You are in Agent mode'),
       }),
     )
     expect(mockExecuteSingleTurn).toHaveBeenCalledWith(
@@ -298,8 +296,6 @@ describe('AgentLlmTurnExecutor', () => {
       mcpManager: createMockMcpManager(),
       conversationId: 'conv-1',
       messages: [],
-      enableTools: false,
-      includeBuiltinTools: false,
       onAssistantMessage: (message) => {
         observed.push({
           ...message,
@@ -327,8 +323,6 @@ describe('AgentLlmTurnExecutor', () => {
         mcpManager: createMockMcpManager(),
         conversationId: 'conv-1',
         messages: [],
-        enableTools: false,
-        includeBuiltinTools: false,
         onAssistantMessage: (message) => {
           observed.push({
             ...message,
@@ -433,8 +427,6 @@ describe('AgentLlmTurnExecutor', () => {
       mcpManager,
       conversationId: 'conv-1',
       messages: [],
-      enableTools: true,
-      includeBuiltinTools: true,
       requestParams: {
         deliveryMode: 'incremental',
       },
@@ -501,8 +493,6 @@ describe('AgentLlmTurnExecutor', () => {
       mcpManager,
       conversationId: 'conv-1',
       messages: [],
-      enableTools: false,
-      includeBuiltinTools: false,
       requestParams: {
         deliveryMode: 'incremental',
       },
@@ -587,8 +577,6 @@ describe('AgentLlmTurnExecutor', () => {
       conversationId: 'conv-1',
       messages: [],
       sourceUserMessageId: 'user-1',
-      enableTools: false,
-      includeBuiltinTools: false,
       resumeAssistantMessage: interruptedMessage,
       onAssistantMessage: (message) => {
         observed.push({
@@ -654,8 +642,6 @@ describe('AgentLlmTurnExecutor', () => {
       conversationId: 'conv-1',
       messages: [],
       sourceUserMessageId: 'user-1',
-      enableTools: false,
-      includeBuiltinTools: false,
       resumeAssistantMessage: {
         role: 'assistant',
         id: 'assistant-interrupted',
@@ -713,8 +699,6 @@ describe('AgentLlmTurnExecutor', () => {
       mcpManager,
       conversationId: 'conv-1',
       messages: [],
-      enableTools: false,
-      includeBuiltinTools: false,
       requestParams: {
         deliveryMode: 'incremental',
       },
@@ -764,8 +748,6 @@ describe('AgentLlmTurnExecutor', () => {
       mcpManager,
       conversationId: 'conv-1',
       messages: [],
-      enableTools: false,
-      includeBuiltinTools: false,
       abortSignal: abortController.signal,
       requestParams: {
         deliveryMode: 'incremental',
@@ -835,8 +817,6 @@ describe('AgentLlmTurnExecutor', () => {
       mcpManager,
       conversationId: 'conv-1',
       messages: [],
-      enableTools: false,
-      includeBuiltinTools: false,
       requestParams: {
         deliveryMode: 'incremental',
       },
@@ -849,115 +829,5 @@ describe('AgentLlmTurnExecutor', () => {
     expect(result.assistantMessage.content).toBe('')
     expect(result.toolCallRequests).toEqual([])
     expect(result.hasAssistantOutput).toBe(false)
-  })
-
-  it('passes hasMemoryTools when memory tools are available', async () => {
-    const provider = new MockProvider()
-    const requestContextBuilder = {
-      generateRequestMessages: jest
-        .fn()
-        .mockResolvedValue([{ role: 'user', content: 'hello' }]),
-    } as unknown as RequestContextBuilder
-
-    const mcpManager = createMockMcpManager([
-      {
-        name: 'yolo_local__memory_add',
-        description: 'Add memory',
-        inputSchema: {
-          type: 'object',
-          properties: {},
-        },
-      },
-    ])
-
-    mockExecuteSingleTurn.mockResolvedValue({
-      content: 'done',
-      reasoning: '',
-      annotations: undefined,
-      usage: undefined,
-      toolCalls: [],
-    })
-
-    const executor = new AgentLlmTurnExecutor({
-      providerClient: provider,
-      model: TEST_MODEL,
-      requestContextBuilder,
-      mcpManager,
-      conversationId: 'conv-1',
-      messages: [],
-      enableTools: true,
-      includeBuiltinTools: true,
-      requestParams: {
-        deliveryMode: 'buffered',
-      },
-      onAssistantMessage: () => {},
-    })
-
-    await executor.run()
-
-    const generateRequestMessagesMock =
-      // eslint-disable-next-line @typescript-eslint/unbound-method -- Jest mock function accessed for assertion
-      requestContextBuilder.generateRequestMessages
-    expect(generateRequestMessagesMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        hasTools: true,
-        hasMemoryTools: true,
-      }),
-    )
-  })
-
-  it('does not pass hasMemoryTools for non-memory tools', async () => {
-    const provider = new MockProvider()
-    const requestContextBuilder = {
-      generateRequestMessages: jest
-        .fn()
-        .mockResolvedValue([{ role: 'user', content: 'hello' }]),
-    } as unknown as RequestContextBuilder
-
-    const mcpManager = createMockMcpManager([
-      {
-        name: 'yolo_local__fs_read',
-        description: 'Read file',
-        inputSchema: {
-          type: 'object',
-          properties: {},
-        },
-      },
-    ])
-
-    mockExecuteSingleTurn.mockResolvedValue({
-      content: 'done',
-      reasoning: '',
-      annotations: undefined,
-      usage: undefined,
-      toolCalls: [],
-    })
-
-    const executor = new AgentLlmTurnExecutor({
-      providerClient: provider,
-      model: TEST_MODEL,
-      requestContextBuilder,
-      mcpManager,
-      conversationId: 'conv-1',
-      messages: [],
-      enableTools: true,
-      includeBuiltinTools: true,
-      requestParams: {
-        deliveryMode: 'buffered',
-      },
-      onAssistantMessage: () => {},
-    })
-
-    await executor.run()
-
-    const generateRequestMessagesMock =
-      // eslint-disable-next-line @typescript-eslint/unbound-method -- Jest mock function accessed for assertion
-      requestContextBuilder.generateRequestMessages
-    expect(generateRequestMessagesMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        hasTools: true,
-        hasMemoryTools: false,
-      }),
-    )
   })
 })

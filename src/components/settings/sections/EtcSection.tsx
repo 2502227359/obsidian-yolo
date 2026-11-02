@@ -13,15 +13,24 @@ import { useSettings } from '../../../contexts/settings-context'
 import { isPortableVaultPathSegment } from '../../../core/paths/portableVaultPath'
 import { ensureUserDataRootDir } from '../../../core/paths/yoloManagedData'
 import { hasHiddenYoloBaseDirSegment } from '../../../core/paths/yoloPaths'
+import {
+  clearAllEditReviewSnapshotStores,
+  getEditReviewSnapshotUsageBytes,
+} from '../../../database/edit-review/editReviewSnapshotStore'
 import { ChatManager } from '../../../database/json/chat/ChatManager'
-import { clearAllEditReviewSnapshotStores } from '../../../database/json/chat/editReviewSnapshotStore'
-import { clearImageCache } from '../../../database/json/chat/imageCacheStore'
-import { clearPdfTextCache } from '../../../database/json/chat/pdfTextCacheStore'
 import { clearAllPromptSnapshotStores } from '../../../database/json/chat/promptSnapshotStore'
 import { CHAT_DIR } from '../../../database/json/constants'
+import {
+  clearLocalCache,
+  getLocalCacheUsageBytes,
+} from '../../../database/local-cache/localCacheStore'
 import type YoloPlugin from '../../../main'
-import { yoloSettingsSchema } from '../../../settings/schema/setting.types'
+import {
+  pluginUpdateModeSchema,
+  yoloSettingsSchema,
+} from '../../../settings/schema/setting.types'
 import { ObsidianButton } from '../../common/ObsidianButton'
+import { ObsidianDropdown } from '../../common/ObsidianDropdown'
 import { ObsidianSetting } from '../../common/ObsidianSetting'
 import { ObsidianTextInput } from '../../common/ObsidianTextInput'
 import { ObsidianToggle } from '../../common/ObsidianToggle'
@@ -39,9 +48,6 @@ type StorageUsage = {
 }
 
 const CHAT_SNAPSHOT_DIR = 'chat_snapshots'
-const EDIT_REVIEW_SNAPSHOT_DIR = 'edit_review_snapshots'
-const IMAGE_CACHE_DIR = 'image_cache'
-const PDF_CACHE_DIR = 'pdf_cache'
 const formatBytes = (bytes: number): string => {
   if (bytes < 1024) {
     return `${bytes} B`
@@ -93,29 +99,24 @@ const loadStorageUsage = async (
   const rootDir = await ensureUserDataRootDir(app, settings)
   const chatDir = normalizePath(`${rootDir}/${CHAT_DIR}`)
 
+  // 编辑评审快照和本地缓存都在设备本地的 IndexedDB 里，Obsidian 的 adapter
+  // 看不到，由各自的库自己计量。
   const [
-    chatHistoryBytes,
+    chatDirBytes,
     promptSnapshotBytes,
     editReviewSnapshotBytes,
-    imageCacheBytes,
-    pdfCacheBytes,
+    localCacheBytes,
   ] = await Promise.all([
     getPathSize(app, chatDir),
     getPathSize(app, normalizePath(`${chatDir}/${CHAT_SNAPSHOT_DIR}`)),
-    getPathSize(app, normalizePath(`${chatDir}/${EDIT_REVIEW_SNAPSHOT_DIR}`)),
-    getPathSize(app, normalizePath(`${chatDir}/${IMAGE_CACHE_DIR}`)),
-    getPathSize(app, normalizePath(`${chatDir}/${PDF_CACHE_DIR}`)),
+    getEditReviewSnapshotUsageBytes(app),
+    getLocalCacheUsageBytes(app),
   ])
 
-  const snapshotAndCacheBytes =
-    promptSnapshotBytes +
-    editReviewSnapshotBytes +
-    imageCacheBytes +
-    pdfCacheBytes
-
   return {
-    chatHistoryBytes: Math.max(0, chatHistoryBytes - snapshotAndCacheBytes),
-    chatSnapshotBytes: snapshotAndCacheBytes,
+    chatHistoryBytes: Math.max(0, chatDirBytes - promptSnapshotBytes),
+    chatSnapshotBytes:
+      promptSnapshotBytes + editReviewSnapshotBytes + localCacheBytes,
   }
 }
 
@@ -218,30 +219,15 @@ export function EtcSection({ app, plugin, className }: EtcSectionProps) {
       })
   }
 
-  const handlePluginUpdateNoticeChange = (value: boolean) => {
-    void (async () => {
-      try {
-        await setSettings({
-          ...settings,
-          pluginUpdateNoticeEnabled: value,
-        })
-      } catch (error: unknown) {
-        console.error('Failed to update plugin update notice setting', error)
-      }
-    })()
-  }
-
-  const handlePluginAutoUpdateChange = (value: boolean) => {
-    void (async () => {
-      try {
-        await setSettings({
-          ...settings,
-          pluginUpdateAutoDownloadEnabled: value,
-        })
-      } catch (error: unknown) {
-        console.error('Failed to update plugin auto-update setting', error)
-      }
-    })()
+  const handlePluginUpdateModeChange = (value: string) => {
+    const mode = pluginUpdateModeSchema.safeParse(value)
+    if (!mode.success) return
+    void setSettings({
+      ...settings,
+      pluginUpdateMode: mode.data,
+    }).catch((error: unknown) => {
+      console.error('Failed to update plugin update mode', error)
+    })
   }
 
   // Debug logs live under the YOLO base dir, which every knowledge base's
@@ -349,9 +335,8 @@ export function EtcSection({ app, plugin, className }: EtcSectionProps) {
       onConfirm: () => {
         void (async () => {
           await clearAllPromptSnapshotStores(app, settings)
-          await clearAllEditReviewSnapshotStores(app, settings)
-          await clearImageCache(app, settings)
-          await clearPdfTextCache(app, settings)
+          await clearAllEditReviewSnapshotStores(app)
+          await clearLocalCache(app)
           const nextUsage = await loadStorageUsage(app, settings)
           setStorageUsage(nextUsage)
           new Notice(t('settings.etc.clearChatSnapshotsSuccess'))
@@ -400,41 +385,28 @@ export function EtcSection({ app, plugin, className }: EtcSectionProps) {
 
         <div className="yolo-settings-block-content">
           <ObsidianSetting
-            name={t('settings.etc.pluginUpdateNotice', '更新提醒')}
-            desc={t(
-              'settings.etc.pluginUpdateNoticeDesc',
-              '开启后 YOLO 会自动检测新版本并提醒。',
-            )}
+            name={t('settings.etc.pluginUpdateMode')}
+            desc={
+              settings.pluginUpdateMode === 'auto'
+                ? Platform.isDesktop && canSelfUpdate
+                  ? t('settings.etc.pluginUpdateModeAutoDesc')
+                  : t('settings.etc.pluginUpdateModeAutoDescUnavailable')
+                : settings.pluginUpdateMode === 'off'
+                  ? t('settings.etc.pluginUpdateModeOffDesc')
+                  : t('settings.etc.pluginUpdateModeNotifyDesc')
+            }
             className="yolo-settings-card"
           >
-            <ObsidianToggle
-              value={settings.pluginUpdateNoticeEnabled ?? true}
-              onChange={handlePluginUpdateNoticeChange}
+            <ObsidianDropdown
+              value={settings.pluginUpdateMode}
+              options={{
+                auto: t('settings.etc.pluginUpdateModeAuto'),
+                notify: t('settings.etc.pluginUpdateModeNotify'),
+                off: t('settings.etc.pluginUpdateModeOff'),
+              }}
+              onChange={handlePluginUpdateModeChange}
             />
           </ObsidianSetting>
-
-          {(settings.pluginUpdateNoticeEnabled ?? true) ? (
-            <ObsidianSetting
-              name={t('settings.etc.pluginAutoUpdate', '自动下载更新')}
-              desc={
-                Platform.isDesktop && canSelfUpdate
-                  ? t(
-                      'settings.etc.pluginAutoUpdateDesc',
-                      '开启后检测到新版本会自动在后台加载。',
-                    )
-                  : t(
-                      'settings.etc.pluginAutoUpdateDescUnavailable',
-                      '开启后会自动下载模块更新；主插件的一键安装仅在桌面端且插件目录可写时可用。',
-                    )
-              }
-              className="yolo-settings-card"
-            >
-              <ObsidianToggle
-                value={settings.pluginUpdateAutoDownloadEnabled ?? true}
-                onChange={handlePluginAutoUpdateChange}
-              />
-            </ObsidianSetting>
-          ) : null}
 
           <ObsidianSetting
             name={t('settings.etc.exportConfig', '导出配置')}

@@ -16,6 +16,7 @@ import type {
   CliCompactionBoundary,
   CliContextUsage,
   CliRuntimeEvent,
+  CliRuntimeId,
   CliRuntimeModel,
 } from '../types'
 
@@ -33,6 +34,15 @@ const getRecord = (value: unknown): Record<string, unknown> =>
 
 const getString = (value: unknown): string | null =>
   typeof value === 'string' && value.trim() ? value.trim() : null
+
+/**
+ * Content-preserving counterpart to `getString`. Streaming text arrives split
+ * on token boundaries, so leading/trailing whitespace and whitespace-only
+ * deltas are the newlines and spaces of the reply itself — trimming them (or
+ * dropping them as "empty") silently destroys Markdown block structure.
+ */
+const getRawString = (value: unknown): string | null =>
+  typeof value === 'string' && value.length > 0 ? value : null
 
 const asNonNegativeInt = (value: unknown): number | null => {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
@@ -72,20 +82,40 @@ const firstStringField = (
 // ---------------------------------------------------------------------------
 
 export type PiMappingState = {
+  /**
+   * Runtime this stream belongs to, stamped onto every tool call's
+   * provider-native metadata — the engine drives both pi and its omp fork.
+   */
+  runtimeId: CliRuntimeId
   assistantText: Map<string, string>
   thinkingText: Map<string, string>
   toolInputs: Map<string, Record<string, unknown>>
   toolNames: Map<string, string>
   toolOutputs: Map<string, string>
+  /** Running total of every LLM call billed in the current turn. */
+  turnUsage: PiUsageTotals | null
   turn: number
 }
 
-export const createPiMappingState = (): PiMappingState => ({
+/** pi's raw usage shape, in the same field names it reports. */
+type PiUsageTotals = {
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+  totalTokens: number
+}
+
+export const createPiMappingState = (
+  runtimeId: CliRuntimeId,
+): PiMappingState => ({
+  runtimeId,
   assistantText: new Map(),
   thinkingText: new Map(),
   toolInputs: new Map(),
   toolNames: new Map(),
   toolOutputs: new Map(),
+  turnUsage: null,
   turn: 0,
 })
 
@@ -96,12 +126,18 @@ export const resetPiMappingState = (state: PiMappingState): void => {
   state.toolInputs.clear()
   state.toolNames.clear()
   state.toolOutputs.clear()
+  state.turnUsage = null
   state.turn += 1
 }
 
 /**
- * `agent_settled` is the authoritative "this turn is fully done" signal —
- * unlike `agent_end`, it is not emitted while pi is still retrying/queued.
+ * pi's "this turn is fully done" signal. `agent_settled` is authoritative
+ * where `agent_end` is not: pi re-emits `agent_end` after a retry or a
+ * compaction, so treating that as terminal ends the turn early.
+ *
+ * This rule is pi's alone — omp removed `agent_settled` entirely and marks
+ * terminality on `agent_end` instead (see `omp/dialect.ts`), which is why the
+ * engine takes the predicate from its `PiRuntimeDialect`.
  */
 export const isPiAgentSettled = (event: PiRpcRecord): boolean =>
   getString(event.type) === 'agent_settled'
@@ -156,10 +192,11 @@ const extractDelta = (
 ): string | null => {
   const snakeKey = kind === 'text' ? 'text_delta' : 'thinking_delta'
   const camelKey = kind === 'text' ? 'textDelta' : 'thinkingDelta'
-  const direct = getString(record[snakeKey]) ?? getString(record[camelKey])
-  if (direct) return direct
+  const direct =
+    getRawString(record[snakeKey]) ?? getRawString(record[camelKey])
+  if (direct !== null) return direct
   if (record.type === snakeKey || record.type === camelKey) {
-    return getString(record.delta)
+    return getRawString(record.delta)
   }
   return null
 }
@@ -178,7 +215,6 @@ const extractStreamId = (
 const mapMessageUpdate = (
   event: Record<string, unknown>,
   state: PiMappingState,
-  maxContextTokens: number | null,
 ): CliRuntimeEvent[] => {
   const assistantEvent =
     getNestedRecord(event, 'assistantMessageEvent') ??
@@ -188,7 +224,7 @@ const mapMessageUpdate = (
   const events: CliRuntimeEvent[] = []
 
   const textDelta = extractDelta(assistantEvent, 'text')
-  if (textDelta) {
+  if (textDelta !== null) {
     const content = `${state.assistantText.get(streamId) ?? ''}${textDelta}`
     state.assistantText.set(streamId, content)
     events.push({
@@ -203,7 +239,7 @@ const mapMessageUpdate = (
   }
 
   const thinkingDelta = extractDelta(assistantEvent, 'thinking')
-  if (thinkingDelta) {
+  if (thinkingDelta !== null) {
     const reasoning = `${state.thinkingText.get(streamId) ?? ''}${thinkingDelta}`
     state.thinkingText.set(streamId, reasoning)
     events.push({
@@ -218,11 +254,33 @@ const mapMessageUpdate = (
     })
   }
 
-  const usage = extractPiUsage(event.usage)
-  if (usage) events.push({ type: 'turn_metrics', usage })
-  const contextUsage = extractPiContextUsage(event.usage, maxContextTokens)
-  if (contextUsage) events.push({ type: 'context_usage', usage: contextUsage })
+  return events
+}
 
+/**
+ * Token counts only ever arrive here. pi's RPC layer reduces `message_update`
+ * to `{ type, assistantMessageEvent }` (see its `toJsonEvent`), so the
+ * streaming path carries no usage at all — the finalized `message_end.message`
+ * is the single place per-call `usage` is reported.
+ *
+ * One turn can finish several assistant messages (one LLM call per tool-loop
+ * step). The footer states what the turn billed, so usage accumulates across
+ * them; the ring states how full the window is right now, so it follows the
+ * latest call's prompt alone.
+ */
+const mapMessageEnd = (
+  event: Record<string, unknown>,
+  state: PiMappingState,
+  maxContextTokens: number | null,
+): CliRuntimeEvent[] => {
+  const usage = getNestedRecord(event, 'message')?.usage
+  if (!isRecord(usage)) return []
+  state.turnUsage = accumulatePiUsage(state.turnUsage, usage)
+  const events: CliRuntimeEvent[] = []
+  const turnUsage = state.turnUsage ? extractPiUsage(state.turnUsage) : null
+  if (turnUsage) events.push({ type: 'turn_metrics', usage: turnUsage })
+  const contextUsage = extractPiContextUsage(usage, maxContextTokens)
+  if (contextUsage) events.push({ type: 'context_usage', usage: contextUsage })
   return events
 }
 
@@ -301,7 +359,11 @@ const mapToolStart = (
   const request = createCliToolCallRequest({
     id,
     input,
-    metadata: { runtimeId: 'pi', eventType: 'tool_execution_start', name },
+    metadata: {
+      runtimeId: state.runtimeId,
+      eventType: 'tool_execution_start',
+      name,
+    },
   })
   const [assistant, tool] = toolPair(request, {
     status: ToolCallResponseStatus.Running,
@@ -353,7 +415,11 @@ const mapToolEnd = (
   const request = createCliToolCallRequest({
     id,
     input,
-    metadata: { runtimeId: 'pi', eventType: 'tool_execution_end', name },
+    metadata: {
+      runtimeId: state.runtimeId,
+      eventType: 'tool_execution_end',
+      name,
+    },
   })
   const response: ToolCallResponse = isError
     ? {
@@ -383,12 +449,18 @@ let compactionCounter = 0
 
 /**
  * Maps one raw pi RPC event line into zero or more `CliRuntimeEvent`s.
- * `agent_settled` and the `message_end`/`turn_end` error path are handled
- * separately by the runtime (they drive `run_state`, which also needs
+ * The turn-terminal event and the `message_end`/`turn_end` error path are
+ * handled separately by the runtime (they drive `run_state`, which also needs
  * runtime-local state like "was cancel() called"), so this only covers the
  * message/tool/compaction event families. `auto_retry_start`/`auto_retry_end`
  * have no corresponding UI surface yet and are intentionally ignored rather
  * than routed through a notice mechanism that doesn't exist.
+ *
+ * Compaction is accepted under both runtimes' names: pi emits
+ * `compaction_start`/`compaction_end`, omp renamed the pair to
+ * `auto_compaction_start`/`auto_compaction_end`. The two vocabularies do not
+ * overlap — neither runtime emits the other's names — so a plain union is
+ * exact here, and splitting it per runtime would buy nothing.
  */
 export const mapPiEvent = (
   event: PiRpcRecord,
@@ -397,7 +469,9 @@ export const mapPiEvent = (
 ): CliRuntimeEvent[] => {
   switch (getString(event.type)) {
     case 'message_update':
-      return mapMessageUpdate(event, state, maxContextTokens)
+      return mapMessageUpdate(event, state)
+    case 'message_end':
+      return mapMessageEnd(event, state, maxContextTokens)
     case 'tool_execution_start':
       return mapToolStart(event, state)
     case 'tool_execution_update':
@@ -406,8 +480,10 @@ export const mapPiEvent = (
     case 'tool_execution_end':
       return mapToolEnd(event, state)
     case 'compaction_start':
+    case 'auto_compaction_start':
       return [{ type: 'compaction_state', isCompacting: true }]
     case 'compaction_end':
+    case 'auto_compaction_end':
       return [
         { type: 'compaction_state', isCompacting: false },
         {
@@ -426,6 +502,37 @@ export const mapPiEvent = (
 // Usage / context window
 // ---------------------------------------------------------------------------
 
+/** Folds one call's raw usage into the turn's running total. */
+const accumulatePiUsage = (
+  totals: PiUsageTotals | null,
+  raw: Record<string, unknown>,
+): PiUsageTotals | null => {
+  const input = asNonNegativeInt(raw.input)
+  const output = asNonNegativeInt(raw.output)
+  if (input === null || output === null) return totals
+  const cacheRead = asNonNegativeInt(raw.cacheRead) ?? 0
+  const cacheWrite = asNonNegativeInt(raw.cacheWrite) ?? 0
+  return {
+    input: (totals?.input ?? 0) + input,
+    output: (totals?.output ?? 0) + output,
+    cacheRead: (totals?.cacheRead ?? 0) + cacheRead,
+    cacheWrite: (totals?.cacheWrite ?? 0) + cacheWrite,
+    totalTokens:
+      (totals?.totalTokens ?? 0) +
+      (asNonNegativeInt(raw.totalTokens) ??
+        input + output + cacheRead + cacheWrite),
+  }
+}
+
+/**
+ * pi reports Anthropic-shaped counts: `input` is the *uncached* prompt only,
+ * with cache reads/writes billed separately (`totalTokens === input +
+ * cacheRead + output`). `ResponseUsage.prompt_tokens` is defined as the whole
+ * prompt with `cache_read_input_tokens` nested inside it, so the cache halves
+ * are folded back in here — exactly as the Claude mapping does. Passing pi's
+ * `input` straight through made every cache-ratio consumer divide by the
+ * uncached remainder (the footer showed hit rates far above 100%).
+ */
 export const extractPiUsage = (raw: unknown): ResponseUsage | null => {
   if (!isRecord(raw)) return null
   const input = asNonNegativeInt(raw.input)
@@ -433,9 +540,10 @@ export const extractPiUsage = (raw: unknown): ResponseUsage | null => {
   if (input === null || output === null) return null
   const cacheRead = asNonNegativeInt(raw.cacheRead) ?? 0
   const cacheWrite = asNonNegativeInt(raw.cacheWrite) ?? 0
-  const totalTokens = asNonNegativeInt(raw.totalTokens) ?? input + output
+  const promptTokens = input + cacheRead + cacheWrite
+  const totalTokens = asNonNegativeInt(raw.totalTokens) ?? promptTokens + output
   return {
-    prompt_tokens: input,
+    prompt_tokens: promptTokens,
     completion_tokens: output,
     total_tokens: totalTokens,
     ...(cacheRead > 0 ? { cache_read_input_tokens: cacheRead } : {}),
@@ -448,13 +556,15 @@ export const extractPiContextUsage = (
   maxContextTokens: number | null,
 ): CliContextUsage | null => {
   if (!isRecord(raw)) return null
-  const promptTokens = asNonNegativeInt(raw.input)
-  if (promptTokens === null) return null
+  const input = asNonNegativeInt(raw.input)
+  if (input === null) return null
   const cacheRead = asNonNegativeInt(raw.cacheRead) ?? 0
+  const cacheWrite = asNonNegativeInt(raw.cacheWrite) ?? 0
+  // Context occupancy is the whole prompt, cached parts included — see
+  // `extractPiUsage` for why pi's `input` alone is not that number.
+  const promptTokens = input + cacheRead + cacheWrite
   const cacheHitRate =
-    promptTokens > 0 && cacheRead > 0
-      ? Math.min(1, cacheRead / promptTokens)
-      : undefined
+    promptTokens > 0 && cacheRead > 0 ? cacheRead / promptTokens : undefined
   return {
     promptTokens,
     maxContextTokens,
@@ -462,7 +572,12 @@ export const extractPiContextUsage = (
   }
 }
 
-/** Best-effort context-window lookup from a `get_state`/`get_session_stats` response. */
+/**
+ * Best-effort context-window lookup from a `get_state` / `get_session_stats` /
+ * `set_model` response. The window lives on the Model object for `get_state`
+ * and `set_model` (`data.model.contextWindow` / `data.contextWindow`), and
+ * under `contextUsage` for `get_session_stats`.
+ */
 export const extractPiContextWindow = (response: unknown): number | null => {
   const record = getRecord(response)
   const candidates: unknown[] = [
@@ -470,6 +585,8 @@ export const extractPiContextWindow = (response: unknown): number | null => {
     record.context_usage,
     getRecord(record.state).contextUsage,
     getRecord(record.session).contextUsage,
+    record.model,
+    getRecord(record.state).model,
     record,
   ]
   for (const candidate of candidates) {
@@ -881,6 +998,7 @@ const buildUserMessage = (
 const buildAssistantEntry = (
   entry: PiSessionEntry,
   index: number,
+  runtimeId: CliRuntimeId,
 ): { assistant: ChatAssistantMessage; tool: ChatToolMessage | null } => {
   const parts = extractContentParts(entry.message)
   const textParts: string[] = []
@@ -908,7 +1026,7 @@ const buildAssistantEntry = (
           createCliToolCallRequest({
             id: toolId,
             input: getPiToolInput(part),
-            metadata: { runtimeId: 'pi', eventType: 'history', name },
+            metadata: { runtimeId, eventType: 'history', name },
           }),
         )
         continue
@@ -1114,6 +1232,7 @@ export const buildPiForkSessionContent = ({
  */
 export const mapPiEntriesToHydration = (
   response: unknown,
+  runtimeId: CliRuntimeId,
 ): PiSessionHydrationContent => {
   const normalized = normalizePiEntries(response)
   const entries = resolvePiActiveBranch(normalized.entries, normalized.leafId)
@@ -1140,7 +1259,7 @@ export const mapPiEntriesToHydration = (
       return
     }
     if (role === 'assistant') {
-      const { assistant, tool } = buildAssistantEntry(entry, index)
+      const { assistant, tool } = buildAssistantEntry(entry, index, runtimeId)
       messages.push(assistant)
       if (tool) messages.push(tool)
     }

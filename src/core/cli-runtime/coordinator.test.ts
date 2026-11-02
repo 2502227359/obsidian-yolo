@@ -1,5 +1,7 @@
 import { FileSystemAdapter, Platform } from 'obsidian'
 
+import { ToolCallResponseStatus } from '../../types/tool-call.types'
+
 import type { CliRuntimeFactories } from './coordinator'
 import { createDesktopCliRuntimeCoordinator } from './coordinator'
 import { discoverHermesProfiles } from './hermes/profiles'
@@ -89,11 +91,11 @@ class TestRuntime implements CliRuntime {
   async rewriteTurn() {}
 
   async respondApproval() {
-    return true
+    return null
   }
 
   async respondQuestion() {
-    return true
+    return null
   }
 
   subscribe(listener: CliRuntimeEventListener): () => void {
@@ -111,6 +113,8 @@ const runtimeHarness = () => {
   const codexRuntimes: TestRuntime[] = []
   const hermesRuntimes: TestRuntime[] = []
   const piRuntimes: TestRuntime[] = []
+  const ompRuntimes: TestRuntime[] = []
+  const grokRuntimes: TestRuntime[] = []
   const createClaudeRuntime = jest.fn(() => {
     const runtime = new TestRuntime('claude-code')
     claudeRuntimes.push(runtime)
@@ -131,21 +135,38 @@ const runtimeHarness = () => {
     piRuntimes.push(runtime)
     return runtime
   })
+  const createOmpRuntime = jest.fn(() => {
+    const runtime = new TestRuntime('omp')
+    ompRuntimes.push(runtime)
+    return runtime
+  })
+  const createGrokRuntime = jest.fn(() => {
+    const runtime = new TestRuntime('grok')
+    grokRuntimes.push(runtime)
+    return runtime
+  })
+  const createCodebuddyRuntime = jest.fn(() => new TestRuntime('codebuddy'))
   const factories: CliRuntimeFactories = {
     'claude-code': { create: createClaudeRuntime },
     codex: { create: createCodexRuntime },
     hermes: { create: createHermesRuntime },
     pi: { create: createPiRuntime },
+    omp: { create: createOmpRuntime },
+    grok: { create: createGrokRuntime },
+    codebuddy: { create: createCodebuddyRuntime },
   }
   return {
     claudeRuntimes,
     codexRuntimes,
     hermesRuntimes,
     piRuntimes,
+    ompRuntimes,
+    grokRuntimes,
     createClaudeRuntime,
     createCodexRuntime,
     createHermesRuntime,
     createPiRuntime,
+    createGrokRuntime,
     factories,
   }
 }
@@ -249,6 +270,12 @@ describe('CLI runtime coordinator', () => {
     expect(scope.resolveRuntime('codex')).toBe(scope.resolveRuntime('codex'))
     expect(harness.createCodexRuntime).toHaveBeenCalledTimes(1)
     expect(harness.createCodexRuntime).toHaveBeenCalledWith({
+      app,
+      vaultPath: '/vault/current',
+    })
+    expect(scope.resolveRuntime('grok')).toBe(scope.resolveRuntime('grok'))
+    expect(harness.createGrokRuntime).toHaveBeenCalledTimes(1)
+    expect(harness.createGrokRuntime).toHaveBeenCalledWith({
       app,
       vaultPath: '/vault/current',
     })
@@ -414,6 +441,71 @@ describe('CLI runtime coordinator', () => {
     )
   })
 
+  it('keeps the selected conversation alive while a session open is pending or abandoned', async () => {
+    const { coordinator } = await createCoordinator()
+    const scope = coordinator.createScope()
+    const current = scope.selectConversationRuntime('claude-code')
+    const disposeCurrent = jest.spyOn(current, 'dispose')
+
+    const lease = scope.openConversationSession({
+      runtimeId: 'claude-code',
+      nativeSessionId: 'abandoned-session',
+    })
+    const disposeOpened = jest.spyOn(lease.controller, 'dispose')
+    expect(lease.controller).not.toBe(current)
+    expect(disposeCurrent).not.toHaveBeenCalled()
+
+    lease.release()
+    lease.release()
+    expect(disposeOpened).toHaveBeenCalledTimes(1)
+    expect(disposeCurrent).not.toHaveBeenCalled()
+    expect(scope.selectConversationRuntime('claude-code')).toBe(current)
+    expect(() => lease.commit()).toThrow(/no longer held/)
+
+    await scope.dispose()
+    await coordinator.dispose()
+  })
+
+  it('swaps the selection only when an opened session is committed', async () => {
+    const { coordinator } = await createCoordinator()
+    const scope = coordinator.createScope()
+    const current = scope.selectConversationRuntime('claude-code')
+    const disposeCurrent = jest.spyOn(current, 'dispose')
+
+    const lease = scope.openConversationSession({
+      runtimeId: 'claude-code',
+      nativeSessionId: 'committed-session',
+    })
+    const disposeOpened = jest.spyOn(lease.controller, 'dispose')
+    lease.commit()
+    lease.release()
+
+    expect(disposeCurrent).toHaveBeenCalledTimes(1)
+    expect(disposeOpened).not.toHaveBeenCalled()
+    expect(scope.selectConversationRuntime('claude-code')).toBe(
+      lease.controller,
+    )
+
+    await scope.dispose()
+    expect(disposeOpened).toHaveBeenCalledTimes(1)
+    await coordinator.dispose()
+  })
+
+  it('releases a pending session open when its view scope closes', async () => {
+    const { coordinator } = await createCoordinator()
+    const scope = coordinator.createScope()
+    const lease = scope.openConversationSession({
+      runtimeId: 'claude-code',
+      nativeSessionId: 'pending-session',
+    })
+    const disposeOpened = jest.spyOn(lease.controller, 'dispose')
+
+    await scope.dispose()
+    expect(disposeOpened).toHaveBeenCalledTimes(1)
+    expect(() => lease.commit()).toThrow(/no longer held/)
+    await coordinator.dispose()
+  })
+
   it('keeps an unobserved active conversation alive until it reaches a terminal state', async () => {
     const { coordinator, harness } = await createCoordinator()
     const scope = coordinator.createScope()
@@ -456,7 +548,21 @@ describe('CLI runtime coordinator', () => {
       runState: 'running',
     })
 
-    runtime.emit({ type: 'run_state', state: 'waiting_for_approval' })
+    // A pending card is what puts the run into `waiting_for_approval` — the
+    // state is derived from it, so monitoring keeps seeing a live run.
+    runtime.emit({
+      type: 'message_upsert',
+      message: {
+        role: 'tool',
+        id: 'tool-1',
+        toolCalls: [
+          {
+            request: { id: 'call-1', name: 'ls' },
+            response: { status: ToolCallResponseStatus.PendingApproval },
+          },
+        ],
+      },
+    })
     expect(summaries[summaries.length - 1].get('conversation-a')).toEqual({
       conversationId: 'conversation-a',
       runtimeId: 'claude-code',

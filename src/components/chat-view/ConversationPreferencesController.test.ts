@@ -40,7 +40,7 @@ function createController(
   conversationId: string,
   overrides: Partial<ConversationPreferencesControllerDeps> = {},
 ) {
-  const settings = createSettings()
+  const settings = overrides.getSettings?.() ?? createSettings()
   const persistPreferredAssistantId = jest.fn()
   const persistPreferredChatMode = jest.fn()
   const getReasoningLevelForModelId = jest.fn(() => 'off' as const)
@@ -181,11 +181,67 @@ describe('ConversationPreferencesController', () => {
       controller.changeChatMode('ask')
       controller.changeChatMode('agent')
 
-      // isAgentChatMode('agent') && assistant has a modelId && current model
+      // isToolChatMode('agent') && assistant has a modelId && current model
       // equals the global default → re-applies the assistant's own model.
       expect(controller.getSnapshot().conversationModelId).toBe(
         'model-assistant',
       )
+    })
+
+    it('does the same on the way into max — it runs on the assistant exactly as agent does', () => {
+      const { controller, persistPreferredChatMode } = createController('c1')
+      controller.selectAssistant('assistant-2')
+      controller.setConversationModelId('model-default')
+
+      controller.changeChatMode('ask')
+      controller.changeChatMode('max')
+
+      expect(controller.getSnapshot().chatMode).toBe('max')
+      expect(controller.getSnapshot().conversationModelId).toBe(
+        'model-assistant',
+      )
+      // Max is a built-in mode, so the global default does learn it.
+      expect(persistPreferredChatMode).toHaveBeenLastCalledWith('max')
+    })
+
+    it('re-reads the YOLO flag from the mode being entered instead of carrying the old one across', () => {
+      const { controller } = createController('c1')
+
+      controller.toggleYolo('agent', true)
+      controller.changeChatMode('max')
+
+      // Max starts from its own (unset → false) profile, not Agent's true.
+      expect(controller.getSnapshot().yoloEnabled).toBe(false)
+      expect(controller.getSnapshot().conversationOverrides).toEqual({
+        agentYoloEnabled: true,
+        chatMode: 'max',
+      })
+
+      controller.toggleYolo('max', true)
+      controller.changeChatMode('agent')
+
+      // ...and switching back restores Agent's, which was never overwritten.
+      expect(controller.getSnapshot().yoloEnabled).toBe(true)
+      expect(controller.getSnapshot().conversationOverrides).toEqual({
+        agentYoloEnabled: true,
+        maxYoloEnabled: true,
+        chatMode: 'agent',
+      })
+    })
+
+    it('falls back to the global default for the mode being entered', () => {
+      const settings = createSettings()
+      settings.chatOptions.agentYoloEnabled = false
+      settings.chatOptions.maxYoloEnabled = true
+      const { controller } = createController('c1', {
+        getSettings: () => settings,
+      })
+
+      controller.changeChatMode('max')
+      expect(controller.getSnapshot().yoloEnabled).toBe(true)
+
+      controller.changeChatMode('agent')
+      expect(controller.getSnapshot().yoloEnabled).toBe(false)
     })
   })
 
@@ -193,7 +249,7 @@ describe('ConversationPreferencesController', () => {
     it('sets yoloEnabled and merges agentYoloEnabled into the override', () => {
       const { controller } = createController('c1')
 
-      controller.toggleYolo(true)
+      controller.toggleYolo('agent', true)
 
       const snapshot = controller.getSnapshot()
       expect(snapshot.yoloEnabled).toBe(true)
@@ -201,6 +257,45 @@ describe('ConversationPreferencesController', () => {
       expect(controller.conversationOverridesRef.current.get('c1')).toEqual({
         agentYoloEnabled: true,
       })
+    })
+
+    it('writes maxYoloEnabled while in max mode, leaving the agent profile alone', () => {
+      const { controller } = createController('c1')
+
+      controller.toggleYolo('agent', true)
+      controller.changeChatMode('max')
+      controller.toggleYolo('max', true)
+
+      expect(controller.conversationOverridesRef.current.get('c1')).toEqual({
+        chatMode: 'max',
+        agentYoloEnabled: true,
+        maxYoloEnabled: true,
+      })
+    })
+
+    it('records the preference without touching the mode or the running trust flag when the other card is flipped', () => {
+      const { controller, persistPreferredChatMode } = createController('c1')
+
+      // Selector shows both switches at once: this is the Max card being
+      // flipped while the conversation is running Agent.
+      controller.toggleYolo('max', true)
+
+      const snapshot = controller.getSnapshot()
+      expect(snapshot.chatMode).toBe('agent')
+      // `yoloEnabled` is what `bypassToolApproval` reads for the *running*
+      // mode — flipping the other card must not move it.
+      expect(snapshot.yoloEnabled).toBe(false)
+      expect(snapshot.conversationOverrides).toEqual({ maxYoloEnabled: true })
+      expect(persistPreferredChatMode).not.toHaveBeenCalled()
+    })
+
+    it('hands the recorded preference over when the mode is later entered', () => {
+      const { controller } = createController('c1')
+
+      controller.toggleYolo('max', true)
+      controller.changeChatMode('max')
+
+      expect(controller.getSnapshot().yoloEnabled).toBe(true)
     })
   })
 

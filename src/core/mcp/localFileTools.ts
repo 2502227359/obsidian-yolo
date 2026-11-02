@@ -1,6 +1,7 @@
 import type { ChatModelModality } from '../../types/chat-model.types'
 import { McpTool } from '../../types/mcp.types'
 import { recoverLikelyEscapedBackslashSequences } from '../edits/textEditEngine'
+import { INVOKE_TOOL_NAME } from '../tools/internal/invoke_tool/definition'
 import {
   LOAD_TOOL_SCHEMAS_TOOL_NAME as LOAD_TOOL_SCHEMAS_LOCAL_TOOL_NAME,
   getLoadToolSchemasTool,
@@ -9,6 +10,7 @@ import {
   type BuiltinToolName,
   assertNoDuplicates,
   getToolDefinition,
+  isBuiltinToolName,
   listBuiltinTools,
 } from '../tools/registry'
 import type { ToolCatalogContext } from '../tools/types'
@@ -16,7 +18,7 @@ import { WEB_SCRAPE_TOOL_NAME, WEB_SEARCH_TOOL_NAME } from '../web-search'
 
 import { JS_SANDBOX_TOOL_NAME } from './jsSandboxTool'
 import { LOCAL_FILE_TOOL_SERVER } from './localFileToolNames'
-import { parseToolName } from './tool-name-utils'
+import { getToolName, parseToolName } from './tool-name-utils'
 
 export { getLocalFileToolServerName } from './localFileToolNames'
 
@@ -32,9 +34,6 @@ export const LOCAL_FILE_TOOL_SHORT_NAMES = [
   'fs_read',
   'fs_edit',
   'fs_write',
-  'memory_add',
-  'memory_update',
-  'memory_delete',
   'web_search',
   'web_scrape',
   JS_SANDBOX_TOOL_NAME,
@@ -43,6 +42,11 @@ export const LOCAL_FILE_TOOL_SHORT_NAMES = [
   'load_tool_schemas',
   'todo_write',
   'ask_user_question',
+  // `native_files` (desktop-only, Max mode).
+  'read_file',
+  'write_file',
+  'edit_file',
+  'vault_search',
 ] as const
 
 /**
@@ -55,6 +59,60 @@ export const LOCAL_FILE_TOOL_SHORT_NAMES = [
  */
 export const USER_FACING_LOCAL_TOOL_SHORT_NAMES: readonly string[] =
   LOCAL_FILE_TOOL_SHORT_NAMES.filter((name) => name !== 'load_tool_schemas')
+
+/**
+ * Whether `name` is the short name of a tool served by this in-process server:
+ * every registered built-in (derived from `CAPABILITIES`, never hand-listed)
+ * plus the two protocol-internal tools, which have no capability of their own
+ * but are still registered in the request and called back by name.
+ */
+const isLocalToolShortName = (name: string): boolean =>
+  isBuiltinToolName(name) ||
+  name === LOAD_TOOL_SCHEMAS_LOCAL_TOOL_NAME ||
+  name === INVOKE_TOOL_NAME
+
+/**
+ * The model-facing form of a tool name — the *only* place a name is rewritten
+ * on its way out to the provider, and {@link fromModelToolName} the only place
+ * it is read back.
+ *
+ * Built-in tools drop the `yolo_local__` prefix: it carries no information the
+ * model can act on (there is exactly one such server, and it is ours), while
+ * costing tokens in every schema, every catalog line and every replayed tool
+ * call. MCP and module tools keep theirs — there the prefix *is* the routing
+ * key, the stable identity, and the only signal of where a tool came from.
+ *
+ * Internal identity is untouched: the gateway, approval and always-allow keys,
+ * persisted messages, settings keys and the UI all keep speaking the fully
+ * qualified name, so nothing needs migrating.
+ */
+export const toModelToolName = (name: string): string => {
+  try {
+    const { serverName, toolName } = parseToolName(name)
+    return serverName === LOCAL_FILE_TOOL_SERVER ? toolName : name
+  } catch {
+    return name
+  }
+}
+
+/**
+ * Inverse of {@link toModelToolName}: restore the internal identity of a name
+ * the model produced. A name that already carries a server prefix is returned
+ * untouched — MCP and module names always do, so they can never be confused
+ * with a built-in short name. An unqualified name that is not one of ours is
+ * left alone too, so the usual "no such tool" error names what the model
+ * actually asked for.
+ */
+export const fromModelToolName = (name: string): string => {
+  try {
+    parseToolName(name)
+    return name
+  } catch {
+    return isLocalToolShortName(name)
+      ? getToolName(LOCAL_FILE_TOOL_SERVER, name)
+      : name
+  }
+}
 // 'delete' | 'create_dir' | 'move' retired with fs_delete/fs_create_dir/fs_move
 // (see the bash tool, which now covers path operations via vaultFileOps.ts).
 type FsFileOpAction = 'write'
@@ -69,36 +127,34 @@ export const LOCAL_FS_SPLIT_ACTION_TOOL_NAMES = Object.keys(
 
 export const LOCAL_FS_EDIT_TOOL_NAMES = ['fs_edit', 'fs_write'] as const
 
-export const LOCAL_MEMORY_SPLIT_ACTION_TOOL_NAMES = [
-  'memory_add',
-  'memory_update',
-  'memory_delete',
-] as const
+/**
+ * The `native_files` counterparts of `LOCAL_FS_EDIT_TOOL_NAMES` — the tools
+ * that stand for "this run can edit files" in Max, where the vault-backed
+ * ones are not exposed at all.
+ */
+export const NATIVE_FS_EDIT_TOOL_NAMES = ['edit_file', 'write_file'] as const
 
 const LOCAL_FS_WRITE_TOOL_NAMES = new Set<string>([
   'fs_edit',
   ...LOCAL_FS_SPLIT_ACTION_TOOL_NAMES,
-  'memory_add',
-  'memory_update',
-  'memory_delete',
 ])
 
 /**
  * Re-exported for external callers (`core/agent/tool-selection.ts`,
  * `core/agent/tool-preferences.ts`, `core/agent/tool-gateway.ts`) — the
  * implementation moved to `core/tools/internal/load_tool_schemas/definition.ts`
- * (D6b: it is a protocol-internal tool, not a `CAPABILITIES` member, so it
+ * (it is a protocol-internal tool, not a `CAPABILITIES` member, so it
  * lives in `internal/` rather than getting a `defineTool` entry — see that
  * module's own doc comment). This is a plain re-export, not a registry
- * lookup (master.md §3.5: compat exports may only forward a per-tool
- * module's own constant, never round-trip through the registry).
+ * lookup (compat exports may only forward a per-tool module's own
+ * constant, never round-trip through the registry).
  */
 export { LOAD_TOOL_SCHEMAS_LOCAL_TOOL_NAME, getLoadToolSchemasTool }
 
 /**
- * Model-facing catalog order, preserved verbatim from the pre-D6b literal
- * array this function used to return directly (phase2-migration.md D6b —
- * "顺序与内容逐条不变": the model's tool list must not silently reorder).
+ * Model-facing catalog order, preserved verbatim from the literal array this
+ * function used to return directly ("顺序与内容逐条不变": the model's tool
+ * list must not silently reorder).
  * Every registered `BuiltinToolName` must appear here exactly once; the
  * module-load assertions below turn "forgot to add the new tool here" into
  * an immediate throw instead of a silently incomplete catalog.
@@ -110,9 +166,6 @@ const LOCAL_FILE_TOOL_CATALOG_ORDER: readonly BuiltinToolName[] = [
   'fs_edit',
   'fs_write',
   BASH_TOOL_NAME,
-  'memory_add',
-  'memory_update',
-  'memory_delete',
   WEB_SEARCH_TOOL_NAME,
   WEB_SCRAPE_TOOL_NAME,
   JS_SANDBOX_TOOL_NAME,
@@ -120,6 +173,14 @@ const LOCAL_FILE_TOOL_CATALOG_ORDER: readonly BuiltinToolName[] = [
   'delegate_subagent',
   'ask_user_question',
   'todo_write',
+  // `native_files` (desktop-only, Max mode). Appended rather than placed
+  // next to the vault `fs_*` entries so the pre-existing catalog order the
+  // model already sees stays byte-identical.
+  'read_file',
+  'write_file',
+  'edit_file',
+  // `vault_search` (all three modes). Appended for the same reason.
+  'vault_search',
 ]
 
 assertNoDuplicates(
@@ -149,7 +210,7 @@ export function getLocalFileTools(options?: {
   return LOCAL_FILE_TOOL_CATALOG_ORDER.filter((name) => {
     // `bash`'s catalog-inclusion is gated by the `bash-engine` runtime
     // component being enabled — the one tool whose presence here was ever
-    // conditional (see the pre-D6b literal array this replaced). That
+    // conditional (see the former literal array this replaced). That
     // judgment now lives on the tool's own `isAvailable`
     // (`core/tools/bash/definition.ts`) rather than a raw
     // `isRuntimeComponentEnabled` call inline here, but this loop still has
@@ -159,8 +220,8 @@ export function getLocalFileTools(options?: {
     // `isAvailable` needs `settings`) from every catalog built here —
     // including the settings-page call sites (`AgentSection.tsx`,
     // `AgentToolsModal.tsx`, `agentToolPersistence.ts`) that need the full,
-    // unfiltered list to render toggles regardless of runtime readiness
-    // (master.md decision 18). `web_search` / `terminal_command` /
+    // unfiltered list to render toggles regardless of runtime readiness.
+    // `web_search` / `terminal_command` /
     // `js_eval` stay unconditionally listed here, exactly as before;
     // environment-availability filtering for *them* happens downstream, in
     // `McpManager.isLocalToolEnabled` (`core/mcp/mcpManager.ts`), which

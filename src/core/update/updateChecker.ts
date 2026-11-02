@@ -8,10 +8,6 @@ const GITHUB_RELEASES_URL =
 const GITHUB_RELEASE_DOWNLOAD_BASE =
   'https://github.com/Lapis0x0/obsidian-yolo/releases/download'
 
-function releaseTagUrl(version: string): string {
-  return `${GITHUB_RELEASES_URL}/tags/${encodeURIComponent(version)}`
-}
-
 /** Matches the UI page size and GitHub `per_page` for on-demand loading. */
 export const RELEASE_HISTORY_PAGE_SIZE = 10
 
@@ -46,9 +42,6 @@ export type ReleaseAssets = {
   manifestJson: ReleaseAssetMeta
   stylesCss: ReleaseAssetMeta
 }
-
-/** @deprecated Use ReleaseAssets */
-export type ReleaseAssetUrls = ReleaseAssets
 
 export type UpdateCheckResult = {
   hasUpdate: boolean
@@ -158,33 +151,6 @@ export function compareVersions(current: string, latest: string): boolean {
     if (bv < av) return false
   }
   return false
-}
-
-function isPluginVersion(version: string): boolean {
-  return /^v?\d+(?:\.\d+)*$/i.test(version.trim())
-}
-
-export function parseLatestVersionFromVersionsJson(raw: string): string | null {
-  try {
-    const parsed = JSON.parse(raw) as unknown
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return null
-    }
-
-    let latestVersion: string | null = null
-    for (const version of Object.keys(parsed)) {
-      if (!isPluginVersion(version)) {
-        continue
-      }
-      const normalized = normalizePluginVersion(version)
-      if (!latestVersion || compareVersions(latestVersion, normalized)) {
-        latestVersion = normalized
-      }
-    }
-    return latestVersion
-  } catch {
-    return null
-  }
 }
 
 export function parseReleaseNoteVersion(markdown: string): string | null {
@@ -319,9 +285,10 @@ function parseChangelogItem(text: string): ChangelogItem {
  * update toast renders (Direction 1 / "Cursor minimal card" design): a subtitle
  * plus tone-tagged sections of bullet items. The repo authors release notes in a
  * stable shape — a `##` title heading, `### {emoji} {name}` section headings, and
- * `- **Title (#ref)**: body` bullets — so this maps directly. Content that
- * appears before the first section is gathered into an unnamed leading section so
- * nothing is dropped if the format drifts.
+ * `- **Title (#ref)**: body` bullets — so this maps directly. A paragraph is
+ * read as one more item of the section it sits in, and anything before the
+ * first section opens an unnamed leading section, so a note that leads with a
+ * plain sentence still reaches the reader instead of being dropped.
  */
 export function parseChangelog(markdown: string): ParsedChangelog {
   let subtitle: string | null = null
@@ -349,14 +316,16 @@ export function parseChangelog(markdown: string): ParsedChangelog {
       continue
     }
 
+    // The GitHub Release body carries a `<!-- core-release-owner -->` marker
+    // the reader must never see.
+    if (line.startsWith('<!--')) continue
+
     const bullet = line.match(/^[-*]\s+(.*)$/)
-    if (bullet) {
-      if (!current) {
-        current = { tone: 'accent', emoji: null, name: '', items: [] }
-        sections.push(current)
-      }
-      current.items.push(parseChangelogItem(bullet[1]))
+    if (!current) {
+      current = { tone: 'accent', emoji: null, name: '', items: [] }
+      sections.push(current)
     }
+    current.items.push(parseChangelogItem(bullet ? bullet[1] : line))
   }
 
   return { subtitle, sections }
@@ -442,56 +411,6 @@ export function parseReleaseAssets(
   }
 
   return { mainJs, manifestJson, stylesCss }
-}
-
-/** @deprecated Use parseReleaseAssets */
-export function parseReleaseAssetUrls(
-  assets: GitHubReleaseAsset[] | undefined,
-): ReleaseAssets | null {
-  return parseReleaseAssets(assets)
-}
-
-/**
- * Fetches a specific GitHub release by tag/version. Returns null on failure.
- */
-export async function fetchReleaseByVersion(version: string): Promise<{
-  version: string
-  releaseUrl: string
-  assets: ReleaseAssets | null
-} | null> {
-  const normalized = normalizePluginVersion(version)
-  if (!normalized) {
-    return null
-  }
-
-  try {
-    const response = await requestUrl({
-      url: releaseTagUrl(normalized),
-      method: 'GET',
-      headers: {
-        Accept: 'application/vnd.github+json',
-      },
-    })
-
-    if (response.status < 200 || response.status >= 300) {
-      return null
-    }
-
-    const data = JSON.parse(response.text) as GitHubReleaseResponse
-    const tag = typeof data.tag_name === 'string' ? data.tag_name : ''
-    const releaseVersion = stripVersionPrefix(tag)
-    if (!releaseVersion) {
-      return null
-    }
-
-    return {
-      version: releaseVersion,
-      releaseUrl: typeof data.html_url === 'string' ? data.html_url : '',
-      assets: parseReleaseAssets(data.assets),
-    }
-  } catch {
-    return null
-  }
 }
 
 /**

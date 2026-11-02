@@ -8,7 +8,6 @@ import {
   locateReleaseHistoryPage,
   normalizePluginVersion,
   parseChangelog,
-  parseLatestVersionFromVersionsJson,
   parseReleaseAssets,
   parseReleaseNoteVersion,
   splitReleaseNotesByLanguage,
@@ -32,27 +31,6 @@ function createRequestUrlResponse(text: string): RequestUrlResponse {
     text,
   }
 }
-
-describe('parseLatestVersionFromVersionsJson', () => {
-  it('returns the highest normalized version key', () => {
-    expect(
-      parseLatestVersionFromVersionsJson(
-        JSON.stringify({
-          '1.5.9': '1.8.0',
-          '1.5.12.4': '1.8.0',
-          v1: 'ignored',
-          '1.5.12.5': '1.8.0',
-          next: 'ignored',
-        }),
-      ),
-    ).toBe('1.5.12.5')
-  })
-
-  it('returns null for invalid JSON or non-object payloads', () => {
-    expect(parseLatestVersionFromVersionsJson('not-json')).toBeNull()
-    expect(parseLatestVersionFromVersionsJson('[]')).toBeNull()
-  })
-})
 
 describe('checkForUpdate', () => {
   const asset = (name: string) => ({
@@ -408,6 +386,27 @@ describe('parseChangelog', () => {
     expect(sections).toHaveLength(1)
     expect(sections[0].name).toBe('')
     expect(sections[0].items[0].title).toBe('Loose note')
+  })
+
+  it('keeps a lead paragraph and hides the release-owner marker', () => {
+    const { sections } = parseChangelog(
+      [
+        '<!-- core-release-owner:123:1 -->',
+        '## 1.6.8 YOLO Whiteboard 🧩',
+        '',
+        '**Introducing YOLO Whiteboard** — a faster canvas.',
+        '',
+        '### Agent & tools',
+        '',
+        '- Tools are disclosed on demand.',
+      ].join('\n'),
+    )
+    expect(sections.map((section) => section.name)).toEqual([
+      '',
+      'Agent & tools',
+    ])
+    expect(sections[0].items[0].title).toBe('Introducing YOLO Whiteboard')
+    expect(sections[0].items[0].body).toBe('— a faster canvas.')
   })
 
   it('handles asterisk bullet markers (older release style) and the 🔧 tone', () => {

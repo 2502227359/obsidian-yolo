@@ -1,4 +1,3 @@
-import type { ChatContextPolicy } from '../../components/chat-view/chat-runtime-profiles'
 import type {
   AssistantToolPreference,
   AssistantToolServerPreference,
@@ -9,15 +8,13 @@ import type {
 } from '../../types/chat'
 import type { ChatModel } from '../../types/chat-model.types'
 import type { LLMProviderApiType } from '../../types/provider.types'
-import type { ContextualInjection } from '../../utils/chat/contextual-injections'
 import { RequestContextBuilder } from '../../utils/chat/requestContextBuilder'
 import { estimateJsonTokens } from '../../utils/llm/contextTokenEstimate'
 import { McpManager } from '../mcp/mcpManager'
+import type { ChatModeCapabilityOverrides } from '../tools/types'
 
-import {
-  type ToolCapabilityMode,
-  buildToolCapabilityPrompt,
-} from './tool-capability-prompt'
+import type { ChatContextPolicy } from './chat-runtime-profiles'
+import { type RuntimeMode, buildRuntimeModePrompt } from './runtime-mode-prompt'
 import { selectAllowedTools } from './tool-selection'
 
 export const estimateContinuationRequestContextTokens = async ({
@@ -27,15 +24,13 @@ export const estimateContinuationRequestContextTokens = async ({
   messages,
   conversationId,
   compaction,
-  enableTools,
-  includeBuiltinTools,
   apiType,
   allowedToolNames,
-  enableToolDisclosure,
   toolPreferences,
   toolServerPreferences,
-  contextualInjections,
-  toolCapabilityMode,
+  capabilityOverrides,
+  runtimeMode,
+  modeEnvironmentPrompt,
   modePersonaPrompt,
   modePersonaModuleId,
   moduleChatModeId,
@@ -47,59 +42,48 @@ export const estimateContinuationRequestContextTokens = async ({
   messages: ChatMessage[]
   conversationId: string
   compaction?: ChatConversationCompactionLike | null
-  enableTools: boolean
-  includeBuiltinTools: boolean
   apiType?: LLMProviderApiType | null
   allowedToolNames?: string[]
-  enableToolDisclosure?: boolean
   toolPreferences?: Record<string, AssistantToolPreference>
   toolServerPreferences?: Record<string, AssistantToolServerPreference>
-  contextualInjections?: ContextualInjection[]
-  toolCapabilityMode?: ToolCapabilityMode
+  /** The running chat mode's capability grant; see `AgentToolGateway`. */
+  capabilityOverrides?: ChatModeCapabilityOverrides
+  runtimeMode?: RuntimeMode
+  modeEnvironmentPrompt?: string
   modePersonaPrompt?: string
   modePersonaModuleId?: string
   moduleChatModeId?: string
   contextPolicy?: ChatContextPolicy
 }): Promise<number> => {
-  const availableTools = enableTools
-    ? await mcpManager.listAvailableTools({
-        includeBuiltinTools,
-        // Tailor built-in tool schemas to the active model so the token
-        // estimate reflects what the model will actually see at request time.
-        chatModelModalities: model.modalities,
-      })
-    : []
-  const {
-    filteredTools,
-    hasTools,
-    hasMemoryTools,
-    hasOnDemandTools,
-    requestTools,
-  } = await selectAllowedTools({
-    availableTools,
-    allowedToolNames,
-    toolPreferences,
-    toolServerPreferences,
-    apiType,
-    enableToolDisclosure,
-    jsSandboxSettings: mcpManager.getJsSandboxSettings(),
-    settings: mcpManager.getSettingsSnapshot(),
+  const availableTools = await mcpManager.listAvailableTools({
+    capabilityOverrides,
+    // Tailor built-in tool schemas to the active model so the token
+    // estimate reflects what the model will actually see at request time.
+    chatModelModalities: model.modalities,
   })
+  const { hasTools, hasOnDemandTools, requestTools, deferredToolCatalog } =
+    await selectAllowedTools({
+      availableTools,
+      allowedToolNames,
+      toolPreferences,
+      toolServerPreferences,
+      model,
+      apiType,
+      jsSandboxSettings: mcpManager.getJsSandboxSettings(),
+      settings: mcpManager.getSettingsSnapshot(),
+    })
 
-  const runtimeModePrompt = buildToolCapabilityPrompt({
-    mode: toolCapabilityMode ?? 'agent',
-    toolNames: filteredTools.map((tool) => tool.name),
-  })
+  const runtimeModePrompt = buildRuntimeModePrompt(runtimeMode ?? 'agent')
   const requestMessages = await requestContextBuilder.generateRequestMessages({
     messages,
     hasTools,
-    hasMemoryTools,
     hasOnDemandTools,
+    deferredToolCatalogText: deferredToolCatalog?.text,
     model,
     conversationId,
     compaction,
-    contextualInjections,
     runtimeModePrompt,
+    modeEnvironmentPrompt,
     modePersonaPrompt,
     modePersonaModuleId,
     moduleChatModeId,

@@ -3,7 +3,6 @@ import { getCapabilityForTool, listCapabilities } from '../tools/registry'
 
 import {
   BUILTIN_DEFAULT_ENABLED_TOOL_FQNS,
-  buildServerToolTokenBudgets,
   getAssistantToolApprovalMode,
   getAssistantToolDisclosureMode,
   getDefaultApprovalModeForTool,
@@ -18,28 +17,6 @@ import {
 const JS_SANDBOX_FQN = 'yolo_local__js_eval'
 
 describe('tool-preferences defaults', () => {
-  it('shares cached MCP schema costs across catalog consumers', async () => {
-    const estimate = jest.fn().mockResolvedValue(123)
-    const buildCatalog = () =>
-      new Map([
-        [
-          'cache_test_server',
-          [
-            {
-              name: 'cache_test_server__unique_tool_524',
-              description: 'schema cache regression 524',
-              inputSchema: { type: 'object' as const, properties: {} },
-            },
-          ],
-        ],
-      ])
-
-    await buildServerToolTokenBudgets(buildCatalog(), estimate)
-    await buildServerToolTokenBudgets(buildCatalog(), estimate)
-
-    expect(estimate).toHaveBeenCalledTimes(1)
-  })
-
   it('uses the server disclosure policy for every current and future tool', () => {
     const assistant = {
       toolPreferences: {},
@@ -103,7 +80,7 @@ describe('tool-preferences defaults', () => {
       )
     })
 
-    // D7 (phase2-migration.md D7 item 5): `defaultEnabled` used to be read
+    // `defaultEnabled` used to be read
     // off a hand-maintained deny-list (`BUILTIN_DEFAULT_DISABLED_TOOL_SHORT_
     // NAMES`) that had to be kept in sync with each capability's own
     // `defaultEnabled` by inspection. This pins every user-facing tool's
@@ -121,7 +98,7 @@ describe('tool-preferences defaults', () => {
       }
     })
 
-    it('the five capabilities that default off match master.md §3.1', () => {
+    it('the five capabilities that default off match the registry', () => {
       const disabledCapabilityIds = listCapabilities()
         .filter((capability) => !capability.defaultEnabled)
         .map((capability) => capability.id)
@@ -173,13 +150,12 @@ describe('tool-preferences defaults', () => {
     })
   })
 
-  // D7 (phase2-migration.md D7 items 5-7): pins every case the task's
-  // acceptance table calls out, now that `getDefaultApprovalModeForTool`
+  // Pins every default-approval case now that `getDefaultApprovalModeForTool`
   // reads `approval.defaultMode` off the owning capability instead of the
   // three retired side tables (`FULL_ACCESS_LOCAL_TOOLS`,
   // `REQUIRE_APPROVAL_LOCAL_TOOLS`, and the bash-specific `if`).
   describe('getDefaultApprovalModeForTool', () => {
-    it('fs_edit: NEW value require_approval (master.md decision 17 — the one deliberate behavior change)', () => {
+    it('fs_edit: NEW value require_approval (the one deliberate behavior change)', () => {
       expect(getDefaultApprovalModeForTool('yolo_local__fs_edit')).toBe(
         'require_approval',
       )
@@ -210,9 +186,6 @@ describe('tool-preferences defaults', () => {
       expect(getDefaultApprovalModeForTool('yolo_local__fs_read')).toBe(
         'full_access',
       )
-      expect(getDefaultApprovalModeForTool('yolo_local__memory_add')).toBe(
-        'full_access',
-      )
       expect(getDefaultApprovalModeForTool('yolo_local__todo_write')).toBe(
         'full_access',
       )
@@ -240,7 +213,7 @@ describe('tool-preferences defaults', () => {
       )
     })
 
-    it('the legacy fs_edit_ops group-name FQN also falls back to full_access — it is not a registered tool name and no live call site ever passes it (see D7b report)', () => {
+    it('the legacy fs_edit_ops group-name FQN also falls back to full_access — it is not a registered tool name and no live call site ever passes it', () => {
       expect(getDefaultApprovalModeForTool('yolo_local__fs_edit_ops')).toBe(
         'full_access',
       )
@@ -269,7 +242,7 @@ describe('tool-preferences defaults', () => {
     })
   })
 
-  // D7 (phase2-migration.md D7 item 7): `allowAlwaysAllow` used to be a
+  // `allowAlwaysAllow` used to be a
   // hand-maintained two-item list (`ALWAYS_ALLOW_DISABLED_TOOL_NAMES`,
   // consumed only by `ToolMessage.tsx`'s `isAlwaysAllowDisabled`). Pinned
   // here at the data level, since that's a rendering hook rather than an
@@ -292,7 +265,6 @@ describe('tool-preferences defaults', () => {
         [
           'file_reading',
           'file_editing',
-          'memory',
           'context_compaction',
           'context_pruning',
           'todo_list',
@@ -300,22 +272,23 @@ describe('tool-preferences defaults', () => {
           'web_access',
           'js_sandbox',
           'subagent_delegation',
+          'native_files',
+          'vault_search',
         ].sort(),
       )
     })
   })
 
-  // D9 (docs/plans/2026-08-15-tool-registry/phase2-migration.md D9): a
-  // built-in tool's FQN resolves through its owning capability's
+  // A built-in tool's FQN resolves through its owning capability's
   // `builtinCapabilityPreferences` entry now, not `toolPreferences` —
   // `toolPreferences` is exclusively remote-MCP-tool territory as of the
-  // `80_to_81` migration. Remote-tool behavior (unaffected by D9) is
-  // unchanged from before.
+  // `80_to_81` migration. Remote-tool behavior (unaffected by that
+  // migration) is unchanged from before.
   describe('isAssistantToolEnabled', () => {
     it('a built-in tool with no explicit builtinCapabilityPreferences entry falls back to its capability default', () => {
       // file_editing defaults enabled; context_compaction defaults disabled
-      // (master.md §3.1) — no fill-in happens in toolPreferences for either,
-      // since built-ins never read it at all post-D9.
+      // — no fill-in happens in toolPreferences for either, since built-ins
+      // never read it at all after the `80_to_81` migration.
       const assistant = {
         toolPreferences: {},
         enabledToolNames: [],
@@ -441,23 +414,10 @@ describe('tool-preferences defaults', () => {
       })
       expect(result).toContain('Gemini__get_all_tabs')
     })
-
-    it('excludes built-in tools when includeBuiltinTools is false', () => {
-      const result = getEnabledAssistantToolNames({
-        toolPreferences: {
-          Gemini__get_all_tabs: { enabled: true },
-        },
-        enabledToolNames: [],
-        includeBuiltinTools: false,
-      })
-      expect(result).not.toContain('yolo_local__fs_write')
-      expect(result).toContain('Gemini__get_all_tabs')
-    })
   })
 
   describe('getAssistantToolApprovalMode (js_eval)', () => {
-    // D9 (docs/plans/2026-08-15-tool-registry/phase2-migration.md D9): a
-    // built-in tool's approval mode is now read from its owning capability's
+    // A built-in tool's approval mode is now read from its owning capability's
     // `builtinCapabilityPreferences` entry, not from a `toolPreferences[fqn]`
     // entry — `toolPreferences` no longer carries built-in tool state at all.
     it.each(['full_access', 'require_approval'] as const)(

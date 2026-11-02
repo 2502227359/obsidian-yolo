@@ -1,9 +1,11 @@
 import { v4 as uuidv4 } from 'uuid'
 
+import type { ChatMode } from '../../core/agent/chat-mode'
+import { isModuleChatMode } from '../../core/agent/chat-mode'
 import type {
   AgentConversationRunSummary,
   AgentConversationState,
-  AgentService,
+  AgentSessionService,
 } from '../../core/agent/service'
 import type {
   ChatRuntimeId,
@@ -34,7 +36,7 @@ import { groupAssistantAndToolMessages } from '../../utils/chat/message-groups'
 import type { RequestContextBuilder } from '../../utils/chat/requestContextBuilder'
 import { stampUserMessageTimeContext } from '../../utils/prompt/timeContext'
 
-import { type ChatMode, isModuleChatMode } from './chat-input/ChatModeSelect'
+import { yoloPreferencePatch } from './chat-input/ChatModeSelect'
 import {
   buildAssistantErrorContinuation,
   buildRetrySubmissionMessages,
@@ -80,9 +82,7 @@ export type ChatSessionSnapshot = {
 
 /**
  * Persist-call outcome, reported back to the caller instead of surfacing a
- * `Notice` directly — Notice/i18n stay in the React hook layer (see
- * `docs/plans/2026-08-11-arch-governance-step3-chat-state-ownership.md`,
- * "分期 C" boundary rules).
+ * `Notice` directly — Notice/i18n stay in the React hook layer.
  */
 export type ChatSessionPersistOutcome = {
   kind: 'persisted'
@@ -92,8 +92,7 @@ export type ChatSessionPersistOutcome = {
 /**
  * Everything `submit`/`abortRun` need from the CLI runtime side for the
  * currently-active CLI runtime. Still React state owned by
- * `useCliRuntimeOrchestration` (see plan "分期 C" boundary rules — CLI
- * orchestration state stays there until C3); Chat.tsx assembles a fresh bag
+ * `useCliRuntimeOrchestration`; Chat.tsx assembles a fresh bag
  * every render behind a `useLatestRef` and hands the controller only a
  * zero-arg getter, so this file never imports `obsidian` or React to type
  * `app`/`settings` directly (`buildEnvironmentContext` is pre-bound by the
@@ -142,7 +141,7 @@ export type ChatSessionSubmitInput = {
    * selectedSkills/reasoningLevel already resolved, not yet time-stamped. */
   message: ChatUserMessage
   /** Resolved by the hook from settings + selected assistant (policy input —
-   * see the C1 branch-policy precedent in `branchFromAssistantGroup`). Only
+   * see the branch-policy precedent in `branchFromAssistantGroup`). Only
    * consulted on the yolo path; the CLI path always stamps (see
    * `submitCliComposerTurn`). */
   assistantTimeContextEnabled: boolean
@@ -216,12 +215,12 @@ export type ChatSessionRunConversationParams = {
 
 export type ChatSessionControllerDeps = {
   /**
-   * Long-lived object — read the current AgentService through a getter
+   * Long-lived object — read the current AgentSessionService through a getter
    * rather than caching it, matching CLAUDE.md's "Runtime Boundaries" rule
    * for every other controller in this directory.
    */
   getAgentService: () => Pick<
-    AgentService,
+    AgentSessionService,
     | 'subscribe'
     | 'getState'
     | 'replaceConversationMessages'
@@ -259,7 +258,7 @@ export type ChatSessionControllerDeps = {
    */
   chatModeForSave: (mode: ChatMode) => ChatMode
 
-  // === C2 additions: submit/abort/compact/retry/recover/continue ===
+  // === Submit/abort/compact/retry/recover/continue ===
 
   /** `RequestContextBuilder` changes identity when `settings` changes — read
    * it through a getter, not a captured reference (same reason
@@ -269,8 +268,8 @@ export type ChatSessionControllerDeps = {
     'compileUserMessagePrompt'
   >
   /** Wraps `useChatStreamManager().submitChatMutation.mutate` — streaming
-   * itself is not moved into the controller (plan: "本分期不重写 streaming
-   * 层"), only the call-time orchestration around it. */
+   * itself is not moved into the controller, only the call-time
+   * orchestration around it. */
   runConversation: (
     params: ChatSessionRunConversationParams,
     options?: { onSettled?: () => void },
@@ -287,9 +286,10 @@ export type ChatSessionControllerDeps = {
   /**
    * Scroll writes stay behind an injected trigger — never a direct
    * `scrollTop` write from this file (CLAUDE.md "Chat Runtime Invariants").
-   * `deferToNextFrame` preserves the pre-C2 difference between call sites:
-   * `handleUserMessageSubmit` wrapped its call in `requestAnimationFrame`,
-   * `handleAssistantErrorContinue` called it synchronously. Scheduling is
+   * `deferToNextFrame` preserves the original hook-side difference between
+   * call sites: `handleUserMessageSubmit` wrapped its call in
+   * `requestAnimationFrame`, `handleAssistantErrorContinue` called it
+   * synchronously. Scheduling is
    * the dep's job (Chat.tsx wraps it when asked) so this file never touches
    * a browser-only global and stays runnable under Jest's Node test
    * environment.
@@ -298,13 +298,14 @@ export type ChatSessionControllerDeps = {
   setQueryProgress: (action: SetStateActionLike<QueryProgressState>) => void
   /** Bumped once per new user turn entering the conversation (queued or
    * submitted) so any in-flight CLI/native-action navigation token is
-   * invalidated — mirrors the pre-C2 `invalidateChatRuntimeNavigation` call
-   * site. Plain `{ current }` object (not `MutableRefObject`) to keep this
+   * invalidated — mirrors the original hook-side
+   * `invalidateChatRuntimeNavigation` call site. Plain `{ current }` object (not `MutableRefObject`) to keep this
    * file React-import-free. */
   runtimeNavigationGenerationRef: { current: number }
   /** `null` whenever the active runtime is `'yolo'`, or the CLI orchestration
    * hook hasn't produced a ready controller/coordinator/scope yet — mirrors
-   * the pre-C2 `if (!controller || !coordinator || !scope) return` guard. */
+   * the original hook-side `if (!controller || !coordinator || !scope) return`
+   * guard. */
   getCliSubmitContext: () => ChatSessionCliContext | null
 }
 
@@ -336,8 +337,7 @@ export type BranchFromAssistantGroupResult = {
  * `messageModelMap` / `messageReasoningMap` /
  * `assistantGroupBoundaryMessageIds` / `activeBranchByUserMessageId`.
  *
- * See `docs/plans/2026-08-11-arch-governance-step3-chat-state-ownership.md`,
- * "分期 C" ("C1" slice). Plain TS class — zero React / zero `obsidian`
+ * Plain TS class — zero React / zero `obsidian`
  * imports, one instance per ChatView (constructed via `useRef` in Chat.tsx,
  * same lifecycle as `ConversationPreferencesController`). React subscribes
  * through `useSyncExternalStore(controller.subscribe, controller.getSnapshot)`.
@@ -346,30 +346,29 @@ export type BranchFromAssistantGroupResult = {
  * - Raw `SetStateActionLike` setters (`setChatMessages` etc.) — drop-in
  *   replacements for the `useState` setters they used to be, for call sites
  *   that only ever "reduce over the array" (mentionable edits, and the
- *   surviving pre-C2 write points in `useChatDomainActions`/`YoloChatSurface`
- *   documented in the plan). No cascading side effects.
+ *   remaining write points in `useChatDomainActions`/`YoloChatSurface`). No
+ *   cascading side effects.
  * - Semantic commands (`removeHistoricalUserMessage`,
  *   `handleAssistantMessageGroupBranch`, ...) — full edit/delete/branch
  *   transactions, including persistence. They return typed results instead
  *   of surfacing `Notice`; the calling hook translates results into UI
  *   reactions (Notice, focus, scroll, input-box rebuild).
  *
- * AgentService is the authoritative source for `chatMessages` /
+ * AgentSessionService is the authoritative source for `chatMessages` /
  * `compactionState` / `pendingCompactionAnchorMessageId` *while a run is in
  * flight or has left tracked state behind* — the controller keeps its own
  * subscription (re-pointed whenever `currentConversationId` changes) and
  * merges pushes into its snapshot, replacing the mirrored `setChatMessages`
  * calls `useChatStreamManager` used to make into React state directly. Direct
- * edits (this file's commands) remain legitimate — see the 2026-08-11
- * architecture-governance audit referenced in the plan for why these three
- * fields are not pure AgentService shadows.
+ * edits (this file's commands) remain legitimate: these three fields are not
+ * pure AgentSessionService shadows.
  */
 export class ChatSessionController {
   private snapshot: ChatSessionSnapshot
   private readonly listeners = new Set<Listener>()
   private agentUnsubscribe: (() => void) | null = null
   /** Guards `continueAssistantError` against re-entrant clicks — equivalent
-   * to the pre-C2 `assistantContinuationPendingRef` in
+   * to the former `assistantContinuationPendingRef` in
    * `useChatDomainActions.ts`, now a plain field instead of a React ref. */
   private assistantContinuationPending = false
 
@@ -430,7 +429,7 @@ export class ChatSessionController {
   }
 
   /**
-   * Re-establish the AgentService subscription after `dispose()` dropped it.
+   * Re-establish the AgentSessionService subscription after `dispose()` dropped it.
    * React StrictMode (dev builds — see ChatView.tsx) replays the mount effect
    * as setup → cleanup → setup; without this, the cleanup's `dispose()` would
    * leave the second mount permanently unsubscribed.
@@ -475,9 +474,9 @@ export class ChatSessionController {
     })
   }
 
-  // === Pure helpers (duplicated from useYoloChatSession.ts intentionally —
-  // see the C1 completion report for why: importing them would either pull
-  // React into this module or force an awkward controller -> hook edge). ===
+  // === Pure helpers (duplicated from useYoloChatSession.ts intentionally:
+  // importing them would either pull React into this module or force an
+  // awkward controller -> hook edge). ===
 
   private normalizeAssistantGroupBoundaryMessageIds(
     messages: ChatMessage[],
@@ -501,8 +500,7 @@ export class ChatSessionController {
   /**
    * Public (unlike the other grouping helpers below): the hook layer calls
    * this directly for the mentionable-delete-from-all boundary recompute
-   * (`useChatInputController.ts`'s `handleMentionableDeleteFromAll` — see
-   * the C2 migration list, "boundary 工具已是 controller 能力").
+   * (`useChatInputController.ts`'s `handleMentionableDeleteFromAll`).
    */
   buildAssistantGroupBoundaryMessageIdsAfterUserRemoval(
     sourceMessages: ChatMessage[],
@@ -592,7 +590,7 @@ export class ChatSessionController {
   }
 
   /**
-   * Align AgentService's in-memory copy of the conversation with a message
+   * Align AgentSessionService's in-memory copy of the conversation with a message
    * list the user just mutated outside of a run (deletions). Without this the
    * service keeps the pre-deletion list and any later publish — a background
    * task result appending to `entry.state.messages`, for instance — pushes the
@@ -635,7 +633,10 @@ export class ChatSessionController {
     const effectiveOverrides = {
       ...(prefs.conversationOverrides ?? {}),
       chatMode: this.deps.chatModeForSave(prefs.persistedChatMode),
-      agentYoloEnabled: prefs.yoloEnabled,
+      // `yoloEnabled` describes the trust profile of the mode being saved, so
+      // it is written back under that mode's own field and leaves the other
+      // mode's stored value alone.
+      ...yoloPreferencePatch(prefs.persistedChatMode, prefs.yoloEnabled),
     }
     const reasoningLevel =
       this.preferencesController.conversationReasoningLevelRef.current.get(
@@ -674,7 +675,7 @@ export class ChatSessionController {
   }
 
   /** Same as `persist`, but through `createOrUpdateConversationImmediately`
-   * (no debounce) — used by the C2 recovery paths that must land on disk
+   * (no debounce) — used by the recovery paths that must land on disk
    * before the next `run()` call reads the conversation back. */
   private persistImmediately(
     messages: ChatMessage[],
@@ -685,7 +686,10 @@ export class ChatSessionController {
     const effectiveOverrides = {
       ...(prefs.conversationOverrides ?? {}),
       chatMode: this.deps.chatModeForSave(prefs.persistedChatMode),
-      agentYoloEnabled: prefs.yoloEnabled,
+      // `yoloEnabled` describes the trust profile of the mode being saved, so
+      // it is written back under that mode's own field and leaves the other
+      // mode's stored value alone.
+      ...yoloPreferencePatch(prefs.persistedChatMode, prefs.yoloEnabled),
     }
     const reasoningLevel =
       this.preferencesController.conversationReasoningLevelRef.current.get(
@@ -742,7 +746,7 @@ export class ChatSessionController {
   }
 
   /** Duplicated from `useChatDomainActions.ts` intentionally — same
-   * rationale as the grouping helpers above (C1 completion report): pulling
+   * rationale as the grouping helpers above: pulling
    * it in would either import React into this module or create a
    * controller -> hook edge for a five-line pure function. */
   private getLatestUserSelectedModelIds(
@@ -787,7 +791,7 @@ export class ChatSessionController {
   /**
    * Equivalent to the original `handleUserMessageSubmit`
    * (`useChatDomainActions.ts`): compiles the submitted user message's
-   * prompt, writes the working copy + AgentService + debounced persistence,
+   * prompt, writes the working copy + AgentSessionService + debounced persistence,
    * and triggers the run. Shared by the normal `submit()` yolo path and
    * `retryAssistantMessageGroup` (its `retryBranchTarget` is the only thing
    * that differs between the two call sites, exactly as before the move).
@@ -803,7 +807,7 @@ export class ChatSessionController {
     retryBranchTarget?: ChatSessionRunConversationBranchTarget
     persistedMessageModelMap?: Map<string, string>
   }): Promise<void> {
-    // Captured once, matching the pre-C2 closure semantics: everything after
+    // Captured once, matching the original hook closure semantics: everything after
     // the awaited prompt compilation below must keep targeting the
     // conversation (and its maps) as of the moment the user hit submit — the
     // user may load another conversation while the await is in flight.
@@ -895,7 +899,7 @@ export class ChatSessionController {
       {
         ...(prefs.conversationOverrides ?? {}),
         chatMode: prefs.chatMode,
-        agentYoloEnabled: prefs.yoloEnabled,
+        ...yoloPreferencePatch(prefs.chatMode, prefs.yoloEnabled),
       },
       prefs.conversationModelId,
       this.serializeMessageModelMap(
@@ -1107,7 +1111,7 @@ export class ChatSessionController {
   }
 
   /**
-   * Changing the conversation identity re-points the AgentService
+   * Changing the conversation identity re-points the AgentSessionService
    * subscription — every other setter is a plain field write.
    */
   setCurrentConversationId = (action: SetStateActionLike<string>): void => {
@@ -1312,10 +1316,10 @@ export class ChatSessionController {
 
   /**
    * Equivalent to the original `handleAssistantMessageGroupBranch`, plus the
-   * confirmed AgentService-registration fix: the branched conversation's
-   * messages are now registered into AgentService memory (`replaceConversationMessages`
+   * confirmed AgentSessionService-registration fix: the branched conversation's
+   * messages are now registered into AgentSessionService memory (`replaceConversationMessages`
    * + re-pointing this controller's own subscription) before persistence,
-   * instead of only ever reaching AgentService on the first submit in the new
+   * instead of only ever reaching AgentSessionService on the first submit in the new
    * branch.
    *
    * `policy` carries every value that depends on settings / the module
@@ -1394,7 +1398,7 @@ export class ChatSessionController {
       activeBranchByUserMessageId: nextActiveBranchByUserMessageId,
     })
 
-    // Fix: register into AgentService memory before anything else observes
+    // Fix: register into AgentSessionService memory before anything else observes
     // `newConversationId` — see method doc.
     this.deps
       .getAgentService()
@@ -1417,7 +1421,10 @@ export class ChatSessionController {
           {
             ...(policy.nextOverrides ?? {}),
             chatMode: this.deps.chatModeForSave(policy.nextPersistedChatMode),
-            agentYoloEnabled: policy.nextYoloEnabled,
+            ...yoloPreferencePatch(
+              policy.nextPersistedChatMode,
+              policy.nextYoloEnabled,
+            ),
           },
           policy.resolvedConversationModelId,
           this.serializeMessageModelMap(nextMessages, nextMessageModelMap),
@@ -1447,7 +1454,7 @@ export class ChatSessionController {
     }
   }
 
-  // === C2 commands: submit / abort / compact / retry / recover / continue ===
+  // === Commands: submit / abort / compact / retry / recover / continue ===
 
   /**
    * Equivalent to `handleMainInputSubmit` (`useChatInputController.ts`),
@@ -1499,7 +1506,7 @@ export class ChatSessionController {
         return { kind: 'blocked_enqueue_awaiting_approval' }
       }
       // 'idle' falls through to the normal submit path below, matching the
-      // pre-C2 behavior.
+      // original hook behavior.
     }
 
     if (runSummary.isActive) {
@@ -1563,14 +1570,13 @@ export class ChatSessionController {
    * hook's own `cliOperationCoordinator.transition` (native CLI compaction
    * has no local message-state to own here).
    *
-   * Implicit-dependency note (see the plan's C2 design-audit section): this
-   * method does not call `this.setCompactionState` directly after a
-   * successful compaction. `replaceConversationMessages` below reaches this
-   * same controller's own AgentService subscription (`mergeAgentState`,
-   * re-pointed per `currentConversationId` since C1), which synchronously
-   * folds the new compaction entry into this snapshot. Confirmed still true
-   * post-C1: the controller, not `useChatStreamManager`, now owns that
-   * subscription.
+   * Implicit-dependency note: this method does not call
+   * `this.setCompactionState` directly after a successful compaction.
+   * `replaceConversationMessages` below reaches this same controller's own
+   * AgentSessionService subscription (`mergeAgentState`, re-pointed per
+   * `currentConversationId`), which synchronously folds the new compaction
+   * entry into this snapshot. The controller, not `useChatStreamManager`,
+   * owns that subscription.
    */
   async compactContext(input: {
     currentConversationRunSummary: Pick<
@@ -1589,7 +1595,7 @@ export class ChatSessionController {
       return { kind: 'empty' }
     }
 
-    // Captured once, matching the pre-C2 closure semantics: the awaited
+    // Captured once, matching the original hook closure semantics: the awaited
     // compaction below must keep targeting the conversation (and its maps
     // and preferences) it started in — the user may load another
     // conversation while the await is in flight.
@@ -1626,14 +1632,14 @@ export class ChatSessionController {
           nextCompactionHistory,
         )
 
-      // Intentionally mirrors the pre-C2 behavior exactly: raw `chatMode`
+      // Intentionally mirrors the original hook behavior exactly: raw `chatMode`
       // here, not `chatModeForSave(persistedChatMode)` like `persist()` uses
       // — an existing discrepancy carried over unchanged, not something
       // introduced by this move.
       const effectiveOverrides = {
         ...(prefs.conversationOverrides ?? {}),
         chatMode: prefs.chatMode,
-        agentYoloEnabled: prefs.yoloEnabled,
+        ...yoloPreferencePatch(prefs.chatMode, prefs.yoloEnabled),
       }
       await this.deps.createOrUpdateConversationImmediately(
         conversationId,

@@ -24,7 +24,7 @@ import {
   buildAllowedSkillPathSet,
   buildRagScopeForWorkspace,
   describePathDenial,
-  isCoveredBySkillPathExemption,
+  isCoveredByScopeExemption,
   isVisibleForTraversal,
   resolvePathVisibility,
 } from '../agent/workspaceScope'
@@ -2282,15 +2282,14 @@ function deepCloneJson<T>(value: T): T {
 
 // --- $vault / $browser / $fetch / $db proxy-handler construction ---------
 //
-// Moved here verbatim from `core/mcp/localFileTools.ts` (D6 batch 6,
-// docs/plans/2026-08-15-tool-registry/phase2-migration.md). Every helper in
+// Moved here verbatim from `core/mcp/localFileTools.ts`. Every helper in
 // this section had exactly one call site — inside `buildJsSandboxProxyHandlers`
-// itself — so per the "谁用它谁收留" rule (phase2-migration.md D6 "注意") the
-// whole cluster relocates together rather than leaving a stub behind.
+// itself — so per the "谁用它谁收留" rule the whole cluster relocates
+// together rather than leaving a stub behind.
 //
-// This move exists to satisfy master.md's D6 batch 6 requirement without
-// creating a new `core/tools/* -> core/mcp/localFileTools.ts` value import
-// (forbidden by the D6a fix, master.md §D6a): `core/tools/js_eval/definition.ts`
+// This move exists to avoid creating a new `core/tools/* ->
+// core/mcp/localFileTools.ts` value import (forbidden):
+// `core/tools/js_eval/definition.ts`
 // needs to build these proxy handlers, and this file — jsSandboxTool.ts,
 // js_eval's designated external-implementation home — is a dependency
 // `core/tools/*` may safely import from (localFileTools.ts already imports
@@ -2328,7 +2327,7 @@ const resolveFolderByPath = (
   if (
     scope?.enabled &&
     !isVisibleForTraversal(normalizedPath, scope) &&
-    !(exemptPaths && isCoveredBySkillPathExemption(normalizedPath, exemptPaths))
+    !(exemptPaths && isCoveredByScopeExemption(normalizedPath, exemptPaths))
   ) {
     throw new Error(describePathDenial('out-of-scope', trimmedPath, 'folder'))
   }

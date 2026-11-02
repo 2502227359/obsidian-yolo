@@ -1,4 +1,3 @@
-import type { ChatContextPolicy } from '../../components/chat-view/chat-runtime-profiles'
 import type { AssistantToolApprovalMode } from '../../types/assistant.types'
 import {
   ChatConversationCompactionLike,
@@ -16,9 +15,12 @@ import { RequestContextBuilder } from '../../utils/chat/requestContextBuilder'
 import { BaseLLMProvider } from '../llm/base'
 import type { ResponseDeliveryMode } from '../llm/responseDeliveryMode'
 import { McpManager } from '../mcp/mcpManager'
+import type { NativePathBoundary } from '../tools/native/paths'
+import type { ChatModeCapabilityOverrides } from '../tools/types'
 
-import type { AutoContextCompactionChatOptions } from './compaction'
-import type { ToolCapabilityMode } from './tool-capability-prompt'
+import type { ChatContextPolicy } from './chat-runtime-profiles'
+import type { AutoContextCompactionInput } from './compaction'
+import type { RuntimeMode } from './runtime-mode-prompt'
 
 export type AgentRuntimeSnapshot = {
   messages: ChatMessage[]
@@ -65,7 +67,6 @@ export type AgentRuntimeRunInput = {
     streamFallbackRecoveryEnabled?: boolean
   }
   allowedToolNames?: string[]
-  enableToolDisclosure?: boolean
   toolPreferences?: Record<
     string,
     {
@@ -74,10 +75,9 @@ export type AgentRuntimeRunInput = {
     }
   >
   /**
-   * Per-capability enabled/approval state for built-in tools (D9,
-   * docs/plans/2026-08-15-tool-registry/phase2-migration.md D9). Sibling to
-   * `toolPreferences` above, which as of that migration only carries remote
-   * MCP tool state — built-in tool approval/enablement resolution
+   * Per-capability enabled/approval state for built-in tools. Sibling to
+   * `toolPreferences` above, which as of the `80_to_81` migration only
+   * carries remote MCP tool state — built-in tool approval/enablement resolution
    * (`AgentToolGateway.resolveApprovalMode`/`isToolAllowed`) needs both.
    */
   builtinCapabilityPreferences?: Record<
@@ -100,8 +100,31 @@ export type AgentRuntimeRunInput = {
     exclude: string[]
   }
   allowedSkillPaths?: string[]
+  /**
+   * The running chat mode's own capability grant (see
+   * `ChatModeCapabilityOverride`). Reaches both `AgentToolGateway` and, via
+   * it and `AgentLlmTurnExecutor`, `McpManager` — a capability the mode
+   * forces on must be offered to the model *and* executable.
+   */
+  capabilityOverrides?: ChatModeCapabilityOverrides
+  /**
+   * Where the vault is and what `~` means, for the outside-the-vault
+   * approval. Present only for a mode that enforces that boundary (Max).
+   */
+  vaultPathBoundary?: NativePathBoundary
+  /**
+   * What to stamp on a queued user message the run takes in mid-way. The
+   * message that starts the run arrives already stamped by its caller.
+   */
   contextualInjections?: ContextualInjection[]
-  toolCapabilityMode?: ToolCapabilityMode
+  runtimeMode?: RuntimeMode
+  /**
+   * Environment facts the running mode states to the model (cwd, OS, shell,
+   * date, tool discipline). Only Max supplies one — see
+   * `buildMaxEnvironmentPrompt`. Rendered as its own `system.max-mode`
+   * section, not folded into the persona or the capability prompt.
+   */
+  modeEnvironmentPrompt?: string
   /** Module chat mode persona, injected in place of assistant instructions. */
   modePersonaPrompt?: string
   /** The owning module id, for the persona injection's `module="..."` attribute. */
@@ -129,18 +152,14 @@ export type AgentRuntimeRunInput = {
   session?: ProviderSessionAccessor
   /** See `LLMOptions.nativeToolPolicy`. */
   nativeToolPolicy?: NativeToolPolicy
-  autoContextCompaction?: {
-    chatOptions: AutoContextCompactionChatOptions
-    maxContextTokens?: number
-  }
+  /** Forced compaction threshold; absent turns it off for this run. */
+  autoContextCompaction?: AutoContextCompactionInput
   /**
    * Optional hook called at every `llm_request` boundary inside the runtime
    * loop. Returns user messages that should be merged into the response stream
    * before the next LLM turn together with the visual-turn anchor they create.
    * Used to inject mid-run user messages enqueued by the service layer.
    * Returning null is a no-op.
-   *
-   * Not invoked by the single-turn fast path (single LLM call, no boundary).
    */
   drainPendingUserMessages?: () => AgentPendingUserMessageDrain | null
   /** Isolated subagent runs: replace the normal system prompt assembly. */
@@ -174,9 +193,7 @@ export type AgentRuntimeRunInput = {
 }
 
 export type AgentRuntimeLoopConfig = {
-  enableTools: boolean
   maxAutoIterations: number
-  includeBuiltinTools: boolean
 }
 
 export type AgentWorkerInbound =

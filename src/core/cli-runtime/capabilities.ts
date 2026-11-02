@@ -5,24 +5,25 @@ import type { ChatRuntimeId, CliRuntimeId } from './types'
  * visibility and entry guards. Process differences must stay inside each
  * runtime implementation — never branch behavior on these fields.
  *
- * Fields are inducted from the guards they replace (see
- * `docs/plans/2026-08-11-arch-governance-step2-survey.md`); do not add a
- * field ahead of an actual guard that needs it.
+ * Fields are inducted from the guards they replace; do not add a field
+ * ahead of an actual guard that needs it.
  */
 export type ChatRuntimeCapabilities = Readonly<{
-  /** Shift+Tab plan-mode shortcut and plan/agent mode switching (A20). */
+  /** Shift+Tab plan-mode shortcut and plan/agent mode switching. */
   supportsPlanMode: boolean
-  /** Needs `warmConversationRuntime` before first use (A25, codex only). */
+  /** Shows the YOLO auto-approval toggle for this runtime. */
+  showsYoloToggle: boolean
+  /** Needs `warmConversationRuntime` before first use (codex only). */
   needsWarmup: boolean
-  /** Loads provider-native skills into the skills picker (A12). */
+  /** Loads provider-native skills into the skills picker. */
   hasNativeSkills: boolean
-  /** Has a native MCP server status panel (A5, B8). */
+  /** Has a native MCP server status panel. */
   hasNativeMcpPanel: boolean
-  /** Has a plugin manager surface (B8, claude-code only). */
+  /** Has a plugin manager surface (claude-code only). */
   hasPluginManagement: boolean
-  /** Shows the assistant selector (B5, yolo only). */
+  /** Shows the assistant selector (yolo only). */
   hasAssistants: boolean
-  /** Supports rewriting an already-sent user turn (A17). */
+  /** Supports rewriting an already-sent user turn. */
   supportsMessageRewrite: boolean
   /**
    * Shows the `/` compact-context command. Hermes supports it through its
@@ -31,17 +32,19 @@ export type ChatRuntimeCapabilities = Readonly<{
    * their own profile supplies a compact command.
    */
   supportsContextCompaction: boolean
-  /** Supports exporting the conversation to the vault (B6, yolo only). */
+  /** Supports exporting the conversation to the vault (yolo only). */
   supportsVaultExport: boolean
-  /** Subagent transcripts can be watched live, not just read once (C3). */
+  /** Subagent transcripts can be watched live, not just read once. */
   supportsSubagentWatch: boolean
-  /** Shows the main-input model control and allows `@model` mentions (B1). */
+  /** Shows the main-input model control and allows `@model` mentions. */
   supportsModelControl: boolean
-  /** Shows the main-input reasoning-effort selector (B1). */
+  /** Shows the main-input reasoning-effort selector. */
   supportsReasoningSelect: boolean
-  /** Main input skips its yolo-only image/model capability check (B1). */
+  /** Main input skips its yolo-only image/model capability check. */
   skipsImageModelCapabilityCheck: boolean
-  /** Main input allows queueing a message while a run is in flight (B1). */
+  /** Main input accepts image attachments for this runtime. */
+  supportsImageAttachments: boolean
+  /** Main input allows queueing a message while a run is in flight. */
   supportsQueueWhileGenerating: boolean
 }>
 
@@ -51,6 +54,7 @@ export const RUNTIME_CAPABILITIES: Record<
 > = {
   yolo: {
     supportsPlanMode: false,
+    showsYoloToggle: true,
     needsWarmup: false,
     hasNativeSkills: false,
     hasNativeMcpPanel: false,
@@ -63,10 +67,12 @@ export const RUNTIME_CAPABILITIES: Record<
     supportsModelControl: true,
     supportsReasoningSelect: true,
     skipsImageModelCapabilityCheck: false,
+    supportsImageAttachments: true,
     supportsQueueWhileGenerating: true,
   },
   'claude-code': {
     supportsPlanMode: true,
+    showsYoloToggle: true,
     needsWarmup: false,
     hasNativeSkills: true,
     hasNativeMcpPanel: true,
@@ -79,10 +85,12 @@ export const RUNTIME_CAPABILITIES: Record<
     supportsModelControl: false,
     supportsReasoningSelect: false,
     skipsImageModelCapabilityCheck: true,
+    supportsImageAttachments: true,
     supportsQueueWhileGenerating: false,
   },
   codex: {
     supportsPlanMode: false,
+    showsYoloToggle: true,
     needsWarmup: true,
     hasNativeSkills: true,
     hasNativeMcpPanel: true,
@@ -95,10 +103,12 @@ export const RUNTIME_CAPABILITIES: Record<
     supportsModelControl: false,
     supportsReasoningSelect: false,
     skipsImageModelCapabilityCheck: true,
+    supportsImageAttachments: true,
     supportsQueueWhileGenerating: false,
   },
   hermes: {
     supportsPlanMode: false,
+    showsYoloToggle: true,
     needsWarmup: false,
     hasNativeSkills: false,
     hasNativeMcpPanel: false,
@@ -111,10 +121,12 @@ export const RUNTIME_CAPABILITIES: Record<
     supportsModelControl: false,
     supportsReasoningSelect: false,
     skipsImageModelCapabilityCheck: true,
+    supportsImageAttachments: true,
     supportsQueueWhileGenerating: false,
   },
   pi: {
     supportsPlanMode: false,
+    showsYoloToggle: true,
     needsWarmup: false,
     hasNativeSkills: false,
     hasNativeMcpPanel: false,
@@ -133,6 +145,76 @@ export const RUNTIME_CAPABILITIES: Record<
     supportsModelControl: false,
     supportsReasoningSelect: false,
     skipsImageModelCapabilityCheck: true,
+    supportsImageAttachments: true,
+    supportsQueueWhileGenerating: false,
+  },
+  // oh-my-pi is a hard fork of pi speaking the same RPC protocol, so it
+  // exposes exactly the same product surface — kept field-for-field identical
+  // to `pi` above rather than guessing at extra capabilities.
+  omp: {
+    supportsPlanMode: false,
+    showsYoloToggle: true,
+    needsWarmup: false,
+    hasNativeSkills: false,
+    hasNativeMcpPanel: false,
+    hasPluginManagement: false,
+    hasAssistants: false,
+    supportsMessageRewrite: true,
+    supportsContextCompaction: true,
+    supportsVaultExport: false,
+    supportsSubagentWatch: false,
+    supportsModelControl: false,
+    supportsReasoningSelect: false,
+    skipsImageModelCapabilityCheck: true,
+    supportsImageAttachments: true,
+    supportsQueueWhileGenerating: false,
+  },
+  // CodeBuddy Code speaks ACP with the fullest capability set of any agent
+  // behind `AcpCliRuntime` so far: it advertises `loadSession`, image
+  // prompts, and permission policies as ACP session modes — including a
+  // `plan` one, which is why this is the first ACP runtime with plan mode
+  // turned on. Rewrite stays off because ACP has no call for it, and the MCP
+  // panel stays off because the generic ACP runtime has no status call for
+  // it. Native skills are on: CodeBuddy marks which advertised commands are
+  // skills (`isSkillCommand` in its profile).
+  codebuddy: {
+    supportsPlanMode: true,
+    showsYoloToggle: true,
+    needsWarmup: false,
+    hasNativeSkills: true,
+    hasNativeMcpPanel: false,
+    hasPluginManagement: false,
+    hasAssistants: false,
+    supportsMessageRewrite: false,
+    supportsContextCompaction: true,
+    supportsVaultExport: false,
+    supportsSubagentWatch: false,
+    // Same reasoning as pi/claude-code: these two gate the *yolo-native*
+    // model and reasoning pickers, which would conflict with CodeBuddy's own
+    // model list. The CLI model picker still renders via CliRuntimeControls,
+    // fed by whatever models the agent reports on `session/new`.
+    supportsModelControl: false,
+    supportsReasoningSelect: false,
+    skipsImageModelCapabilityCheck: true,
+    supportsImageAttachments: true,
+    supportsQueueWhileGenerating: false,
+  },
+  grok: {
+    supportsPlanMode: false,
+    showsYoloToggle: false,
+    needsWarmup: false,
+    hasNativeSkills: false,
+    hasNativeMcpPanel: false,
+    hasPluginManagement: false,
+    hasAssistants: false,
+    supportsMessageRewrite: false,
+    supportsContextCompaction: false,
+    supportsVaultExport: false,
+    supportsSubagentWatch: false,
+    supportsModelControl: false,
+    supportsReasoningSelect: false,
+    skipsImageModelCapabilityCheck: true,
+    supportsImageAttachments: false,
     supportsQueueWhileGenerating: false,
   },
 }

@@ -13,10 +13,17 @@ import type { StagedModuleContributions } from './contributionStager'
 import { ModuleContributionStager } from './contributionStager'
 import type { ModuleHostCapabilityProviderV1 } from './hostCapabilities'
 import { ModuleLifecycleScope } from './lifecycleScope'
+import {
+  ModuleFileMenuRegistry,
+  ModuleFileViewSlot,
+  createModuleFileView,
+} from './moduleFileView'
 import { resolveLocalizedText } from './moduleI18n'
+import { ModuleRibbonSlots } from './moduleRibbonSlots'
 import { installYoloModuleRuntimeBridge } from './runtimeBridge'
 import type {
   YoloModuleDefinition,
+  YoloModuleFileViewV1,
   YoloModuleOpenViewOptionsV1,
   YoloModuleViewV1,
   YoloModuleWorkspaceV1,
@@ -306,6 +313,8 @@ export class ModuleRuntime {
       registerView: stager.workspace.registerView,
       registerRibbonAction: stager.workspace.registerRibbonAction,
       registerCommand: stager.workspace.registerCommand,
+      registerFileView: stager.workspace.registerFileView,
+      registerFileMenuAction: stager.workspace.registerFileMenuAction,
       openView: (options) => {
         if (!isWorkspaceActive()) {
           return Promise.reject(
@@ -353,6 +362,7 @@ export class ModuleRuntime {
             config: capabilityActivation.capabilities.config,
             i18n: capabilityActivation.capabilities.i18n,
             paths: capabilityActivation.capabilities.paths,
+            pdf: capabilityActivation.capabilities.pdf,
             privateStorage: capabilityActivation.capabilities.privateStorage,
             settings: capabilityActivation.capabilities.settings,
             ui: capabilityActivation.capabilities.ui,
@@ -491,11 +501,22 @@ export class ObsidianModuleContributionRegistrar
   private readonly viewSlotsByType = new Map<string, ModuleViewSlot>()
   private readonly viewSlotByModuleId = new Map<string, ModuleViewSlot>()
   private readonly openingViewByModuleId = new Map<string, Promise<void>>()
+  private readonly fileViewSlotsByType = new Map<string, ModuleFileViewSlot>()
+  private readonly fileViewSlotsByModuleId = new Map<
+    string,
+    Map<string, ModuleFileViewSlot>
+  >()
+  private readonly fileViewExtensionOwners = new Map<string, string>()
+  private readonly fileMenuRegistry: ModuleFileMenuRegistry
+  readonly ribbonSlots: ModuleRibbonSlots
 
   constructor(
     private readonly plugin: Plugin,
     private readonly locales: LocaleStore = localeStore,
-  ) {}
+  ) {
+    this.fileMenuRegistry = new ModuleFileMenuRegistry(plugin, locales)
+    this.ribbonSlots = new ModuleRibbonSlots(plugin)
+  }
 
   commit(
     moduleId: string,
@@ -509,6 +530,35 @@ export class ObsidianModuleContributionRegistrar
     }
     if (view && !existingSlot && this.viewSlotsByType.has(view.type)) {
       throw new Error(`Module view type "${view.type}" is already registered`)
+    }
+
+    const fileViews = contributions.fileViews ?? []
+    const existingFileViewSlots = this.fileViewSlotsByModuleId.get(moduleId)
+    for (const fileView of fileViews) {
+      const existingFileViewSlot = existingFileViewSlots?.get(fileView.viewType)
+      if (existingFileViewSlot?.get()) {
+        throw new Error(
+          `Module file view type "${fileView.viewType}" is already active`,
+        )
+      }
+      if (
+        !existingFileViewSlot &&
+        this.fileViewSlotsByType.has(fileView.viewType)
+      ) {
+        throw new Error(
+          `Module file view type "${fileView.viewType}" is already registered`,
+        )
+      }
+      if (!existingFileViewSlot) {
+        for (const extension of fileView.extensions) {
+          const owner = this.fileViewExtensionOwners.get(extension)
+          if (owner && owner !== fileView.viewType) {
+            throw new Error(
+              `Module file view extension "${extension}" is already registered to view type "${owner}"`,
+            )
+          }
+        }
+      }
     }
 
     for (const command of contributions.commands ?? []) {
@@ -556,7 +606,8 @@ export class ObsidianModuleContributionRegistrar
 
     if (contributions.ribbonAction) {
       const action = contributions.ribbonAction
-      const ribbon = this.plugin.addRibbonIcon(
+      const ribbon = this.ribbonSlots.bind(
+        moduleId,
         action.icon,
         resolveLocalizedText(action.title, this.locales.getSnapshot().locale),
         () => {
@@ -580,7 +631,7 @@ export class ObsidianModuleContributionRegistrar
       })
       lifecycle.add(() => {
         unsubscribeLocale()
-        ribbon.remove()
+        this.ribbonSlots.unbind(moduleId)
       })
     }
 
@@ -610,13 +661,80 @@ export class ObsidianModuleContributionRegistrar
         slot.unbind(view)
       })
     }
+
+    for (const fileView of fileViews) {
+      this.commitFileView(moduleId, fileView, lifecycle)
+    }
+
+    if (contributions.fileMenuActions?.length) {
+      this.fileMenuRegistry.commit(
+        moduleId,
+        contributions.fileMenuActions,
+        lifecycle,
+      )
+    }
+  }
+
+  private commitFileView(
+    moduleId: string,
+    fileView: YoloModuleFileViewV1,
+    lifecycle: ModuleLifecycleScope,
+  ): void {
+    const moduleSlots = this.fileViewSlotsByModuleId.get(moduleId)
+    const existingSlot = moduleSlots?.get(fileView.viewType)
+    const slot =
+      existingSlot ??
+      new ModuleFileViewSlot(
+        moduleId,
+        fileView.viewType,
+        fileView.icon,
+        fileView.name,
+        this.locales,
+      )
+    if (!existingSlot) {
+      this.plugin.registerView(fileView.viewType, (leaf) =>
+        createModuleFileView(leaf, this.plugin, slot),
+      )
+      this.plugin.registerExtensions(
+        [...fileView.extensions],
+        fileView.viewType,
+      )
+      this.fileViewSlotsByType.set(fileView.viewType, slot)
+      for (const extension of fileView.extensions) {
+        this.fileViewExtensionOwners.set(extension, fileView.viewType)
+      }
+      const nextModuleSlots =
+        moduleSlots ?? new Map<string, ModuleFileViewSlot>()
+      nextModuleSlots.set(fileView.viewType, slot)
+      this.fileViewSlotsByModuleId.set(moduleId, nextModuleSlots)
+    }
+    slot.bind(fileView)
+    const unsubscribeLocale = this.locales.subscribe(() => {
+      this.plugin.app.workspace.trigger('layout-change')
+    })
+    lifecycle.add(() => {
+      unsubscribeLocale()
+      slot.unbind(fileView)
+    })
   }
 
   deactivate(moduleId: string, closeViews: boolean): void {
     const slot = this.viewSlotByModuleId.get(moduleId)
-    if (!slot) return
-    slot.unbind()
-    if (closeViews) this.plugin.app.workspace.detachLeavesOfType(slot.type)
+    if (slot) {
+      slot.unbind()
+      if (closeViews) this.plugin.app.workspace.detachLeavesOfType(slot.type)
+    }
+    const fileViewSlots = this.fileViewSlotsByModuleId.get(moduleId)
+    if (fileViewSlots) {
+      for (const fileViewSlot of fileViewSlots.values()) {
+        fileViewSlot.unbind()
+        if (closeViews) {
+          this.plugin.app.workspace.detachLeavesOfType(fileViewSlot.viewType)
+        }
+      }
+    }
+    this.fileMenuRegistry.deactivate(moduleId)
+    this.ribbonSlots.forget(moduleId)
   }
 
   async openView(

@@ -21,6 +21,66 @@ const createElement = (): HTMLElement =>
     },
   }) as unknown as HTMLElement
 
+type MenuItemSpec = {
+  title?: string
+  icon?: string
+  disabled?: boolean
+  click?: () => void
+}
+
+const menus: MockMenu[] = []
+
+class MockMenu {
+  readonly items: MenuItemSpec[] = []
+  readonly separators: number[] = []
+  readonly hide = jest.fn(() => {
+    this.hidden = true
+    this.onHideCallback?.()
+  })
+  readonly showAtMouseEvent = jest.fn()
+  hidden = false
+  private onHideCallback: (() => void) | undefined
+
+  constructor() {
+    menus.push(this)
+  }
+
+  addItem(build: (item: unknown) => void): this {
+    const spec: MenuItemSpec = {}
+    const item = {
+      setTitle: (title: string) => {
+        spec.title = title
+        return item
+      },
+      setIcon: (icon: string) => {
+        spec.icon = icon
+        return item
+      },
+      setDisabled: (disabled: boolean) => {
+        spec.disabled = disabled
+        return item
+      },
+      onClick: (click: () => void) => {
+        spec.click = click
+        return item
+      },
+    }
+    build(item)
+    this.items.push(spec)
+    return this
+  }
+
+  addSeparator(): this {
+    this.separators.push(this.items.length)
+    return this
+  }
+
+  onHide(callback: () => void): this {
+    this.onHideCallback = callback
+    return this
+  }
+}
+
 jest.mock('obsidian', () => ({
   App: jest.fn(),
   Component: jest.fn().mockImplementation(() => ({
@@ -29,10 +89,77 @@ jest.mock('obsidian', () => ({
   })),
   Keymap: { isModEvent: keymapIsModEvent },
   MarkdownRenderer: { render: markdownRender },
+  Menu: jest.fn().mockImplementation(() => new MockMenu()),
   Notice: jest.fn().mockImplementation(notice),
   TFile: class {},
+  TFolder: class {},
   htmlToMarkdown: convertHtmlToMarkdown,
   normalizePath: (path: string) => path,
+}))
+
+// The editor itself is Obsidian's and cannot exist under jest; what this file
+// covers is the host's side of it — argument checking, post-deactivation
+// guarding, and that a leaked editor is destroyed with the module.
+type FakeEditor = {
+  options: {
+    value: string
+    sourcePath: string
+    quickAsk?: { attach: (target: unknown) => { destroy: () => void } }
+  }
+  onChange?: (text: string) => void
+  onBlur?: (text: string) => void
+  destroyed: boolean
+}
+const createdEditors: FakeEditor[] = []
+jest.mock('./obsidianMarkdownEditor', () => ({
+  createObsidianMarkdownEditor: jest.fn(
+    (_app: unknown, options: FakeEditor['options'] & Partial<FakeEditor>) => {
+      const editor: FakeEditor = {
+        options,
+        onChange: options.onChange,
+        onBlur: options.onBlur,
+        destroyed: false,
+      }
+      createdEditors.push(editor)
+      return {
+        getValue: () => editor.options.value,
+        setValue: (text: string) => {
+          editor.options = { ...editor.options, value: text }
+        },
+        focus: jest.fn(),
+        blur: jest.fn(),
+        hasFocus: () => false,
+        destroy: () => {
+          editor.destroyed = true
+        },
+      }
+    },
+  ),
+}))
+
+// Same shape of stand-in as the editor above, and for the same reason: the
+// preview component is Obsidian's, so what this file covers is the host's
+// side of it.
+type FakeContentView = {
+  options: { value: string; sourcePath: string }
+  destroyed: boolean
+}
+const createdContentViews: FakeContentView[] = []
+jest.mock('./obsidianMarkdownContentView', () => ({
+  createObsidianMarkdownContentView: jest.fn(
+    (_app: unknown, options: FakeContentView['options']) => {
+      const view: FakeContentView = { options, destroyed: false }
+      createdContentViews.push(view)
+      return {
+        setValue: (text: string) => {
+          view.options = { ...view.options, value: text }
+        },
+        destroy: () => {
+          view.destroyed = true
+        },
+      }
+    },
+  ),
 }))
 
 type ModalOptions = {
@@ -58,7 +185,7 @@ class MockConfirmModal {
   }
 }
 
-import { type App, TFile } from 'obsidian'
+import { type App, TFile, TFolder } from 'obsidian'
 
 import { ModuleLifecycleScope } from './lifecycleScope'
 import { ObsidianModuleUiCapabilityProvider } from './moduleUi'
@@ -73,15 +200,23 @@ describe('ObsidianModuleUiCapabilityProvider', () => {
   beforeEach(() => {
     jest.clearAllMocks()
     modals.length = 0
+    menus.length = 0
+    createdEditors.length = 0
+    createdContentViews.length = 0
     markdownRender.mockImplementation(() => Promise.resolve())
   })
 
-  const create = () => {
+  const create = (
+    extra: Partial<
+      ConstructorParameters<typeof ObsidianModuleUiCapabilityProvider>[0]
+    > = {},
+  ) => {
     const lifecycle = new ModuleLifecycleScope()
     const activation = new ObsidianModuleUiCapabilityProvider({
       app,
       createConfirmModal: (modalApp, options) =>
         new MockConfirmModal(modalApp, options),
+      ...extra,
     }).create('learning', lifecycle)
     activation.activate()
     return { lifecycle, activation, ui: activation.api }
@@ -271,6 +406,15 @@ describe('ObsidianModuleUiCapabilityProvider', () => {
     )
   })
 
+  it('rejects a sections option that is not a boolean', () => {
+    const { lifecycle, ui } = create()
+
+    expect(() =>
+      ui.createMarkdownRenderer({ sections: 'yes' as unknown as boolean }),
+    ).toThrow('Markdown renderer sections option must be a boolean')
+    lifecycle.dispose()
+  })
+
   it('cancels a pending render when its lifecycle is disposed', async () => {
     let finishRender!: () => void
     markdownRender.mockImplementationOnce(
@@ -295,6 +439,208 @@ describe('ObsidianModuleUiCapabilityProvider', () => {
     expect(container.textContent).toBe('original')
   })
 
+  it('opens a native menu from module-supplied data and closes it on disposal', async () => {
+    const { lifecycle, ui } = create()
+    const onSelect = jest.fn()
+    const event = { type: 'contextmenu' } as MouseEvent
+
+    ui.showMenu(event, [
+      { title: 'Convert to note', icon: 'file-plus', onSelect },
+      { kind: 'separator' },
+      { title: 'Delete', onSelect: jest.fn() },
+    ])
+
+    const [menu] = menus
+    expect(menu.items.map((item) => item.title)).toEqual([
+      'Convert to note',
+      'Delete',
+    ])
+    expect(menu.items[0].icon).toBe('file-plus')
+    // The event itself is what tells Obsidian which window owns the menu.
+    expect(menu.showAtMouseEvent).toHaveBeenCalledWith(event)
+
+    menu.items[0].click?.()
+    expect(onSelect).toHaveBeenCalledTimes(1)
+
+    lifecycle.dispose()
+    expect(menu.hide).toHaveBeenCalledTimes(1)
+
+    // A selection that lands after teardown must not run module code.
+    menu.items[1].click?.()
+    expect(onSelect).toHaveBeenCalledTimes(1)
+  })
+
+  it('snapshots menu items so later mutation cannot change what was shown', () => {
+    const { lifecycle, ui } = create()
+    const original = jest.fn()
+    const swapped = jest.fn()
+    const item = { title: 'Original', onSelect: original }
+
+    ui.showMenu({ type: 'contextmenu' } as MouseEvent, [item])
+    item.title = 'Swapped'
+    item.onSelect = swapped
+
+    const [menu] = menus
+    expect(menu.items[0].title).toBe('Original')
+    menu.items[0].click?.()
+    expect(original).toHaveBeenCalledTimes(1)
+    expect(swapped).not.toHaveBeenCalled()
+    lifecycle.dispose()
+  })
+
+  it('shows a disabled menu item as not selectable', () => {
+    const { lifecycle, ui } = create()
+    ui.showMenu({ type: 'contextmenu' } as MouseEvent, [
+      { title: 'Too large to copy', disabled: true, onSelect: jest.fn() },
+      { title: 'Export', onSelect: jest.fn() },
+    ])
+    const [menu] = menus
+    expect(menu.items.map((item) => item.disabled)).toEqual([true, undefined])
+    lifecycle.dispose()
+  })
+
+  describe('saveFile', () => {
+    const fakeSink = () => ({
+      name: 'board.png',
+      write: jest.fn(async () => undefined),
+      close: jest.fn(async () => undefined),
+      abort: jest.fn(async () => undefined),
+    })
+
+    it('answers whether it is offered before activation completes', () => {
+      const lifecycle = new ModuleLifecycleScope()
+      const activation = new ObsidianModuleUiCapabilityProvider({
+        app,
+        createConfirmModal: (modalApp, options) =>
+          new MockConfirmModal(modalApp, options),
+        saveFile: jest.fn(),
+      }).create('learning', lifecycle)
+      expect(activation.api.canSaveFile()).toBe(true)
+      lifecycle.dispose()
+    })
+
+    it('is not offered where the device has no save dialog', async () => {
+      const { lifecycle, ui } = create()
+      expect(ui.canSaveFile()).toBe(false)
+      await expect(ui.saveFile({ suggestedName: 'board.png' })).rejects.toThrow(
+        'unavailable',
+      )
+      lifecycle.dispose()
+    })
+
+    it('hands the request to the dialog and resolves null when cancelled', async () => {
+      const saveFile = jest.fn(async () => null)
+      const { lifecycle, ui } = create({ saveFile })
+      expect(ui.canSaveFile()).toBe(true)
+      await expect(
+        ui.saveFile({
+          suggestedName: 'board.png',
+          filters: [{ name: 'PNG', extensions: ['png'] }],
+        }),
+      ).resolves.toBeNull()
+      expect(saveFile).toHaveBeenCalledWith({
+        suggestedName: 'board.png',
+        filters: [{ name: 'PNG', extensions: ['png'] }],
+      })
+      await expect(
+        ui.saveFile({
+          suggestedName: 'board.png',
+          filters: [{ name: 'PNG', extensions: ['.png'] }],
+        }),
+      ).rejects.toThrow('without the dot')
+      lifecycle.dispose()
+    })
+
+    it('writes through the sink and aborts one left open at deactivation', async () => {
+      const finished = fakeSink()
+      const left = fakeSink()
+      const saveFile = jest
+        .fn()
+        .mockResolvedValueOnce(finished)
+        .mockResolvedValueOnce(left)
+      const { lifecycle, ui } = create({ saveFile })
+
+      const first = await ui.saveFile({ suggestedName: 'a.png' })
+      await first?.write(new Uint8Array([1, 2]))
+      await first?.close()
+      expect(finished.write).toHaveBeenCalledWith(new Uint8Array([1, 2]))
+      expect(finished.close).toHaveBeenCalledTimes(1)
+
+      const second = await ui.saveFile({ suggestedName: 'b.png' })
+      await expect(
+        second?.write('text' as unknown as Uint8Array),
+      ).rejects.toThrow('Uint8Array')
+      lifecycle.dispose()
+      expect(left.abort).toHaveBeenCalledTimes(1)
+      expect(finished.abort).not.toHaveBeenCalled()
+    })
+  })
+
+  it('rejects malformed menu items before showing anything', () => {
+    const { lifecycle, ui } = create()
+    const event = { type: 'contextmenu' } as MouseEvent
+
+    expect(() =>
+      ui.showMenu(event, [{ title: '  ', onSelect: jest.fn() }]),
+    ).toThrow('Menu item title')
+    expect(() =>
+      ui.showMenu(event, [
+        { title: 'No handler' } as unknown as {
+          title: string
+          onSelect(): void
+        },
+      ]),
+    ).toThrow('onSelect')
+    expect(menus).toHaveLength(0)
+    lifecycle.dispose()
+  })
+
+  it('resolves a drop into vault entries from Obsidian drag state', () => {
+    const file = Object.assign(new TFile(), {
+      path: 'notes/card.md',
+      name: 'card.md',
+      stat: { ctime: 1, mtime: 2 },
+    })
+    const folder = Object.assign(new TFolder(), {
+      path: 'notes',
+      name: 'notes',
+    })
+    const dragApp = {
+      workspace: { openLinkText, trigger },
+      dragManager: { draggable: { files: [file, folder] } },
+    } as unknown as App
+    const lifecycle = new ModuleLifecycleScope()
+    const activation = new ObsidianModuleUiCapabilityProvider({
+      app: dragApp,
+      createConfirmModal: (modalApp, options) =>
+        new MockConfirmModal(modalApp, options),
+    }).create('whiteboard', lifecycle)
+    activation.activate()
+
+    const entries = activation.api.resolveDropEntries({
+      type: 'drop',
+    } as DragEvent)
+
+    expect(entries).toEqual([
+      {
+        kind: 'file',
+        path: 'notes/card.md',
+        name: 'card.md',
+        ctime: 1,
+        mtime: 2,
+      },
+      { kind: 'folder', path: 'notes', name: 'notes' },
+    ])
+    expect(Object.isFrozen(entries)).toBe(true)
+    lifecycle.dispose()
+  })
+
+  it('resolves a drop that carries nothing from the vault into an empty list', () => {
+    const { lifecycle, ui } = create()
+    expect(ui.resolveDropEntries({ type: 'drop' } as DragEvent)).toEqual([])
+    lifecycle.dispose()
+  })
+
   it('rejects every new capability call after disposal', async () => {
     const { lifecycle, ui } = create()
     lifecycle.dispose()
@@ -315,6 +661,10 @@ describe('ObsidianModuleUiCapabilityProvider', () => {
       }),
     ).toThrow('no longer active')
     expect(() => ui.openLink('late', '', false)).toThrow('no longer active')
+    expect(() => ui.showMenu({} as MouseEvent, [])).toThrow('no longer active')
+    expect(() => ui.resolveDropEntries({} as DragEvent)).toThrow(
+      'no longer active',
+    )
     expect(openLinkText).not.toHaveBeenCalled()
   })
 
@@ -327,5 +677,192 @@ describe('ObsidianModuleUiCapabilityProvider', () => {
     }).create('learning', lifecycle)
     expect(() => activation.api.notice('early')).toThrow('UI is not active')
     lifecycle.dispose()
+  })
+
+  describe('createMarkdownContentView', () => {
+    const viewOptions = () => ({
+      container: createElement(),
+      value: '# card',
+      sourcePath: 'boards/ideas.yoloboard',
+    })
+
+    it('mounts a content view and exposes it through the module handle', () => {
+      const { lifecycle, ui } = create()
+      const view = ui.createMarkdownContentView(viewOptions())
+
+      expect(createdContentViews).toHaveLength(1)
+      expect(createdContentViews[0].options.sourcePath).toBe(
+        'boards/ideas.yoloboard',
+      )
+      view.setValue('changed')
+      expect(createdContentViews[0].options.value).toBe('changed')
+      lifecycle.dispose()
+    })
+
+    it('validates its arguments', () => {
+      const { lifecycle, ui } = create()
+      const valid = viewOptions()
+
+      expect(() =>
+        ui.createMarkdownContentView({
+          ...valid,
+          value: 1 as unknown as string,
+        }),
+      ).toThrow('must be a string')
+      expect(() =>
+        ui.createMarkdownContentView({
+          ...valid,
+          container: null as unknown as HTMLElement,
+        }),
+      ).toThrow('Markdown content view container')
+      expect(createdContentViews).toHaveLength(0)
+      lifecycle.dispose()
+    })
+
+    it('destroys a view the module left behind, and only once', () => {
+      const { lifecycle, ui } = create()
+      const kept = ui.createMarkdownContentView(viewOptions())
+      const released = ui.createMarkdownContentView(viewOptions())
+
+      released.destroy()
+      expect(createdContentViews[1].destroyed).toBe(true)
+      expect(createdContentViews[0].destroyed).toBe(false)
+
+      lifecycle.dispose()
+      expect(createdContentViews[0].destroyed).toBe(true)
+      expect(() => kept.destroy()).not.toThrow()
+    })
+  })
+
+  describe('createMarkdownEditor', () => {
+    const editorOptions = () => ({
+      container: createElement(),
+      value: '# card',
+      sourcePath: 'boards/ideas.yoloboard',
+    })
+
+    it('mounts an editor and exposes it through the module handle', () => {
+      const { lifecycle, ui } = create()
+      const editor = ui.createMarkdownEditor(editorOptions())
+
+      expect(createdEditors).toHaveLength(1)
+      expect(createdEditors[0].options.sourcePath).toBe(
+        'boards/ideas.yoloboard',
+      )
+      expect(editor.getValue()).toBe('# card')
+      editor.setValue('changed')
+      expect(editor.getValue()).toBe('changed')
+      lifecycle.dispose()
+    })
+
+    it('validates its arguments', () => {
+      const { lifecycle, ui } = create()
+      const valid = editorOptions()
+
+      expect(() =>
+        ui.createMarkdownEditor({ ...valid, value: 1 as unknown as string }),
+      ).toThrow('must be a string')
+      expect(() =>
+        ui.createMarkdownEditor({
+          ...valid,
+          container: null as unknown as HTMLElement,
+        }),
+      ).toThrow('Markdown editor container')
+      expect(() =>
+        ui.createMarkdownEditor({
+          ...valid,
+          onChange: 'nope' as unknown as () => void,
+        }),
+      ).toThrow('must be a function')
+      expect(createdEditors).toHaveLength(0)
+      lifecycle.dispose()
+    })
+
+    // An editor can outlive activation by a beat — a blur fires as the
+    // workspace tears down — and must not call back into a stopped module.
+    it('stops delivering callbacks once the module is gone', () => {
+      const onChange = jest.fn()
+      const onBlur = jest.fn()
+      const { lifecycle, ui } = create()
+      ui.createMarkdownEditor({ ...editorOptions(), onChange, onBlur })
+
+      createdEditors[0].onChange?.('while active')
+      expect(onChange).toHaveBeenCalledWith('while active')
+
+      lifecycle.dispose()
+      createdEditors[0].onChange?.('after dispose')
+      createdEditors[0].onBlur?.('after dispose')
+      expect(onChange).toHaveBeenCalledTimes(1)
+      expect(onBlur).not.toHaveBeenCalled()
+    })
+
+    // The module says what its editor is embedded in and when it moved; the
+    // host owns everything else about the panel.
+    it('hands Quick Ask the module description, guarded like every other callback', () => {
+      const attachQuickAsk = jest.fn(() => ({ destroy: jest.fn() }))
+      const getContext = jest.fn(() => 'board summary')
+      const subscribeAnchorMove = jest.fn(() => jest.fn())
+      const { lifecycle, ui } = create({ attachQuickAsk })
+
+      ui.createMarkdownEditor({
+        ...editorOptions(),
+        quickAsk: { getContext, subscribeAnchorMove },
+      })
+
+      const target = { sourcePath: 'boards/ideas.yoloboard' }
+      createdEditors[0].options.quickAsk?.attach(target)
+      expect(attachQuickAsk).toHaveBeenCalledTimes(1)
+      const [forwarded, forwardedTarget] = attachQuickAsk.mock
+        .calls[0] as unknown as [
+        {
+          getContext: () => string
+          subscribeAnchorMove: (onMove: () => void) => () => void
+        },
+        unknown,
+      ]
+      expect(forwardedTarget).toBe(target)
+      expect(forwarded.subscribeAnchorMove).toBe(subscribeAnchorMove)
+      expect(forwarded.getContext()).toBe('board summary')
+
+      lifecycle.dispose()
+      expect(forwarded.getContext()).toBe('')
+      expect(getContext).toHaveBeenCalledTimes(1)
+    })
+
+    it('leaves Quick Ask off unless the module asks for it', () => {
+      const attachQuickAsk = jest.fn(() => ({ destroy: jest.fn() }))
+      const { lifecycle, ui } = create({ attachQuickAsk })
+
+      ui.createMarkdownEditor(editorOptions())
+
+      expect(createdEditors[0].options.quickAsk).toBeUndefined()
+      lifecycle.dispose()
+    })
+
+    it('validates Quick Ask options', () => {
+      const { lifecycle, ui } = create()
+      expect(() =>
+        ui.createMarkdownEditor({
+          ...editorOptions(),
+          quickAsk: { getContext: 'nope' as unknown as () => string },
+        }),
+      ).toThrow('must be a function')
+      expect(createdEditors).toHaveLength(0)
+      lifecycle.dispose()
+    })
+
+    it('destroys an editor the module left behind, and only once', () => {
+      const { lifecycle, ui } = create()
+      const kept = ui.createMarkdownEditor(editorOptions())
+      const released = ui.createMarkdownEditor(editorOptions())
+
+      released.destroy()
+      expect(createdEditors[1].destroyed).toBe(true)
+      expect(createdEditors[0].destroyed).toBe(false)
+
+      lifecycle.dispose()
+      expect(createdEditors[0].destroyed).toBe(true)
+      expect(() => kept.destroy()).not.toThrow()
+    })
   })
 })

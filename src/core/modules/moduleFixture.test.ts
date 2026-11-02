@@ -20,8 +20,8 @@ import {
   selectModuleManifestVariant,
 } from './moduleStore'
 import {
-  parseOfficialModuleCatalog,
-  selectInitialCompatibleVersion,
+  isHostApiCompatible,
+  isModuleHostApiRange,
 } from './officialModuleCatalog'
 
 describe('host API conformance artifact boundary', () => {
@@ -80,24 +80,6 @@ describe('host API conformance artifact boundary', () => {
   })
 
   it('ships a separately hashed Learning module that uses only Host API', () => {
-    const bundled = JSON.parse(
-      readFileSync('modules/bundled.json', 'utf8'),
-    ) as {
-      schemaVersion: number
-      modules: Array<{
-        id: string
-        version: string
-        manifestUrl: string
-        manifest: { byteSize: number; sha256: string }
-      }>
-    }
-    expect(bundled).toEqual({
-      schemaVersion: 1,
-      modules: [
-        expect.objectContaining({ id: 'learning', version: learningVersion }),
-      ],
-    })
-
     const manifestBytes = readFileSync(path.join(learningDir, 'module.json'))
     const manifest = parseModuleArtifactManifest(
       JSON.parse(manifestBytes.toString('utf8')),
@@ -109,10 +91,6 @@ describe('host API conformance artifact boundary', () => {
     const source = entry.toString('utf8')
     expect(manifest.id).toBe('learning')
     expect(manifest.version).toBe(learningVersion)
-    expect(bundled.modules[0]?.manifest).toEqual({
-      byteSize: manifestBytes.byteLength,
-      sha256: createHash('sha256').update(manifestBytes).digest('hex'),
-    })
     expect(entryFile.byteSize).toBe(entry.byteLength)
     expect(entryFile.sha256).toBe(
       createHash('sha256').update(entry).digest('hex'),
@@ -159,63 +137,19 @@ describe('host API conformance artifact boundary', () => {
     expect(source).not.toContain('YoloPlugin')
   })
 
-  it('preserves real Learning build schema declarations through the catalog parser', () => {
-    const bundledModule = (
-      JSON.parse(readFileSync('modules/bundled.json', 'utf8')) as {
-        modules: Array<{ manifestUrl: string }>
-      }
-    ).modules[0]
+  it('preserves the real Learning build schema declarations', () => {
     const manifestBytes = readFileSync(path.join(learningDir, 'module.json'))
     const manifest = parseModuleArtifactManifest(
       JSON.parse(manifestBytes.toString('utf8')),
     )
-    const catalog = parseOfficialModuleCatalog(
-      JSON.stringify({
-        schemaVersion: 1,
-        modules: [
-          {
-            id: manifest.id,
-            localizations: {
-              en: { name: 'Learning', description: 'Learning module' },
-              zh: { name: '学习', description: '学习模块' },
-              it: {
-                name: 'Apprendimento',
-                description: 'Modulo apprendimento',
-              },
-            },
-            versions: [
-              {
-                version: manifest.version,
-                hostApi: manifest.hostApi,
-                platforms: manifest.variants.map(({ platform }) => platform),
-                dataSchemas: manifest.dataSchemas,
-                manifestUrl: bundledModule.manifestUrl,
-                manifest: {
-                  byteSize: manifestBytes.byteLength,
-                  sha256: createHash('sha256')
-                    .update(manifestBytes)
-                    .digest('hex'),
-                },
-              },
-            ],
-          },
-        ],
-      }),
-      {
-        allowedRepositories: [{ owner: 'Lapis0x0', repo: 'obsidian-yolo' }],
-      },
-    )
 
-    expect(catalog.modules[0]?.versions[0]?.hostApi).toBe(manifest.hostApi)
-    expect(catalog.modules[0]?.versions[0]?.dataSchemas).toEqual(
-      manifest.dataSchemas,
+    expect(manifest.version).toBe(learningVersion)
+    expect(isModuleHostApiRange(manifest.hostApi)).toBe(true)
+    expect(isHostApiCompatible('1.6.0', manifest.hostApi)).toBe(true)
+    expect(Object.keys(manifest.dataSchemas).length).toBeGreaterThan(0)
+    expect(manifest.variants.map(({ platform }) => platform)).toContain(
+      'desktop',
     )
-    expect(
-      selectInitialCompatibleVersion(catalog.modules[0], {
-        hostApi: '1.6.0',
-        platform: 'desktop',
-      })?.version,
-    ).toBe(learningVersion)
   })
 
   it('keeps fixture source and artifacts out of production main metadata', () => {

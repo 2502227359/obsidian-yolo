@@ -16,15 +16,13 @@ const mockCompilePlainUserMessagePrompt = jest.fn(
   }),
 )
 
-jest.mock('../../components/chat-view/chat-runtime-inputs', () => ({
+jest.mock('./chat-runtime-inputs', () => ({
   resolveWorkspaceScopeForRuntimeInput: jest.fn(() => null),
 }))
 
-jest.mock('../../components/chat-view/chat-runtime-profiles', () => ({
+jest.mock('./chat-runtime-profiles', () => ({
   resolveChatModeRuntime: jest.fn(() => ({
     loopConfig: {
-      enableTools: true,
-      includeBuiltinTools: true,
       maxAutoIterations: 100,
     },
     allowedToolNames: ['server__search'],
@@ -63,7 +61,6 @@ jest.mock('../../utils/chat/requestContextBuilder', () => ({
 import { TFile, TFolder } from 'obsidian'
 import type { App } from 'obsidian'
 
-import { resolveChatModeRuntime } from '../../components/chat-view/chat-runtime-profiles'
 import type { YoloSettings } from '../../settings/schema/setting.types'
 import type { ChatMessage, ChatUserMessage } from '../../types/chat'
 import {
@@ -75,7 +72,7 @@ import type { InProcessToolServer } from '../mcp/inProcessToolServer'
 import type { McpManager } from '../mcp/mcpManager'
 
 import {
-  YoloAgentApiService,
+  AgentRunApi,
   buildAgentApiPrompt,
   conversationStateToEvents,
   mergeInProcessServerToolNames,
@@ -83,7 +80,9 @@ import {
   resolveAgentApiRunInput,
 } from './agent-api'
 import type { YoloAgentRunRequest } from './agent-api'
-import type { AgentConversationState, AgentService } from './service'
+import { AGENT_CAPABILITY_TOOL_NAMES } from './capability-profile'
+import { resolveChatModeRuntime } from './chat-runtime-profiles'
+import type { AgentConversationState, AgentSessionService } from './service'
 
 describe('agent api helpers', () => {
   beforeEach(() => {
@@ -149,14 +148,12 @@ describe('agent api helpers', () => {
           modelId: 'mock-model',
           toolPreferences: {},
           enabledToolNames: [],
-          includeBuiltinTools: true,
           skillPreferences: {},
         },
       ],
       providers: [{ id: 'mock-provider', apiType: 'openai' }],
-      mcp: {
-        enableToolDisclosure: false,
-      },
+      chatOptions: {},
+      mcp: {},
       continuationOptions: {
         primaryRequestTimeoutMs: 30000,
         streamFallbackRecoveryEnabled: true,
@@ -305,6 +302,50 @@ describe('agent api helpers', () => {
     ).rejects.toThrow('Either prompt or messages must be provided')
   })
 
+  it('expands a capability tier into the host tool grant and bashReadOnly', async () => {
+    jest.mocked(resolveChatModeRuntime).mockReturnValueOnce({
+      loopConfig: {
+        maxAutoIterations: 100,
+      },
+      allowedToolNames: [
+        AGENT_CAPABILITY_TOOL_NAMES.bash,
+        AGENT_CAPABILITY_TOOL_NAMES.edit,
+        'server__search',
+      ],
+      toolPreferences: undefined,
+      bypassToolApproval: false,
+    } as unknown as ReturnType<typeof resolveChatModeRuntime>)
+
+    const result = await resolveAgentApiRunInput(
+      buildResolveAgentApiRunInputArgs({
+        prompt: 'Read a few notes',
+        capability: 'vault-read',
+      }),
+    )
+
+    // 'vault-read' grants the bash identity only, and carries the read-only
+    // constraint separately — the same expansion the module path used to do
+    // for itself before the tier moved down here.
+    expect(result.input.allowedToolNames).toEqual([
+      AGENT_CAPABILITY_TOOL_NAMES.bash,
+    ])
+    expect(result.input.bashReadOnly).toBe(true)
+  })
+
+  it('lets an explicit tool list and bashReadOnly win over the capability tier', async () => {
+    const result = await resolveAgentApiRunInput(
+      buildResolveAgentApiRunInputArgs({
+        prompt: 'Read a few notes',
+        capability: 'vault-read',
+        tools: { allowedToolNames: ['server__search'] },
+        bashReadOnly: false,
+      }),
+    )
+
+    expect(result.input.allowedToolNames).toEqual(['server__search'])
+    expect(result.input.bashReadOnly).toBe(false)
+  })
+
   it('only narrows runtime allowed tools', () => {
     expect(
       narrowAllowedToolNames(
@@ -376,9 +417,8 @@ describe('agent api helpers', () => {
           },
         ],
         providers: [{ id: 'mock-provider', apiType: 'openai' }],
-        mcp: {
-          enableToolDisclosure: false,
-        },
+        chatOptions: {},
+        mcp: {},
         continuationOptions: {
           primaryRequestTimeoutMs: 30000,
           streamFallbackRecoveryEnabled: true,
@@ -523,13 +563,13 @@ describe('agent api helpers', () => {
   })
 })
 
-describe('YoloAgentApiService in-process tool server lifecycle', () => {
+describe('AgentRunApi in-process tool server lifecycle', () => {
   const buildService = ({
     mcpManager,
     agentServiceOverrides,
   }: {
     mcpManager: McpManager
-    agentServiceOverrides: Partial<AgentService>
+    agentServiceOverrides: Partial<AgentSessionService>
   }) => {
     const settings = {
       currentAssistantId: 'assistant-1',
@@ -540,12 +580,11 @@ describe('YoloAgentApiService in-process tool server lifecycle', () => {
           modelId: 'mock-model',
           toolPreferences: {},
           enabledToolNames: [],
-          includeBuiltinTools: true,
           skillPreferences: {},
         },
       ],
       providers: [{ id: 'mock-provider', apiType: 'openai' }],
-      mcp: { enableToolDisclosure: false },
+      chatOptions: {},
       continuationOptions: {
         primaryRequestTimeoutMs: 30000,
         streamFallbackRecoveryEnabled: true,
@@ -560,9 +599,9 @@ describe('YoloAgentApiService in-process tool server lifecycle', () => {
       })),
       abortConversation: jest.fn(() => false),
       ...agentServiceOverrides,
-    } as unknown as AgentService
+    } as unknown as AgentSessionService
 
-    return new YoloAgentApiService({
+    return new AgentRunApi({
       app: { vault: {} } as unknown as App,
       getSettings: () => settings,
       getAgentService: () => agentService,
@@ -606,7 +645,7 @@ describe('YoloAgentApiService in-process tool server lifecycle', () => {
         run: jest.fn(async (input) => {
           capturedInput = input.input as { allowedToolNames?: string[] }
           return { conversationId: input.conversationId }
-        }) as unknown as AgentService['run'],
+        }) as unknown as AgentSessionService['run'],
       },
     })
 
@@ -681,7 +720,9 @@ describe('YoloAgentApiService in-process tool server lifecycle', () => {
           } as unknown as AgentConversationState)
           return () => undefined
         }),
-        run: jest.fn(async () => undefined) as unknown as AgentService['run'],
+        run: jest.fn(
+          async () => undefined,
+        ) as unknown as AgentSessionService['run'],
         abortConversation: jest.fn(() => true),
       },
     })
@@ -718,7 +759,9 @@ describe('YoloAgentApiService in-process tool server lifecycle', () => {
           } as unknown as AgentConversationState)
           return () => undefined
         }),
-        run: jest.fn(async () => undefined) as unknown as AgentService['run'],
+        run: jest.fn(
+          async () => undefined,
+        ) as unknown as AgentSessionService['run'],
       },
     })
 
@@ -738,14 +781,12 @@ function buildResolveAgentApiRunInputArgs(request: YoloAgentRunRequest) {
         modelId: 'mock-model',
         toolPreferences: {},
         enabledToolNames: [],
-        includeBuiltinTools: true,
         skillPreferences: {},
       },
     ],
     providers: [{ id: 'mock-provider', apiType: 'openai' }],
-    mcp: {
-      enableToolDisclosure: false,
-    },
+    chatOptions: {},
+    mcp: {},
     continuationOptions: {
       primaryRequestTimeoutMs: 30000,
       streamFallbackRecoveryEnabled: true,
@@ -758,7 +799,7 @@ function buildResolveAgentApiRunInputArgs(request: YoloAgentRunRequest) {
       getRevision: jest.fn(() => 1),
       setWatchedPaths: jest.fn(),
     })),
-  } as unknown as AgentService
+  } as unknown as AgentSessionService
 
   return {
     request,

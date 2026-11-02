@@ -1,3 +1,5 @@
+import { withAbort } from '../../utils/async/settle'
+
 import type { ModuleArtifactArrivalGrace } from './moduleArtifactArrivalGrace'
 import type { ModuleArtifactInstaller } from './moduleArtifactInstaller'
 import {
@@ -19,6 +21,7 @@ import type { OfficialModuleCatalogSource } from './officialModuleCatalogSource'
 const MODULE_READINESS_SUPERSEDED = Object.freeze({
   kind: 'module-readiness-superseded',
 })
+const READINESS_DISPOSED = 'Module readiness reconciler is disposed'
 
 export type ModuleReadinessResult = Readonly<{
   moduleId: string
@@ -50,25 +53,7 @@ export class ModuleReadinessReconciler {
   private readonly graceControllers = new Map<string, AbortController>()
   private disposed = false
 
-  constructor(private readonly options: ModuleReadinessReconcilerOptions) {
-    if (
-      !options ||
-      typeof options.deviceStateStore?.runExclusive !== 'function' ||
-      typeof options.intentStore?.get !== 'function' ||
-      typeof options.catalogSource?.getResolvedVersion !== 'function' ||
-      typeof options.catalogSource?.getResolvedArtifactDescriptor !==
-        'function' ||
-      !options.artifactStore ||
-      typeof options.artifactStore.removeVersionArtifacts !== 'function' ||
-      typeof options.installer?.install !== 'function' ||
-      typeof options.installer?.repair !== 'function' ||
-      (options.artifactArrivalGrace !== undefined &&
-        typeof options.artifactArrivalGrace.waitForArtifact !== 'function') ||
-      (options.platform !== 'desktop' && options.platform !== 'mobile')
-    ) {
-      throw new Error('Module readiness reconciler options are invalid')
-    }
-  }
+  constructor(private readonly options: ModuleReadinessReconcilerOptions) {}
 
   ensureModuleReady(
     moduleId: string,
@@ -106,36 +91,6 @@ export class ModuleReadinessReconciler {
           this.graceControllers.delete(moduleId)
         }
       })
-  }
-
-  async reconcile(
-    moduleIds: readonly string[],
-  ): Promise<readonly ModuleReadinessResult[]> {
-    if (!Array.isArray(moduleIds)) {
-      throw new TypeError('Module readiness ids must be an array')
-    }
-    const ids = [...new Set(moduleIds)]
-    for (const moduleId of ids) assertModuleId(moduleId, 'Module id')
-    if (this.disposed) {
-      throw new Error('Module readiness reconciler is disposed')
-    }
-    return Object.freeze(
-      await Promise.all(
-        ids.sort().map(async (moduleId) => {
-          try {
-            return await this.ensureModuleReady(moduleId)
-          } catch (error) {
-            return readinessResult({
-              moduleId,
-              status: 'failed',
-              versions: [],
-              repairedVersions: [],
-              error: errorMessage(error),
-            })
-          }
-        }),
-      ),
-    )
   }
 
   dispose(): void {
@@ -182,13 +137,7 @@ export class ModuleReadinessReconciler {
       resolved.version,
       this.options.platform,
     )
-    if (
-      !descriptor ||
-      descriptor.id !== moduleId ||
-      descriptor.version !== resolved.version ||
-      descriptor.platform !== this.options.platform ||
-      descriptor.manifest.sha256 !== resolved.manifest.sha256
-    ) {
+    if (!descriptor) {
       throw new Error(
         `Official module "${moduleId}" returned a mismatched resolved descriptor`,
       )
@@ -299,6 +248,7 @@ export class ModuleReadinessReconciler {
           guardArtifactCrypto(subtleCrypto),
         ),
         signal,
+        READINESS_DISPOSED,
       )
       return false
     } catch (error) {
@@ -329,6 +279,7 @@ export class ModuleReadinessReconciler {
           guardArtifactCrypto(subtleCrypto),
         ),
         signal,
+        READINESS_DISPOSED,
       )
       return true
     } catch {
@@ -424,18 +375,14 @@ function validateState(
   moduleId: string,
   platform: ModuleArtifactPlatform,
 ): void {
-  if (state.moduleId !== moduleId) {
-    throw new Error(`Module "${moduleId}" returned mismatched device state`)
-  }
+  // The store already binds a state and its descriptors to the module id and
+  // to the state's own platform. What it cannot know is which platform this
+  // process is: a Vault synced from a desktop carries a desktop device state
+  // onto a phone, and only here is that visible.
   if (state.platform !== platform) {
     throw new Error(
       `Module "${moduleId}" device state belongs to ${state.platform}, not ${platform}`,
     )
-  }
-  for (const descriptor of referencedDescriptors(state)) {
-    if (descriptor.id !== moduleId || descriptor.platform !== platform) {
-      throw new Error(`Module "${moduleId}" has a mismatched ready descriptor`)
-    }
   }
 }
 
@@ -461,30 +408,8 @@ function readinessResult(value: ModuleReadinessResult): ModuleReadinessResult {
   })
 }
 
-function withAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) return Promise.reject(disposedError())
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => {
-      cleanup()
-      reject(disposedError())
-    }
-    const cleanup = () => signal.removeEventListener('abort', onAbort)
-    signal.addEventListener('abort', onAbort, { once: true })
-    void operation.then(
-      (value) => {
-        cleanup()
-        resolve(value)
-      },
-      (error) => {
-        cleanup()
-        reject(error instanceof Error ? error : new Error(String(error)))
-      },
-    )
-  })
-}
-
 function disposedError(): Error {
-  return new Error('Module readiness reconciler is disposed')
+  return new Error(READINESS_DISPOSED)
 }
 
 function errorMessage(error: unknown): string {

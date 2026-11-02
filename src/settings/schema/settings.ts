@@ -15,9 +15,8 @@ export function normalizeYoloSettingsReferences(
   )
   const seenEmbeddingModelKeys = new Set<string>()
   const embeddingModels = settings.embeddingModels.filter((model) => {
-    // `yolo-local` (P2, docs/plans/08-22-local-embedding/00-plan.md §3.5) is
-    // a reserved providerId with deliberately no matching `settings.providers`
-    // entry — it's not "a provider" (no API key/base URL), it's the RAG-only
+    // `yolo-local` is a reserved providerId with deliberately no matching
+    // `settings.providers` entry — it's not "a provider" (no API key/base URL), it's the RAG-only
     // local inference path. Without this carve-out every local embedding
     // model would be silently dropped here on the very next settings save.
     if (
@@ -144,27 +143,23 @@ export function migrateYoloSettingsData(
   return currentData
 }
 
+/**
+ * Empty input yields defaults. Non-empty input that fails the schema throws
+ * rather than yielding defaults: it is someone's real settings, and the
+ * caller must not let defaults stand in for it.
+ */
 export function parseYoloSettings(data: unknown): YoloSettings {
-  try {
-    if (
-      !data ||
-      (typeof data === 'object' &&
-        data !== null &&
-        Object.keys(data as Record<string, unknown>).length === 0)
-    ) {
-      const parsed = yoloSettingsSchema.parse({})
-      return { ...parsed, version: SETTINGS_SCHEMA_VERSION }
-    }
-
-    const migratedData = migrateYoloSettingsData(
-      data as Record<string, unknown>,
-    )
-    const parsed = yoloSettingsSchema.parse(migratedData)
-    const normalized = normalizeYoloSettingsReferences(parsed)
-    return { ...normalized, version: SETTINGS_SCHEMA_VERSION }
-  } catch (error) {
-    console.warn('Invalid settings provided, using defaults:', error)
-    const defaults = yoloSettingsSchema.parse({})
-    return { ...defaults, version: SETTINGS_SCHEMA_VERSION }
+  if (
+    !data ||
+    (typeof data === 'object' &&
+      Object.keys(data as Record<string, unknown>).length === 0)
+  ) {
+    const parsed = yoloSettingsSchema.parse({})
+    return { ...parsed, version: SETTINGS_SCHEMA_VERSION }
   }
+
+  const migratedData = migrateYoloSettingsData(data as Record<string, unknown>)
+  const parsed = yoloSettingsSchema.parse(migratedData)
+  const normalized = normalizeYoloSettingsReferences(parsed)
+  return { ...normalized, version: SETTINGS_SCHEMA_VERSION }
 }

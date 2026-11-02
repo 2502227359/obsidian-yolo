@@ -1,4 +1,3 @@
-import { GoogleGenAI } from '@google/genai'
 import {
   Check,
   FileText,
@@ -16,10 +15,11 @@ import { useLanguage } from '../../../contexts/language-context'
 import { listBedrockChatModelIds } from '../../../core/llm/bedrockCatalog'
 import { listChatGPTOAuthModels } from '../../../core/llm/chatgptOAuthModelCatalog'
 import { listClaudeSdkModels } from '../../../core/llm/claude-sdk/modelCatalog'
-import {
-  collectModelIdentifiers,
-  extractModelIdentifier,
-} from '../../../core/llm/modelCatalogIdentifiers'
+import { claudeAcceptsSamplingParams } from '../../../core/llm/claudeReasoning'
+import { COPILOT_AUTO_MODEL_ID } from '../../../core/llm/copilotAutoSession'
+import { getCopilotModelCatalog } from '../../../core/llm/copilotModelCatalog'
+import { listGeminiModelIds } from '../../../core/llm/geminiModelCatalog'
+import { collectModelIdentifiers } from '../../../core/llm/modelCatalogIdentifiers'
 import type YoloPlugin from '../../../main'
 import {
   ChatModel,
@@ -123,19 +123,6 @@ const clampMaxContextTokens = (value: number): number =>
 
 const clampMaxOutputTokens = (value: number): number =>
   Math.max(1, Math.floor(value))
-
-const normalizeGeminiBaseUrl = (raw?: string): string | undefined => {
-  if (!raw) return undefined
-  const trimmed = raw.replace(/\/+$/, '')
-  try {
-    const url = new URL(trimmed)
-    // Strip trailing version segments to avoid double-appending by SDK
-    url.pathname = url.pathname.replace(/\/?(v1beta|v1alpha1|v1)(\/)?$/, '')
-    return url.toString().replace(/\/+$/, '')
-  } catch {
-    return trimmed.replace(/\/?(v1beta|v1alpha1|v1)(\/)?$/, '')
-  }
-}
 
 const CHATGPT_OAUTH_DEFAULT_MODELS = Array.from(
   new Set([
@@ -429,6 +416,27 @@ function AddChatModelModalComponent({
           return
         }
 
+        if (selectedProvider.presetType === 'github-copilot') {
+          // No fallback list: Copilot's models depend on the account's plan
+          // and policies, so a guessed list would offer models it cannot use.
+          const catalog = await getCopilotModelCatalog(
+            selectedProvider.id,
+            plugin.getCopilotOAuthService(selectedProvider.id),
+            { refresh: true },
+          )
+          // Auto first: on Free and Student plans it is the only way to the
+          // newer models, and their catalog lists none to pick by id.
+          const unique = [
+            COPILOT_AUTO_MODEL_ID,
+            ...Array.from(new Set(catalog.map((model) => model.id)))
+              .filter((id) => id !== COPILOT_AUTO_MODEL_ID)
+              .sort(),
+          ]
+          setAvailableModels(unique)
+          plugin.setCachedModelList(selectedProvider.id, unique, 'chat')
+          return
+        }
+
         if (selectedProvider.presetType === 'gemini-oauth') {
           const service = plugin.getGeminiOAuthService(selectedProvider.id)
           const credential = await service.getUsableCredential()
@@ -549,27 +557,9 @@ function AddChatModelModalComponent({
         }
 
         if (selectedProvider.apiType === 'gemini') {
-          const baseUrl = normalizeGeminiBaseUrl(selectedProvider.baseUrl)
-          const ai = new GoogleGenAI({
-            apiKey: selectedProvider.apiKey ?? '',
-            httpOptions:
-              baseUrl || providerHeaders
-                ? {
-                    ...(baseUrl ? { baseUrl } : {}),
-                    ...(providerHeaders ? { headers: providerHeaders } : {}),
-                  }
-                : undefined,
-          })
-          const pager = await ai.models.list()
-          const names: string[] = []
-          for await (const entry of pager) {
-            const raw = extractModelIdentifier(entry) ?? ''
-            if (!raw) continue
-            // Normalize like "models/gemini-2.5-pro" -> "gemini-2.5-pro"
-            const norm = raw.includes('/') ? raw.split('/').pop()! : raw
-            // Only keep gemini text/chat models
-            if (norm.toLowerCase().includes('gemini')) names.push(norm)
-          }
+          const ids = await listGeminiModelIds(selectedProvider)
+          // Only keep gemini text/chat models
+          const names = ids.filter((id) => id.toLowerCase().includes('gemini'))
           // De-dup and sort for UX
           const unique = Array.from(new Set(names)).sort()
           setAvailableModels(unique)
@@ -1591,6 +1581,13 @@ function AddChatModelModalComponent({
       <ModelRequestParametersDisclosure
         enabledCount={enabledRequestParameterCount}
         onClear={clearRequestParameterOverrides}
+        note={
+          (selectedProvider?.apiType === 'anthropic' ||
+            selectedProvider?.apiType === 'amazon-bedrock') &&
+          !claudeAcceptsSamplingParams(formData.model)
+            ? t('settings.models.samplingNotSentForModel')
+            : undefined
+        }
       >
         <div className="yolo-agent-model-controls">
           <div

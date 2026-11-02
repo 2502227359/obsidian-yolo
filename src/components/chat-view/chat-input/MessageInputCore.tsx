@@ -29,6 +29,7 @@ import {
 import { useApp } from '../../../contexts/app-context'
 import { useLanguage } from '../../../contexts/language-context'
 import { useSettings } from '../../../contexts/settings-context'
+import type { ChatMode } from '../../../core/agent/chat-mode'
 import { LiteSkillEntry } from '../../../core/skills/liteSkills'
 import { SnippetEntry } from '../../../core/snippets/snippetsManager'
 import { Assistant } from '../../../types/assistant.types'
@@ -54,7 +55,6 @@ import { fileToMentionableOffice } from '../../../utils/llm/office'
 import { fileToMentionablePDF } from '../../../utils/llm/pdf'
 import { fileToMentionableTextAttachment } from '../../../utils/llm/text-attachment'
 
-import { ChatMode } from './ChatModeSelect'
 import LexicalContentEditable from './LexicalContentEditable'
 import {
   setLexicalStateFromExternalState,
@@ -112,6 +112,7 @@ export type MessageInputCoreProps = {
   setSelectedSkills?: (skills: ChatSelectedSkill[]) => void
 
   enableAttachments?: boolean
+  allowImageAttachments?: boolean
   currentModel?: ChatModel | null
   skipImageModelCapabilityCheck?: boolean
 
@@ -170,6 +171,7 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
       setSelectedSkills,
 
       enableAttachments = true,
+      allowImageAttachments = true,
       currentModel = null,
       skipImageModelCapabilityCheck = false,
 
@@ -290,6 +292,15 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
 
     const handleCreateImageMentionables = useCallback(
       (mentionableImages: MentionableImage[]) => {
+        if (mentionableImages.length > 0 && !allowImageAttachments) {
+          new Notice(
+            t(
+              'chat.imageUnsupportedByRuntime',
+              'This CLI runtime does not accept image input.',
+            ),
+          )
+          return
+        }
         if (
           mentionableImages.length > 0 &&
           !skipImageModelCapabilityCheck &&
@@ -350,6 +361,7 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
         setMentionables([...mentionables, ...newMentionableImages])
       },
       [
+        allowImageAttachments,
         currentModel,
         mentionableUnitLabels,
         mentionables,
@@ -550,9 +562,7 @@ const MessageInputCore = forwardRef<MessageInputCoreRef, MessageInputCoreProps>(
         }
         if (pdfFiles.length > 0) {
           void Promise.allSettled(
-            pdfFiles.map((file) =>
-              fileToMentionablePDF(app, file, { settings }),
-            ),
+            pdfFiles.map((file) => fileToMentionablePDF(app, file)),
           ).then((results) => {
             const successes: MentionablePDF[] = []
             results.forEach((result, idx) => {

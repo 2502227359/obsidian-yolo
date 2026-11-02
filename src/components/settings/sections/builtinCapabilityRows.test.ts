@@ -4,13 +4,12 @@ import {
 } from './builtinCapabilityRows'
 
 // Pass-through translator: exercises the fallback strings, which is exactly
-// what pre-D7 (`AgentToolsModal.tsx` etc.) rendered when no locale override
-// was active.
+// what the former code (`AgentToolsModal.tsx` etc.) rendered when no locale
+// override was active.
 const t = (_key: string, fallback?: string) => fallback ?? ''
 
 /**
- * Regression test for D7a (docs/plans/2026-08-15-tool-registry/phase2-migration.md
- * D7): the settings page's built-in-capability list must render with the
+ * Regression test: the settings page's built-in-capability list must render with the
  * exact same row order and labels as before the `BUILTIN_TOOL_UI_META` /
  * `BUILTIN_TOOL_CATEGORY_MAP` / `BUILTIN_TOOL_DISPLAY_ORDER` side tables were
  * torn down — this is now derived purely from `CAPABILITIES`'s registration
@@ -29,11 +28,12 @@ describe('buildBuiltinCapabilityRows', () => {
       'context_compaction',
       'user_questions',
       'todo_list',
-      'memory',
       'web_access',
       'js_sandbox',
       'terminal',
       'subagent_delegation',
+      'native_files',
+      'vault_search',
     ])
 
     expect(rows.map((row) => row.label)).toEqual([
@@ -44,17 +44,18 @@ describe('buildBuiltinCapabilityRows', () => {
       'Compact Context',
       'Ask User',
       'Task List',
-      'Memory Toolset',
       'Web Search Toolset',
       'Analysis Sandbox',
       'Terminal Commands',
       'Delegate Subagent',
+      'Local Filesystem Toolset',
+      'Vault Search',
     ])
   })
 })
 
 describe('groupCapabilityRowsByCategory', () => {
-  it('buckets rows into the pre-D7 vault / context / external order and content', () => {
+  it('buckets rows into the vault / context / external order and content', () => {
     const rows = buildBuiltinCapabilityRows({ toolOptions: {}, t })
     const groups = groupCapabilityRowsByCategory(rows, t)
 
@@ -65,51 +66,54 @@ describe('groupCapabilityRowsByCategory', () => {
     ])
 
     const vault = groups.find((group) => group.category === 'vault')
-    // fs_read -> bash -> fs_edit_ops (survey-current-state.md §四; the task
-    // brief's "已经替你查清的事实").
+    // fs_read -> bash -> fs_edit_ops, then capabilities registered after that
+    // frozen order — `vault_search`.
     expect(vault?.rows.map((row) => row.id)).toEqual([
       'file_reading',
       'vault_shell',
       'file_editing',
+      'vault_search',
     ])
     expect(vault?.rows.map((row) => row.label)).toEqual([
       'Read File',
       'Bash (Vault Shell)',
       'File Editing Toolset',
+      'Vault Search',
     ])
 
     const context = groups.find((group) => group.category === 'context')
     // context_prune_tool_results -> context_compact -> ask_user_question ->
-    // todo_write -> memory_ops.
+    // todo_write.
     expect(context?.rows.map((row) => row.id)).toEqual([
       'context_pruning',
       'context_compaction',
       'user_questions',
       'todo_list',
-      'memory',
     ])
     expect(context?.rows.map((row) => row.label)).toEqual([
       'Prune Tool Results',
       'Compact Context',
       'Ask User',
       'Task List',
-      'Memory Toolset',
     ])
 
     const external = groups.find((group) => group.category === 'external')
     // web_ops -> js_eval -> terminal_command -> delegate_subagent (former
-    // `BUILTIN_TOOL_DISPLAY_ORDER.external`).
+    // `BUILTIN_TOOL_DISPLAY_ORDER.external`), then capabilities registered
+    // after that frozen order — `native_files`.
     expect(external?.rows.map((row) => row.id)).toEqual([
       'web_access',
       'js_sandbox',
       'terminal',
       'subagent_delegation',
+      'native_files',
     ])
     expect(external?.rows.map((row) => row.label)).toEqual([
       'Web Search Toolset',
       'Analysis Sandbox',
       'Terminal Commands',
       'Delegate Subagent',
+      'Local Filesystem Toolset',
     ])
   })
 

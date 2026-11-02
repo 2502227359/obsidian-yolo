@@ -1,14 +1,18 @@
 import { resolveAssistantModelId } from '../../core/agent/assistant-model'
+import type {
+  BuiltinChatMode,
+  ChatMode,
+  ToolChatMode,
+} from '../../core/agent/chat-mode'
+import { isModuleChatMode, isToolChatMode } from '../../core/agent/chat-mode'
 import type { YoloSettings } from '../../settings/schema/setting.types'
 import type { ConversationOverrideSettings } from '../../types/conversation-settings.types'
 import type { ReasoningLevel } from '../../types/reasoning'
 
 import {
-  type BuiltinChatMode,
-  type ChatMode,
   chatModeForSave,
-  isAgentChatMode,
-  isModuleChatMode,
+  readYoloPreference,
+  yoloPreferencePatch,
 } from './chat-input/ChatModeSelect'
 
 /**
@@ -25,6 +29,12 @@ export type ConversationPreferencesSnapshot = {
   chatMode: ChatMode
   /** Persisted (never runtime-downgraded) chat mode — see `chatModeForSave`. */
   persistedChatMode: ChatMode
+  /**
+   * The YOLO flag of the trust profile `chatMode` reads — Max's when Max is
+   * selected, Agent's otherwise. Switching modes re-reads it from the
+   * incoming mode's stored field rather than carrying the old one over; see
+   * `yoloPreferenceKeyForMode`.
+   */
   yoloEnabled: boolean
   conversationOverrides: ConversationOverrideSettings | null
 }
@@ -54,8 +64,7 @@ function resolveNext<T>(action: SetStateActionLike<T>, prev: T): T {
  * reasoningLevel / chatMode / persistedChatMode / yoloEnabled /
  * conversationOverrides）及各自的每会话 Ref 缓存的唯一 owner。
  *
- * 见 docs/plans/2026-08-11-arch-governance-step3-chat-state-ownership.md
- * 「分期 B」。普通 TS class，零 React 依赖——由
+ * 普通 TS class，零 React 依赖——由
  * `useChatRuntimePreferences` 经 `useSyncExternalStore` 订阅，每个 ChatView
  * 实例持有一个（随 Chat.tsx 组件创建/销毁，不是全局单例，保证多窗口隔离）。
  *
@@ -250,12 +259,23 @@ export class ConversationPreferencesController {
    * 也是应持久化的值。
    */
   changeChatMode = (nextMode: ChatMode): void => {
-    this.setChatMode(nextMode)
-    this.setPersistedChatMode(nextMode)
+    const settings = this.deps.getSettings()
     const nextOverrides = {
       ...(this.snapshot.conversationOverrides ?? {}),
       chatMode: chatModeForSave(nextMode),
     }
+
+    this.setChatMode(nextMode)
+    this.setPersistedChatMode(nextMode)
+    // Each tool mode owns its own trust profile, so `yoloEnabled` — which
+    // only ever describes one of them — has to be re-read for the mode being
+    // switched to. Carrying the old value over would silently hand Max the
+    // auto-approval the user granted Agent, and vice versa.
+    this.setYoloEnabled(
+      readYoloPreference(nextOverrides, nextMode) ??
+        readYoloPreference(settings.chatOptions, nextMode) ??
+        false,
+    )
     this.applyOverrides(nextOverrides)
     this.conversationOverridesRef.current.set(
       this.currentConversationId,
@@ -265,16 +285,18 @@ export class ConversationPreferencesController {
     // 全局 settings 永不学习 module chat mode——只有会话覆盖（上面已写入）
     // 会。module 可能被卸载，全局默认值不能指向它。
     if (!isModuleChatMode(nextMode)) {
-      this.deps.persistPreferredChatMode(nextMode as BuiltinChatMode)
+      this.deps.persistPreferredChatMode(nextMode)
     }
 
-    const settings = this.deps.getSettings()
     const assistant =
       settings.assistants.find(
         (item) => item.id === this.snapshot.conversationAssistantId,
       ) ?? null
+    // Max runs on the assistant the same way Agent does (tool preferences,
+    // instructions, `contextPolicy.useAssistant`), so it adopts the
+    // assistant's default model on entry for the same reason.
     if (
-      isAgentChatMode(nextMode) &&
+      isToolChatMode(nextMode) &&
       assistant?.modelId &&
       this.snapshot.conversationModelId === settings.chatModelId
     ) {
@@ -285,12 +307,22 @@ export class ConversationPreferencesController {
   /**
    * 等价于原 `applyYoloChange`（不含确认弹窗——弹窗触达 Obsidian UI，留在
    * React/host 层的 `handleYoloChange` 包装器里）。
+   *
+   * `mode` 是被拨动的那张卡片所属的模式，不一定是当前模式：选择器里 Agent
+   * 与 Max 各自带一个开关，拨动未选中的那个只是修改它的信任档偏好。因此只
+   * 有当它就是当前模式时才动运行时快照的 `yoloEnabled`（`bypassToolApproval`
+   * 读的就是它）；另一个模式的值会在 `changeChatMode` 切过去时从这里写下的
+   * 覆盖项重新读入。
    */
-  toggleYolo = (enabled: boolean): void => {
-    this.setYoloEnabled(enabled)
+  toggleYolo = (mode: ToolChatMode, enabled: boolean): void => {
+    if (mode === this.snapshot.chatMode) {
+      this.setYoloEnabled(enabled)
+    }
+    // Writes only the field belonging to `mode`'s trust profile, leaving the
+    // other mode's stored value untouched.
     const nextOverrides = {
       ...(this.snapshot.conversationOverrides ?? {}),
-      agentYoloEnabled: enabled,
+      ...yoloPreferencePatch(mode, enabled),
     }
     this.applyOverrides(nextOverrides)
     this.conversationOverridesRef.current.set(

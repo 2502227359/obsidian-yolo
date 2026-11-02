@@ -25,6 +25,10 @@
 </p>
 
 <p align="center">
+  <a href="./documentation/en/README.md"><b>Documentation</b></a> | <a href="./documentation/en/getting-started.md">Getting started</a> | <a href="./documentation/en/faq.md">FAQ</a>
+</p>
+
+<p align="center">
   <a href="https://discord.gg/d8EHm48ppU">
     <img src="https://img.shields.io/badge/Discord-Join_the_community-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Join the Discord community">
   </a>
@@ -35,31 +39,14 @@
 <table>
 <tr>
 <td width="200" align="center" valign="middle">
-  <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=obsidian-yolo">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://www.atlascloud.ai/logo-white.svg">
-      <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" width="163">
-    </picture>
+  <a href="https://fluxionai.space/register?source=github&amp;campaign=github-sidrune-yolo&amp;promo=SDRYOLO">
+    <img src="./assets/sponsor-sidrune.png" alt="Sidrune AI" width="163">
   </a>
 </td>
 <td valign="middle">
-  <b><a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=obsidian-yolo">Atlas Cloud</a></b> gives developers one unified API for building with language, image, and video AI. Connect once to explore 300+ curated models across every modality—without maintaining separate integrations for each provider. From LLM-powered agents to image and video generation, Atlas Cloud makes it easier to experiment, compare models, and bring multimodal AI into production.
+  Thanks to <b><a href="https://fluxionai.space/register?source=github&amp;campaign=github-sidrune-yolo&amp;promo=SDRYOLO">Sidrune AI</a></b> for sponsoring this project! Sidrune AI is an API relay that helps individual developers and businesses access and manage the world's leading AI models through one unified API. Multi-route dynamic scheduling keeps requests available, and model performance, response times, and costs are all transparent. With Fable 5.1, Sidrune AI can save you up to about 90% compared with Claude's official API pricing. Sign up through this link to get $3 in free API credit.
   <br><br>
-  <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=obsidian-yolo"><b>Explore Atlas Cloud →</b></a>
-  &nbsp;&nbsp;·&nbsp;&nbsp;
-  <a href="https://www.atlascloud.ai/console/coding-plan"><b>View the Coding Plan →</b></a>
-</td>
-</tr>
-<tr>
-<td width="200" align="center" valign="middle">
-  <a href="https://go.apimart.ai/gh-obsidian-yolo">
-    <img src="./assets/sponsor-apimart.png" alt="APIMart" width="163">
-  </a>
-</td>
-<td valign="middle">
-  Thanks to <b><a href="https://go.apimart.ai/gh-obsidian-yolo">APIMart</a></b> for sponsoring this project! APIMart is a low-cost API platform for AI image &amp; video generation — GPT-Image-2 from $0.006/image, 160+ images per dollar. One async API covers both image and video: submit a task, get an ID, fetch results via polling or callback. Batch tens of thousands of images without timeouts, switch models without changing code. Pay-as-you-go with no monthly fee — sign up here to get started.
-  <br><br>
-  <a href="https://go.apimart.ai/gh-obsidian-yolo"><b>Sign up for APIMart →</b></a>
+  <a href="https://fluxionai.space/register?source=github&amp;campaign=github-sidrune-yolo&amp;promo=SDRYOLO"><b>Sign up for Sidrune AI →</b></a>
 </td>
 </tr>
 </table>
@@ -68,17 +55,36 @@
 
 - **`1.6`**
   - **On-device local embedding models and multiple knowledge bases**: index without any API key, split and manage knowledge bases independently, and let the Agent auto-pick the right one by name.
-  - **CLI chat**: on desktop, drive the Claude Code, Codex, Hermes, or Pi CLI you're already signed into from the same chat surface.
+  - **CLI chat**: on desktop, drive the Claude Code, Codex, Hermes, Pi, or Grok CLI you're already signed into from the same chat surface.
   - **The new Learning Mode**: turn any topic and reference material into a personalized learning project with structured outlines, knowledge points, flashcards, and an interactive knowledge map, backed by FSRS spaced repetition and Anki `.apkg` import for sustainable long-term review.
 
 - **`1.5`**: Introduces a new Agent runtime that turns AI from Q&A into active collaboration—with full tool calling, MCP, Skills, desktop Bash, subagents, and web search—plus smarter long-session context and memory, refreshed hybrid RAG, focus/PDF awareness, and multi-window chat with background Agents.
 
 ## Highlights
 
-| A Complete Agent Experience \| Use Codex / Claude Code Inside Obsidian | Turn Vault Knowledge into Lasting Mastery |
-|:--:|:--:|
-| ![Agent Tools](./assets/agenttools.gif) | ![Learning Mode](./assets/learning-mode.gif) |
-| Go beyond answers. YOLO understands and works directly with your Vault, calls tools and MCP servers, and uses Skills to get real work done your way. On desktop, switch in one click to the Claude Code or Codex you are already signed in to and let them work directly in your Vault. | Turn topics and source material into a personal learning system, then use flashcards and FSRS-powered review to move from saved notes to lasting knowledge. |
+<table>
+<tr>
+<td width="50%" align="center"><b>A Complete Agent Experience | Use Codex / Claude Code Inside Obsidian</b></td>
+<td width="50%" align="center"><b>Turn Vault Knowledge into Lasting Mastery</b></td>
+</tr>
+<tr valign="top">
+<td align="center"><img src="./assets/agent.webp" alt="Agent" width="100%"></td>
+<td align="center"><img src="./assets/learning-mode.gif" alt="Learning Mode" width="100%"></td>
+</tr>
+<tr valign="top">
+<td align="center">Go beyond answers. YOLO understands and works directly with your Vault, calls tools and MCP servers, and uses Skills to get real work done your way. On desktop, switch in one click to a supported CLI agent you are already signed in to and let it work directly in your Vault.</td>
+<td align="center">Turn topics and source material into a personal learning system, then use flashcards and FSRS-powered review to move from saved notes to lasting knowledge.</td>
+</tr>
+<tr>
+<td colspan="2" align="center"><b>YOLO Whiteboard | A High-Performance Obsidian Canvas</b></td>
+</tr>
+<tr>
+<td colspan="2" align="center"><img src="./assets/whiteboard.gif" alt="YOLO Whiteboard" width="100%"></td>
+</tr>
+<tr>
+<td colspan="2" align="center">For now, think of it as an Obsidian Canvas several to dozens of times faster. More features that push the boundaries of AI and human thinking are on the way.</td>
+</tr>
+</table>
 
 ## Features
 
@@ -86,7 +92,7 @@ Beyond the core capabilities above, YOLO also provides:
 
 | Feature | Description |
 |---------|-------------|
-| 🖥️ CLI Agent (Desktop) | Reuse the Claude Code / Codex you are already signed in to locally, and chat with the CLI agent right inside Obsidian |
+| 🖥️ CLI Agent (Desktop) | Reuse a supported locally signed-in CLI agent, including Claude Code, Codex, Hermes, Pi, and Grok, right inside Obsidian |
 | 🔌 External Agent Support | Connect MCP clients such as Hermes and OpenClaw to YOLO's Vault search, or delegate tasks to a configured YOLO Agent |
 | ⚡ Quick Ask | Ask, edit, and continue writing without leaving the editor |
 | 🔎 Vault RAG | Retrieve across your Vault for answers grounded in your own notes |
@@ -128,8 +134,26 @@ See Quick Start above.
 - [x] Learning Mode — a dedicated study view
 - [ ] Annotation Mode — real-time AI annotations and suggestions on notes
 - [ ] Built-in assistant — a corner-pinned helper for config/agents, with auto-compaction and scheduled tasks
-- [ ] Better AI whiteboard
+- [x] Better AI whiteboard
 - [ ] Voice input & meeting notes
+
+## Documentation
+
+Full user documentation lives in **[documentation/en](./documentation/en/README.md)**:
+
+| | |
+|---|---|
+| [Getting started](./documentation/en/getting-started.md) | Install, configure a working model, run your first chat |
+| [Models & providers](./documentation/en/models.md) | Connect providers, OAuth sign-in, model parameters |
+| [Chat](./documentation/en/chat.md) | Referencing notes, the three modes, tool approvals, applying edits |
+| [Sparkle](./documentation/en/sparkle.md) | Quick Ask, Tab completion, selection rewrite |
+| [Knowledge base](./documentation/en/knowledge-base.md) | Indexing, multiple knowledge bases, local embedding models |
+| [Tools & permissions](./documentation/en/tools-and-permissions.md) | What it can touch, and how to rein it in |
+| [Memory](./documentation/en/memory.md) · [Skills](./documentation/en/skills.md) · [Agents](./documentation/en/assistants.md) | Tailoring it to you |
+| [MCP](./documentation/en/mcp.md) · [CLI agents](./documentation/en/cli-agent.md) · [Modules](./documentation/en/modules.md) | Going further |
+| [Settings reference](./documentation/en/settings-reference.md) · [FAQ](./documentation/en/faq.md) | Look things up |
+
+Also available in [简体中文](./documentation/zh-CN/README.md) and [Italiano](./documentation/it/README.md).
 
 ## Feedback & Issues
 

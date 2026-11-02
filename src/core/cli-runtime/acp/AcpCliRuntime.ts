@@ -4,9 +4,22 @@ import type {
   RequestPermissionResponse,
 } from '@agentclientprotocol/sdk'
 
-import type { ChatMessage } from '../../../types/chat'
+import {
+  type EditReviewSnapshotApp,
+  MAX_SNAPSHOT_CONTENT_CHARS,
+} from '../../../database/edit-review/editReviewSnapshotStore'
+import type { ChatMessage, ChatToolMessage } from '../../../types/chat'
+import {
+  type ToolCallResponse,
+  ToolCallResponseStatus,
+} from '../../../types/tool-call.types'
+import { readNativeCurrentText } from '../../tools/native/current-text'
+import { resolveNativePathWithin } from '../../tools/native/paths'
+import { RUNTIME_CAPABILITIES } from '../capabilities'
+import { recordCliEditReviewSnapshot } from '../edit-review'
 import type {
   CliApprovalResponse,
+  CliPermissionProfileUpdate,
   CliQuestionResponse,
   CliRewriteTurnInput,
   CliRuntime,
@@ -17,19 +30,29 @@ import type {
   CliRuntimeId,
   CliRuntimeModel,
   CliRuntimeReadyInput,
+  CliRuntimeSkill,
   CliSessionHydration,
   CliSessionRef,
   CliTurnInput,
 } from '../types'
 
+import type { AcpAgentProfile } from './agent-profile'
 import { AcpHost, type AcpHostOptions, type AcpHostResolver } from './host'
 import {
   AcpSessionAggregator,
+  type AcpThoughtLevelState,
+  type AcpToolCallState,
+  acpToolMessageId,
   buildCancelledApprovalOutcome,
   buildPendingApprovalMessages,
+  extractAcpSessionModeState,
   extractAcpSessionModelState,
+  extractAcpThoughtLevelState,
+  isAcpDiskSettlementPending,
+  isAcpImagePromptBlock,
   mapAcpTurnUsage,
   mapAcpUsageUpdate,
+  resolveAcpWholeFileDiff,
   resolveApprovalOptionId,
   toAcpPromptBlocks,
   upsertAcpMessage,
@@ -45,11 +68,14 @@ export type AcpCliRuntimeOptions = Readonly<{
   resolveHost?: AcpHostResolver
   createProcess?: AcpHostOptions['createProcess']
   /**
-   * Agent-provided manual-compaction slash command (see
-   * `AcpAgentProfile.compactCommand`). Absent means the connected agent has
-   * no such affordance and `compact()` throws.
+   * The connected agent's plug-in point, supplied by its factory. Everything
+   * agent-specific this runtime consumes comes from here — the manual
+   * compaction command and the permission-profile-to-session-mode mapping —
+   * so adding an agent affordance does not mean threading another loose
+   * field through every ACP factory. Absent in tests that exercise only the
+   * agent-agnostic paths.
    */
-  compactCommand?: string
+  profile?: AcpAgentProfile
   /**
    * Optional recovery for when resuming a stored session fails to load
    * (e.g. the process/place it lived in is no longer reachable).
@@ -68,6 +94,12 @@ export type AcpCliRuntimeOptions = Readonly<{
    * when hosts are not pooled (`resolveHost` absent).
    */
   releaseHost?: () => void
+  /**
+   * Where edit review snapshots are stored. A file change the runtime could
+   * settle against disk is recorded there, so the edit summary panel can open
+   * it in the review overlay. Absent in tests that do not exercise that.
+   */
+  app?: EditReviewSnapshotApp
 }>
 
 type PendingApproval = {
@@ -83,8 +115,17 @@ type PendingApproval = {
  */
 export class AcpCliRuntime implements CliRuntime {
   private readonly listeners = new Set<CliRuntimeEventListener>()
-  private readonly aggregator = new AcpSessionAggregator()
+  private readonly aggregator: AcpSessionAggregator
   private readonly pendingApprovals = new Map<string, PendingApproval>()
+  /**
+   * Every tool card this live turn has put on screen, by message id, as it
+   * currently stands — including the `Running` an approval card becomes when
+   * `respondApproval` answers it. Read when the turn ends; see
+   * `settleRunningToolCards`.
+   */
+  private readonly turnToolCards = new Map<string, ChatToolMessage>()
+  /** Completed file-change calls whose files are being read, by toolCallId. */
+  private readonly diskSettlements = new Map<string, Promise<void>>()
 
   private host: AcpHost | null = null
   private ownsHost = false
@@ -93,6 +134,12 @@ export class AcpCliRuntime implements CliRuntime {
   private activeSessionRef: CliSessionRef | null = null
   private models: CliRuntimeModel[] = []
   private modelId: string | null = null
+  private permissionProfile: CliPermissionProfileUpdate | null = null
+  private sessionModeIds: ReadonlySet<string> = new Set()
+  private currentSessionModeId: string | null = null
+  private thoughtLevel: AcpThoughtLevelState | null = null
+  /** The bound session's skills, as the agent last advertised them. */
+  private skills: CliRuntimeSkill[] = []
   private turnInFlight = false
   private cancelRequested = false
   private disposed = false
@@ -100,7 +147,9 @@ export class AcpCliRuntime implements CliRuntime {
   constructor(
     readonly runtimeId: CliRuntimeId,
     private readonly options: AcpCliRuntimeOptions,
-  ) {}
+  ) {
+    this.aggregator = new AcpSessionAggregator('live', options.cwd)
+  }
 
   /**
    * Read-only peek used to populate the transcript before the session is
@@ -135,7 +184,7 @@ export class AcpCliRuntime implements CliRuntime {
       return { ref, messages: [], compactionBoundaries: [] }
     }
 
-    const aggregator = new AcpSessionAggregator('replay')
+    const aggregator = new AcpSessionAggregator('replay', this.options.cwd)
     const messages: ChatMessage[] = []
     const unregister = host.registerSession(ref.nativeSessionId, {
       onUpdate: (update) => {
@@ -153,7 +202,7 @@ export class AcpCliRuntime implements CliRuntime {
           mcpServers: [],
         }),
       )
-      this.captureModelState(response)
+      this.captureSessionState(response)
     } catch (error) {
       unregister()
       if (!this.options.sessionRecovery) throw error
@@ -191,11 +240,12 @@ export class AcpCliRuntime implements CliRuntime {
       const response = await host.call((connection) =>
         connection.newSession({ cwd: this.options.cwd, mcpServers: [] }),
       )
-      this.captureModelState(response)
+      this.captureSessionState(response)
       this.bindSession(host, {
         runtimeId: this.runtimeId,
         nativeSessionId: response.sessionId,
       })
+      await this.applySessionMode()
       return
     }
 
@@ -211,7 +261,7 @@ export class AcpCliRuntime implements CliRuntime {
             mcpServers: [],
           }),
         )
-        this.captureModelState(response)
+        this.captureSessionState(response)
       } catch (error) {
         if (!this.options.sessionRecovery) throw error
         await this.bindRecoveredSession(input.sessionRef)
@@ -219,22 +269,45 @@ export class AcpCliRuntime implements CliRuntime {
       }
     }
     this.bindSession(host, input.sessionRef)
+    await this.applySessionMode()
+  }
+
+  /** Advertised by the agent after the session binds, and again whenever its
+   * skills change — each time with a `skills_changed` event. */
+  async listSkills(): Promise<CliRuntimeSkill[]> {
+    return [...this.skills]
   }
 
   async getConfiguration(
     cachedModels?: readonly CliRuntimeModel[],
   ): Promise<CliRuntimeConfiguration> {
     const models = this.models.length ? this.models : [...(cachedModels ?? [])]
-    return { models, modelId: this.modelId, reasoningEffort: null }
+    const thoughtLevel = this.thoughtLevel
+    if (!thoughtLevel) {
+      return { models, modelId: this.modelId, reasoningEffort: null }
+    }
+    // The product hangs reasoning levels off each model, while ACP scopes the
+    // `thought_level` option to the *session*. The agent already narrows the
+    // option to what the session's current model supports and re-sends the
+    // whole set whenever the model changes, so publishing the one live list
+    // on every model keeps the picker correct without inventing a per-model
+    // breakdown the protocol never reports.
+    return {
+      models: models.map((model) => ({
+        ...model,
+        reasoningEfforts: [...thoughtLevel.options],
+      })),
+      modelId: this.modelId,
+      reasoningEffort: thoughtLevel.currentValue,
+    }
   }
 
   async updateConfiguration(
     update: CliRuntimeConfigurationUpdate,
   ): Promise<CliRuntimeConfiguration> {
     // Model selection goes through ACP's `session/set_model` extension when
-    // the agent reported a model list; reasoning has no ACP surface, so that
-    // part of the update is ignored. A `null` modelId means "keep the agent's
-    // own selection" — the protocol has no way to unset a model.
+    // the agent reported a model list. A `null` modelId means "keep the
+    // agent's own selection" — the protocol has no way to unset a model.
     const modelId = update.modelId
     if (modelId && modelId !== this.modelId && this.activeSessionRef) {
       const host = await this.getHost()
@@ -244,14 +317,108 @@ export class AcpCliRuntime implements CliRuntime {
       )
       this.modelId = modelId
     }
+    if (update.reasoningEffort !== undefined) {
+      await this.applyThoughtLevel(update.reasoningEffort)
+    }
     return this.getConfiguration()
   }
 
-  private captureModelState(response: unknown): void {
-    const state = extractAcpSessionModelState(response)
-    if (!state) return
-    this.models = state.models
-    this.modelId = state.currentModelId ?? this.modelId
+  /**
+   * Writes the product's reasoning level onto the agent's `thought_level`
+   * config option (ACP `session/set_config_option`).
+   *
+   * The product's `auto` level means "let the agent decide", which each
+   * agent spells with its own value id — hence the profile-declared
+   * `autoThoughtLevelValueId`. Any level the agent did not advertise is
+   * dropped rather than sent, the same way `applySessionMode` refuses a mode
+   * id the session never offered: these ids are agent-defined free text, and
+   * asking for one the agent does not know would only earn a protocol error
+   * for a picker the user just clicked.
+   *
+   * The response carries the agent's full, refreshed option set (changing one
+   * option may change the others), so the reply is what updates local state
+   * rather than the value that was requested.
+   */
+  private async applyThoughtLevel(level: string | null): Promise<void> {
+    const thoughtLevel = this.thoughtLevel
+    const sessionId = this.activeSessionRef?.nativeSessionId
+    if (!thoughtLevel || !sessionId) return
+    const requested =
+      level === null || level === 'auto'
+        ? this.options.profile?.autoThoughtLevelValueId
+        : level
+    if (!requested || !thoughtLevel.valueIds.has(requested)) return
+    if (requested === thoughtLevel.currentValue) return
+    const host = await this.getHost()
+    const response = await host.call((connection) =>
+      connection.request('session/set_config_option', {
+        sessionId,
+        configId: thoughtLevel.optionId,
+        value: requested,
+      }),
+    )
+    this.thoughtLevel = extractAcpThoughtLevelState(response) ?? {
+      ...thoughtLevel,
+      currentValue: requested,
+    }
+  }
+
+  /**
+   * Records what a `session/new` or `session/load` response says about the
+   * session we are about to bind. Model state feeds the picker; mode state
+   * is what `applySessionMode` needs, and re-reading it per session matters
+   * because an ACP mode belongs to *one* session — carrying the previous
+   * session's mode over would make the runtime think the new session was
+   * already on the right policy and skip setting it.
+   */
+  private captureSessionState(response: unknown): void {
+    const modelState = extractAcpSessionModelState(response)
+    if (modelState) {
+      this.models = modelState.models
+      this.modelId = modelState.currentModelId ?? this.modelId
+    }
+    const modeState = extractAcpSessionModeState(response)
+    this.sessionModeIds = modeState?.modeIds ?? new Set()
+    this.currentSessionModeId = modeState?.currentModeId ?? null
+    // Scoped to one session for the same reason modes are: the agent narrows
+    // the levels it offers to the session's current model, so carrying the
+    // previous session's list over would offer levels this one may reject.
+    this.thoughtLevel = extractAcpThoughtLevelState(response)
+  }
+
+  /**
+   * Hot-update of the product's Agent/Plan + YOLO profile. The profile is
+   * kept whether or not a session is bound yet (`ensureReady` can run after
+   * the toggle) and is applied to the agent on every binding, so switching
+   * conversations cannot leave the agent on the previous session's policy.
+   */
+  async updatePermissionProfile(
+    update: CliPermissionProfileUpdate,
+  ): Promise<void> {
+    this.permissionProfile = { ...update }
+    await this.applySessionMode()
+  }
+
+  /**
+   * Requests the agent's session mode matching the current permission
+   * profile. Silently does nothing when there is no bound session, when the
+   * agent declares no mapping, or when the mapped mode is not among the ones
+   * this session advertised — a mode id is agent-defined free text, and
+   * asking for one the agent never offered would only earn a protocol error
+   * for a toggle the user flipped.
+   */
+  private async applySessionMode(): Promise<void> {
+    const profile = this.permissionProfile
+    const sessionId = this.activeSessionRef?.nativeSessionId
+    if (!profile || !sessionId) return
+    const modeId = this.options.profile?.resolveSessionModeId?.(profile)
+    if (!modeId || !this.sessionModeIds.has(modeId)) return
+    if (modeId === this.currentSessionModeId) return
+    const host = await this.getHost()
+    await host.call((connection) =>
+      connection.setSessionMode({ sessionId, modeId }),
+    )
+    this.currentSessionModeId = modeId
   }
 
   async sendTurn(input: CliTurnInput): Promise<void> {
@@ -267,9 +434,23 @@ export class AcpCliRuntime implements CliRuntime {
       )
     }
     const host = await this.getHost()
+    const prompt = toAcpPromptBlocks(input.content)
+    // Runtimes that declare no image attachments (Grok) must not reach the
+    // agent with one, whatever the turn content picked up on the way here —
+    // the composer refusing the attachment is the user-facing half, this is
+    // the protocol edge. Scoped to that declaration rather than to what the
+    // agent advertised: ACP leaves `promptCapabilities` optional, so its
+    // absence is not a denial, and reading it as one would break every
+    // image-capable ACP runtime whose agent stays silent.
+    if (
+      !RUNTIME_CAPABILITIES[this.runtimeId].supportsImageAttachments &&
+      prompt.some(isAcpImagePromptBlock)
+    ) {
+      throw new Error(`${this.runtimeId} does not support image input.`)
+    }
     const sessionId = this.activeSessionRef.nativeSessionId
     this.cancelRequested = false
-    this.aggregator.beginTurn()
+    this.beginAggregatorTurn()
     this.emit({ type: 'run_state', state: 'running' })
     this.turnInFlight = true
     const startedAt = Date.now()
@@ -277,7 +458,7 @@ export class AcpCliRuntime implements CliRuntime {
       const result = await host.call((connection) =>
         connection.prompt({
           sessionId,
-          prompt: toAcpPromptBlocks(input.content),
+          prompt,
         }),
       )
       this.turnInFlight = false
@@ -287,6 +468,10 @@ export class AcpCliRuntime implements CliRuntime {
       // outcome can only be `aborted`, regardless of what `stopReason` the
       // (possibly racing) prompt response reports.
       const aborted = this.cancelRequested || result.stopReason === 'cancelled'
+      // The turn's cards are final once their files are read — before the
+      // terminal run state, so the transcript that closes the turn has them.
+      await Promise.all(this.diskSettlements.values())
+      this.settleRunningToolCards(aborted)
       // Before the terminal run state, which closes the turn's metrics window.
       // ACP has no turn-duration field, so it is measured around the prompt
       // call the same way Codex measures its own.
@@ -301,8 +486,148 @@ export class AcpCliRuntime implements CliRuntime {
       })
     } catch (error) {
       this.turnInFlight = false
+      this.settleRunningToolCards(true)
       throw error
     }
+  }
+
+  /** Opens a live turn: a new aggregation epoch, and no cards of its own yet. */
+  private beginAggregatorTurn(): void {
+    this.aggregator.beginTurn()
+    this.turnToolCards.clear()
+  }
+
+  /**
+   * A prompt turn is over once `session/prompt` returns — ACP reports the
+   * turn's end only after the agent has stopped working on it — so no call of
+   * the turn can still be running, and a card still showing `Running` is one
+   * the agent never reported back on. Hermes produces exactly that on every
+   * approved edit: its `session/request_permission` carries a toolCallId of
+   * its own, so the approval card turns `Running` when answered while the
+   * edit itself runs and completes under a different id, and nothing ever
+   * addresses the approval card again.
+   *
+   * Such a card settles to `Success` — the state the host already gives "a
+   * grant with no follow-up of its own" (`CliRuntime.respondApproval`); the
+   * work it stood for has finished, and any result the agent had is on the
+   * card it did report on. An aborted or failed turn settles it to `Aborted`
+   * instead: the call was cut off, not finished. This is a protocol rule,
+   * applied to every card of the turn alike, whichever agent produced it.
+   */
+  private settleRunningToolCards(aborted: boolean): void {
+    const settled: ToolCallResponse = aborted
+      ? { status: ToolCallResponseStatus.Aborted }
+      : {
+          status: ToolCallResponseStatus.Success,
+          data: { type: 'text', text: '' },
+        }
+    for (const card of [...this.turnToolCards.values()]) {
+      if (
+        !card.toolCalls.some(
+          ({ response }) => response.status === ToolCallResponseStatus.Running,
+        )
+      ) {
+        continue
+      }
+      this.emitMessage({
+        ...card,
+        toolCalls: card.toolCalls.map((toolCall) =>
+          toolCall.response.status === ToolCallResponseStatus.Running
+            ? { ...toolCall, response: settled }
+            : toolCall,
+        ),
+      })
+    }
+  }
+
+  /**
+   * Once a file-change call completes, reads each file it reported a diff for
+   * and settles the diff against it (`resolveAcpWholeFileDiff`): the card is
+   * redrawn from whole-file texts with real line numbers, and those texts are
+   * recorded as the call's review snapshot. Done in the runtime because the
+   * mapping only sees protocol messages — never the disk, the session, or the
+   * snapshot store.
+   *
+   * Once per call. A file whose new text is past the review snapshot's size
+   * cap is not read — nothing downstream could keep it.
+   */
+  private settleAgainstDiskOnce(toolCallId: string): void {
+    const state = this.aggregator.getToolCall(toolCallId)
+    const sessionRef = this.activeSessionRef
+    if (
+      !state ||
+      !sessionRef ||
+      !isAcpDiskSettlementPending(state) ||
+      this.diskSettlements.has(toolCallId)
+    ) {
+      return
+    }
+    const task = this.settleAgainstDisk(state, sessionRef)
+      .catch((error: unknown) => {
+        console.warn('[YOLO] Failed to read ACP file change from disk', error)
+      })
+      .finally(() => this.diskSettlements.delete(toolCallId))
+    this.diskSettlements.set(toolCallId, task)
+  }
+
+  private async settleAgainstDisk(
+    state: AcpToolCallState,
+    sessionRef: CliSessionRef,
+  ): Promise<void> {
+    const boundary = { vaultBasePath: this.options.cwd, homeDir: '' }
+    const settled = await Promise.all(
+      state.diffs.map(async (diff) => {
+        if (diff.newText.length > MAX_SNAPSHOT_CONTENT_CHARS) return null
+        let absolutePath: string
+        try {
+          absolutePath = resolveNativePathWithin(boundary, diff.path)
+        } catch {
+          return null
+        }
+        return resolveAcpWholeFileDiff(
+          diff,
+          await readNativeCurrentText(absolutePath),
+        )
+      }),
+    )
+    // The session moved on while the files were read: its cards are gone.
+    if (this.activeSessionRef !== sessionRef) return
+    const wholeFileDiffs = settled.filter((diff) => diff !== null)
+    const messages = this.aggregator.settleToolCallAgainstDisk(
+      state.toolCallId,
+      wholeFileDiffs,
+      this.runtimeId,
+    )
+    // Nothing settled draws the card exactly as before: leave it untouched.
+    if (wholeFileDiffs.length === 0) return
+    for (const message of messages) this.emitMessage(message)
+    // Settled texts are whole files the disk bears out — what the review
+    // overlay needs. A diff with no known before-text has nothing to review
+    // against.
+    const app = this.options.app
+    if (!app) return
+    await Promise.all(
+      wholeFileDiffs.flatMap(({ path, oldText, newText }) =>
+        oldText === undefined
+          ? []
+          : [
+              recordCliEditReviewSnapshot({
+                app,
+                sessionRef,
+                roundId: acpToolMessageId(state.toolCallId),
+                path,
+                beforeContent: oldText,
+                afterContent: newText,
+              }),
+            ],
+      ),
+    )
+  }
+
+  /** Emits a transcript message, keeping `turnToolCards` in step with it. */
+  private emitMessage(message: ChatMessage): void {
+    if (message.role === 'tool') this.turnToolCards.set(message.id, message)
+    this.emit({ type: 'message_upsert', message })
   }
 
   async rewriteTurn(_input: CliRewriteTurnInput): Promise<void> {
@@ -330,13 +655,13 @@ export class AcpCliRuntime implements CliRuntime {
     if (!this.activeSessionRef) {
       throw new Error(`${this.runtimeId} runtime is not ready.`)
     }
-    const compactCommand = this.options.compactCommand
+    const compactCommand = this.options.profile?.compactCommand
     if (!compactCommand) {
       throw new Error(`${this.runtimeId} does not support compaction.`)
     }
     const host = await this.getHost()
     const sessionId = this.activeSessionRef.nativeSessionId
-    this.aggregator.beginTurn()
+    this.beginAggregatorTurn()
     await host.call((connection) =>
       connection.prompt({
         sessionId,
@@ -369,9 +694,11 @@ export class AcpCliRuntime implements CliRuntime {
     await host.call((connection) => connection.cancel({ sessionId }))
   }
 
-  async respondApproval(response: CliApprovalResponse): Promise<boolean> {
+  async respondApproval(
+    response: CliApprovalResponse,
+  ): Promise<ToolCallResponse | null> {
     const pending = this.pendingApprovals.get(response.requestId)
-    if (!pending) return false
+    if (!pending) return null
     this.pendingApprovals.delete(response.requestId)
     const optionId = resolveApprovalOptionId(pending.options, response.decision)
     pending.resolve(
@@ -379,11 +706,34 @@ export class AcpCliRuntime implements CliRuntime {
         ? { outcome: { outcome: 'selected', optionId } }
         : buildCancelledApprovalOutcome(),
     )
-    return true
+    // A declined request, or no matching option (the outcome then went out
+    // as cancelled), means the tool is not about to run.
+    const settled: ToolCallResponse =
+      optionId && response.decision !== 'reject'
+        ? { status: ToolCallResponseStatus.Running }
+        : { status: ToolCallResponseStatus.Rejected }
+    // The host publishes `settled` onto the card; mirror it here so the
+    // turn's end knows the card now stands at it (`settleRunningToolCards`).
+    const cardId = acpToolMessageId(response.requestId)
+    const card = this.turnToolCards.get(cardId)
+    if (card) {
+      this.turnToolCards.set(cardId, {
+        ...card,
+        toolCalls: card.toolCalls.map((toolCall) =>
+          toolCall.request.id === response.requestId
+            ? { ...toolCall, response: settled }
+            : toolCall,
+        ),
+      })
+    }
+    return settled
   }
 
-  async respondQuestion(_response: CliQuestionResponse): Promise<boolean> {
-    return false
+  /** ACP has no user-question request — nothing is ever pending to answer. */
+  async respondQuestion(
+    _response: CliQuestionResponse,
+  ): Promise<ToolCallResponse | null> {
+    return null
   }
 
   subscribe(listener: CliRuntimeEventListener): () => void {
@@ -423,6 +773,10 @@ export class AcpCliRuntime implements CliRuntime {
     this.unregisterSession?.()
     this.aggregator.reset()
     this.activeSessionRef = ref
+    if (this.skills.length > 0) {
+      this.skills = []
+      this.emit({ type: 'skills_changed' })
+    }
     this.unregisterSession = host.registerSession(ref.nativeSessionId, {
       onUpdate: (update) => {
         // Carries context pressure rather than transcript content, so it never
@@ -432,8 +786,27 @@ export class AcpCliRuntime implements CliRuntime {
           if (usage) this.emit({ type: 'context_usage', usage })
           return
         }
+        if (update.sessionUpdate === 'available_commands_update') {
+          const isSkill = this.options.profile?.isSkillCommand
+          if (!isSkill) return
+          this.skills = update.availableCommands
+            .filter((command) => isSkill(command))
+            .map((command) => ({
+              name: command.name,
+              description: command.description,
+              path: `${this.runtimeId}://skills/${encodeURIComponent(command.name)}`,
+            }))
+          this.emit({ type: 'skills_changed' })
+          return
+        }
         for (const message of this.aggregator.apply(update, this.runtimeId)) {
-          this.emit({ type: 'message_upsert', message })
+          this.emitMessage(message)
+        }
+        if (
+          update.sessionUpdate === 'tool_call' ||
+          update.sessionUpdate === 'tool_call_update'
+        ) {
+          this.settleAgainstDiskOnce(update.toolCallId)
         }
       },
       onRequestPermission: (request) => this.handleRequestPermission(request),
@@ -466,7 +839,7 @@ export class AcpCliRuntime implements CliRuntime {
       connection.newSession({ cwd: this.options.cwd, mcpServers: [] }),
     )
     await this.attachHost(host, false)
-    this.captureModelState(response)
+    this.captureSessionState(response)
     const ref: CliSessionRef = {
       runtimeId: this.runtimeId,
       nativeSessionId: response.sessionId,
@@ -488,24 +861,48 @@ export class AcpCliRuntime implements CliRuntime {
       connection.newSession({ cwd: this.options.cwd, mcpServers: [] }),
     )
     await this.attachHost(host, false)
-    this.captureModelState(response)
+    this.captureSessionState(response)
     this.bindSession(
       host,
       { runtimeId: this.runtimeId, nativeSessionId: response.sessionId },
       requestedRef,
     )
+    await this.applySessionMode()
   }
 
   private async handleRequestPermission(
     request: RequestPermissionRequest,
   ): Promise<RequestPermissionResponse> {
+    // YOLO is a standing authorization the user gave for this conversation,
+    // so answering on their behalf executes that decision rather than
+    // inventing one. The session mode above already stops most requests from
+    // being sent at all; this covers what an agent gates outside that policy
+    // (Hermes, for one, never routes command approvals through it).
+    //
+    // `approve_for_session` is the closest the protocol gets to the intent
+    // "for this conversation": ACP's option kinds are only `allow_once` and
+    // `allow_always`, so an agent offering both a session-scoped and a
+    // permanent choice reports them under the same kind, and the option ids
+    // that tell them apart are agent-defined free text. Picking the first
+    // such option is therefore the most that can be done to avoid leaving a
+    // permanent allow-list entry behind — it holds for Hermes, which lists
+    // "Allow for session" ahead of "Allow always", but is an ordering
+    // convention, not a guarantee the protocol makes.
+    if (this.permissionProfile?.yoloEnabled) {
+      const optionId = resolveApprovalOptionId(
+        request.options,
+        'approve_for_session',
+      )
+      if (optionId) return { outcome: { outcome: 'selected', optionId } }
+    }
     const [assistant, tool] = buildPendingApprovalMessages(
       request,
       this.runtimeId,
+      this.aggregator.getToolCall(request.toolCall.toolCallId),
+      this.options.cwd,
     )
-    this.emit({ type: 'message_upsert', message: assistant })
-    this.emit({ type: 'message_upsert', message: tool })
-    this.emit({ type: 'run_state', state: 'waiting_for_approval' })
+    this.emitMessage(assistant)
+    this.emitMessage(tool)
     return new Promise<RequestPermissionResponse>((resolve) => {
       this.pendingApprovals.set(request.toolCall.toolCallId, {
         options: request.options,

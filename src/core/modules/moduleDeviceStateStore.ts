@@ -1,3 +1,5 @@
+import { runSerialByKey } from '../../utils/async/serialQueue'
+
 import type { ModuleArtifactDescriptor } from './moduleArtifactVerifier'
 import { isOfficialModuleReleaseUrl } from './moduleReleaseUrl'
 import {
@@ -5,11 +7,8 @@ import {
   ModuleRuntimeStateStore,
   ModuleSettingsCorruptionError,
 } from './moduleSettingsStore'
-import {
-  MAX_MODULE_MANIFEST_BYTES,
-  assertModuleId,
-  isModuleHostApiRange,
-} from './moduleStore'
+import { MAX_MODULE_MANIFEST_BYTES, assertModuleId } from './moduleStore'
+import { isModuleHostApiRange } from './officialModuleCatalog'
 
 const SCHEMA_VERSION = 1
 const SEMVER =
@@ -55,7 +54,6 @@ export type ModuleDeviceStateTransaction = Readonly<{
 }>
 
 const EMPTY_STATES = Object.freeze([]) as readonly ModuleDeviceState[]
-const transactionQueues = new WeakMap<object, Map<string, Promise<void>>>()
 
 export class ModuleDeviceStateCorruptionError extends Error {
   constructor(moduleId: string, error: unknown) {
@@ -183,23 +181,30 @@ export class ModuleDeviceStateStore {
     }
   }
 
-  async write(state: ModuleDeviceState): Promise<ModuleDeviceState> {
-    const snapshot = parseState(state)
-    return this.runExclusive(snapshot.moduleId, (transaction) =>
-      transaction.write(snapshot),
+  write(state: ModuleDeviceState): Promise<ModuleDeviceState> {
+    return this.runExclusive(state.moduleId, (transaction) =>
+      transaction.write(state),
     )
   }
 
+  /**
+   * Validates and canonicalizes once, on the way in.
+   *
+   * `ModuleRuntimeStateStore.write` reads the file back and compares it byte
+   * for byte against what it serialized, raising a conflict otherwise, so the
+   * envelope it returns is provably the snapshot built here — re-parsing it
+   * could only reproduce the same object.
+   */
   private async writeUnlocked(
     state: ModuleDeviceState,
     moduleId: string,
   ): Promise<ModuleDeviceState> {
     const snapshot = parseState(state, moduleId)
-    const envelope = await this.store.write(snapshot.moduleId, {
+    await this.store.write(snapshot.moduleId, {
       schemaVersion: SCHEMA_VERSION,
       data: snapshot,
     })
-    return parseState(envelope.data, snapshot.moduleId)
+    return snapshot
   }
 
   runExclusive<T>(
@@ -207,33 +212,16 @@ export class ModuleDeviceStateStore {
     operation: (transaction: ModuleDeviceStateTransaction) => Promise<T>,
   ): Promise<T> {
     assertModuleId(moduleId, 'Module id')
-    if (typeof operation !== 'function') {
-      throw new TypeError('Module device state operation must be a function')
-    }
-    let queues = transactionQueues.get(this.backend.adapter)
-    if (!queues) {
-      queues = new Map()
-      transactionQueues.set(this.backend.adapter, queues)
-    }
-    const key = `${this.rootIdentity}\u0000${moduleId}`
-    const previous = queues.get(key) ?? Promise.resolve()
     const transaction: ModuleDeviceStateTransaction = Object.freeze({
       read: () => this.readUnlocked(moduleId),
       write: (state) => this.writeUnlocked(state, moduleId),
       remove: () => this.removeUnlocked(moduleId),
     })
-    const result = previous
-      .catch(() => undefined)
-      .then(() => operation(transaction))
-    const tail = result.then(
-      () => undefined,
-      () => undefined,
+    return runSerialByKey(
+      this.backend.adapter,
+      `${this.rootIdentity}\u0000${moduleId}`,
+      () => operation(transaction),
     )
-    queues.set(key, tail)
-    void tail.then(() => {
-      if (queues?.get(key) === tail) queues.delete(key)
-    })
-    return result
   }
 
   remove(moduleId: string): Promise<void> {

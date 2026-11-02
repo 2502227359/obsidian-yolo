@@ -8,7 +8,10 @@ import nacl from 'tweetnacl'
 import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici'
 
 import { isValidRuntimeComponentAssetName } from './runtimeComponentAssetName.mjs'
-import { resolveRuntimeComponentAssetSource } from './runtimeComponentAssetSources.mjs'
+import {
+  RUNTIME_ASSET_TAG,
+  listRegistryRuntimeAssets,
+} from './runtimeComponentReleaseAssets.mjs'
 
 if (process.env.HTTP_PROXY || process.env.HTTPS_PROXY) {
   setGlobalDispatcher(new EnvHttpProxyAgent())
@@ -18,7 +21,7 @@ const REPOSITORY = 'Lapis0x0/obsidian-yolo'
 const FEED_PATH = path.resolve('distribution/feed-v1.json')
 const SIGNATURE_PATH = path.resolve('distribution/feed-v1.sig')
 const CATALOG_PATH = path.resolve('modules/catalog-v1.json')
-const DEFAULT_PAGES_DIR = path.resolve('.distribution-pages')
+const DEFAULT_MIRROR_DIR = path.resolve('.distribution-mirror')
 const DEFAULT_R2_BUCKET = 'yolo-updates'
 const R2_CONTENT_TYPES = new Map([
   ['.js', 'application/javascript'],
@@ -82,8 +85,16 @@ export async function reconcileDistribution(options = {}) {
   return { changed: true, feed }
 }
 
-export async function buildPagesSnapshot(options = {}) {
-  const outputDir = path.resolve(options.outputDir ?? DEFAULT_PAGES_DIR)
+/**
+ * Builds the local tree that `uploadSnapshotToR2` pushes to the download
+ * mirror. The mirror is a Cloudflare R2 bucket served at
+ * `updates.yoloapp.dev`, content-addressed by `mirrorPath` and latest-only:
+ * it carries just what the current Feed revision references. The
+ * authoritative copy of every artifact is the append-only `runtime-assets`
+ * Release, which clients fall back to.
+ */
+export async function buildMirrorSnapshot(options = {}) {
+  const outputDir = path.resolve(options.outputDir ?? DEFAULT_MIRROR_DIR)
   const token =
     options.token ?? process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN
   const fetchImpl = options.fetchImpl ?? fetch
@@ -138,24 +149,10 @@ export async function buildPagesSnapshot(options = {}) {
   for (const artifact of runtimeComponents) {
     await writeMirroredAsset(artifact, artifact.bytes, outputDir)
   }
-  const headers = [
-    '/feed-v1.json',
-    '  Cache-Control: public, max-age=0, must-revalidate',
-    '/feed-v1.sig',
-    '  Cache-Control: public, max-age=0, must-revalidate',
-    '/core/*',
-    '  Cache-Control: public, max-age=31536000, immutable',
-    '/modules/*',
-    '  Cache-Control: public, max-age=31536000, immutable',
-    '/runtime-components/*',
-    '  Cache-Control: public, max-age=31536000, immutable',
-    '',
-  ].join('\n')
-  await writeFile(path.join(outputDir, '_headers'), headers)
   return { outputDir, revision: feed.revision }
 }
 
-export async function verifyPagesDeployment(options = {}) {
+export async function verifyMirrorDeployment(options = {}) {
   const baseUrl = (options.baseUrl ?? 'https://updates.yoloapp.dev').replace(
     /\/$/,
     '',
@@ -169,17 +166,19 @@ export async function verifyPagesDeployment(options = {}) {
     cache: 'no-store',
   })
   if (!feedResponse.ok)
-    throw new Error(`Pages Feed returned HTTP ${feedResponse.status}`)
+    throw new Error(`Mirror Feed returned HTTP ${feedResponse.status}`)
   const actualFeed = Buffer.from(await feedResponse.arrayBuffer())
   if (!actualFeed.equals(expectedFeed))
-    throw new Error('Pages Feed bytes differ')
+    throw new Error('Mirror Feed bytes differ')
   const signatureResponse = await fetchImpl(`${baseUrl}/feed-v1.sig`, {
     cache: 'no-store',
   })
   if (!signatureResponse.ok)
-    throw new Error(`Pages signature returned HTTP ${signatureResponse.status}`)
+    throw new Error(
+      `Mirror signature returned HTTP ${signatureResponse.status}`,
+    )
   if ((await signatureResponse.text()).trim() !== expectedSignature) {
-    throw new Error('Pages signature differs')
+    throw new Error('Mirror signature differs')
   }
   const feed = JSON.parse(expectedFeed.toString('utf8'))
   const assets = [...Object.values(feed.core.assets)]
@@ -233,20 +232,17 @@ export async function verifyPagesDeployment(options = {}) {
 }
 
 /**
- * Pushes a snapshot built by `buildPagesSnapshot` to the R2 bucket backing
+ * Pushes a snapshot built by `buildMirrorSnapshot` to the R2 bucket backing
  * `updates.yoloapp.dev`. R2 has no bulk-sync command, so each file is PUT
- * individually with the same Cache-Control semantics the old Pages `_headers`
- * file declared (immutable content is versioned by path; the Feed itself is
- * revalidated on every request). The `_headers` file is Pages-only and is not
- * uploaded.
+ * individually with per-object Cache-Control (immutable content is versioned
+ * by path; the Feed itself is revalidated on every request).
  */
 export async function uploadSnapshotToR2(options = {}) {
   const bucket = options.bucket ?? DEFAULT_R2_BUCKET
-  const sourceDir = path.resolve(options.sourceDir ?? DEFAULT_PAGES_DIR)
+  const sourceDir = path.resolve(options.sourceDir ?? DEFAULT_MIRROR_DIR)
   const run = options.run ?? runWrangler
   const files = await listFilesRecursive(sourceDir)
   for (const relativePath of files) {
-    if (relativePath === '_headers') continue
     const cacheControl =
       relativePath === 'feed-v1.json' || relativePath === 'feed-v1.sig'
         ? 'public, max-age=0, must-revalidate'
@@ -265,7 +261,7 @@ export async function uploadSnapshotToR2(options = {}) {
       '--remote',
     ])
   }
-  return { bucket, uploaded: files.filter((file) => file !== '_headers') }
+  return { bucket, uploaded: files }
 }
 
 function runWrangler(args) {
@@ -567,9 +563,11 @@ export async function describeRuntimeComponentArtifacts(options) {
   if (!CORE_TAG.test(version)) {
     throw new Error('Runtime component Core version is invalid')
   }
-  const tagRoot = `https://raw.githubusercontent.com/${repository}/${version}/runtime-components`
+  // `registry.json` stays committed — it is the contract that declares each
+  // artifact's byteSize/sha256 — so the tag tells us exactly what this Core
+  // version shipped with.
   const registryBytes = await downloadUrl(
-    `${tagRoot}/registry.json`,
+    `https://raw.githubusercontent.com/${repository}/${version}/runtime-components/registry.json`,
     token,
     fetchImpl,
   )
@@ -581,43 +579,24 @@ export async function describeRuntimeComponentArtifacts(options) {
   }
   const components = validateRuntimeComponentRegistry(registry)
   const artifacts = []
-  for (const descriptor of components) {
-    const canonicalUrl = `https://raw.githubusercontent.com/${repository}/${version}/${descriptor.entry}`
+  // The bytes themselves come from the permanent `runtime-assets` Release,
+  // never from this checkout: reconcile runs on main, which may be many
+  // component rebuilds ahead of the Core version being mirrored, so local
+  // `dist/` is simply the wrong bytes. Content addressing makes the Release
+  // correct for any version, current or historical.
+  for (const entry of listRegistryRuntimeAssets({ components })) {
+    const canonicalUrl = `https://github.com/${repository}/releases/download/${RUNTIME_ASSET_TAG}/${encodeURIComponent(entry.releaseName)}`
     const bytes = await downloadUrl(canonicalUrl, token, fetchImpl)
     const artifact = {
-      name: 'entry.js',
-      mirrorPath: `runtime-components/${version}/${descriptor.id}/entry.js`,
+      name: entry.name,
+      mirrorPath: `runtime-components/sha256/${entry.sha256}/${entry.name}`,
       canonicalUrl,
-      byteSize: descriptor.byteSize,
-      sha256: descriptor.sha256,
+      byteSize: entry.byteSize,
+      sha256: entry.sha256,
       bytes,
     }
     verifyBytes(bytes, artifact)
     artifacts.push(artifact)
-    for (const asset of descriptor.assets) {
-      // Unlike entry.js, assets are gitignored build outputs (see
-      // .gitignore) — never committed, so nothing exists at
-      // `{version}/{asset.path}` on any Git ref to download. Read the same
-      // local bytes `npm run runtime:build` would produce instead (CI has
-      // already run `npm ci`, so `node_modules` is present), and verify
-      // them against the registry's declared byteSize/sha256 before
-      // trusting them — a corrupt or mismatched local install must fail
-      // loudly here rather than silently publishing bad bytes.
-      const assetSourcePath = path.resolve(
-        resolveRuntimeComponentAssetSource(descriptor.id, asset.name),
-      )
-      const assetBytes = await readFile(assetSourcePath)
-      const assetArtifact = {
-        name: asset.name,
-        mirrorPath: `runtime-components/${version}/${descriptor.id}/assets/${asset.name}`,
-        canonicalUrl: `https://github.com/${repository}/releases/download/${encodeURIComponent(version)}/${encodeURIComponent(`${descriptor.id}-${asset.name}`)}`,
-        byteSize: asset.byteSize,
-        sha256: asset.sha256,
-        bytes: assetBytes,
-      }
-      verifyBytes(assetBytes, assetArtifact)
-      artifacts.push(assetArtifact)
-    }
   }
   return artifacts
 }
@@ -922,20 +901,20 @@ async function main(args) {
     console.log(`Verified that ${tag} advances its product`)
     return
   }
-  if (command === 'build-pages') {
-    const result = await buildPagesSnapshot({
+  if (command === 'build-mirror') {
+    const result = await buildMirrorSnapshot({
       outputDir: values.get('output-dir'),
     })
     console.log(
-      `Built Pages revision ${result.revision} at ${result.outputDir}`,
+      `Built mirror revision ${result.revision} at ${result.outputDir}`,
     )
     return
   }
-  if (command === 'verify-pages') {
-    const result = await verifyPagesDeployment({
+  if (command === 'verify-mirror') {
+    const result = await verifyMirrorDeployment({
       baseUrl: values.get('base-url'),
     })
-    console.log(`Verified Pages revision ${result.revision}`)
+    console.log(`Verified mirror revision ${result.revision}`)
     return
   }
   if (command === 'upload-r2') {
@@ -949,7 +928,7 @@ async function main(args) {
     return
   }
   throw new Error(
-    'Usage: distribution.mjs <assert-new-release|reconcile|build-pages|verify-pages|upload-r2> [options]',
+    'Usage: distribution.mjs <assert-new-release|reconcile|build-mirror|verify-mirror|upload-r2> [options]',
   )
 }
 

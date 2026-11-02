@@ -1,4 +1,5 @@
 import { Ban, Check, ChevronRight, CircleAlert, Loader2 } from 'lucide-react'
+import type { ReactNode } from 'react'
 import {
   Fragment,
   memo,
@@ -14,10 +15,14 @@ import { useApp } from '../../contexts/app-context'
 import { useLanguage } from '../../contexts/language-context'
 import { useSettings } from '../../contexts/settings-context'
 import type { AgentConversationRunSummary } from '../../core/agent/service'
+import { resolveToolSetLabel } from '../../core/agent/tool-catalog'
 import { isCliToolCallCapability } from '../../core/cli-runtime/tool-call'
 import { InvalidToolNameException } from '../../core/mcp/exception'
+import { getLocalFileToolServerName } from '../../core/mcp/localFileTools'
 import { parseToolName } from '../../core/mcp/tool-name-utils'
-import { readEditReviewSnapshots } from '../../database/json/chat/editReviewSnapshotStore'
+import { getToolDefinition } from '../../core/tools/registry'
+import type { ToolSummaryAction } from '../../core/tools/types'
+import { readEditReviewSnapshots } from '../../database/edit-review/editReviewSnapshotStore'
 import {
   AssistantToolMessageGroup,
   ChatAssistantMessage,
@@ -204,7 +209,7 @@ type AssistantMessageRenderPlan = {
   hasToolResponseForThis: boolean
   hidden: boolean
   visible: boolean
-  rendersOnlyReasoning: boolean
+  rendersOnlyRunAffordances: boolean
 }
 
 // Single source of truth for "does this assistant message render anything",
@@ -262,19 +267,21 @@ const getAssistantMessageRenderPlan = ({
         shouldShowAssistantToolPreview,
     )
 
-  // Renders nothing but a thinking block — foldable into a tool-run summary
-  // alongside the tool cards it interleaves with.
-  const rendersOnlyReasoning =
+  // Renders nothing but the run's own affordances: a thinking block, the
+  // in-flight tool-call preview, or the empty shell a turn opens with before
+  // the provider has sent anything. None of that is narrative — it all
+  // describes the tool run this message sits inside — so it folds into that
+  // run's summary line instead of ending the run. Only narrative output
+  // (an answer, annotations, a provider-side search, an error card) ends it.
+  const rendersOnlyRunAffordances =
     visible &&
-    hasVisibleReasoning &&
-    !message.content &&
-    !message.annotations &&
+    !hasVisibleContent &&
+    !hasVisibleAnnotations &&
     !hostedWebSearchMessage &&
     !(
       message.metadata?.generationState === 'error' &&
       Boolean(message.metadata?.errorMessage)
-    ) &&
-    !shouldShowAssistantToolPreview
+    )
 
   return {
     hostedWebSearchMessage,
@@ -282,7 +289,7 @@ const getAssistantMessageRenderPlan = ({
     hasToolResponseForThis,
     hidden,
     visible,
-    rendersOnlyReasoning,
+    rendersOnlyRunAffordances,
   }
 }
 
@@ -300,25 +307,18 @@ const TOOL_RUN_SUMMARY_BUCKET_ORDER = [
 
 type ToolRunSummaryBucket = (typeof TOOL_RUN_SUMMARY_BUCKET_ORDER)[number]
 
-const TOOL_RUN_SUMMARY_BUCKET_BY_TOOL: Record<string, ToolRunSummaryBucket> = {
-  fs_read: 'read',
-  fs_list: 'search',
-  fs_search: 'search',
-  web_search: 'web',
-  web_scrape: 'web',
-  fs_write: 'edit',
-  fs_edit: 'edit',
-  fs_move: 'edit',
-  fs_delete: 'edit',
-  fs_create_dir: 'edit',
-  // Legacy tool names — keep summarizing historical conversations.
-  fs_create_file: 'edit',
-  fs_delete_file: 'edit',
-  fs_delete_dir: 'edit',
-  bash: 'virtualTerminal',
-  terminal_command: 'terminal',
-  js_eval: 'analysis',
-}
+/**
+ * Every bucket except `command` and `other` is a {@link ToolSummaryAction} a
+ * built-in tool declares on itself; those two exist only here, for the CLI
+ * table below and for calls nothing recognizes.
+ *
+ * `agentInternal` tools (todo list, context compaction, delegation, asking the
+ * user) fold into `other` on purpose — see that value's doc comment in
+ * `core/tools/types.ts`.
+ */
+const toolSummaryActionBucket = (
+  action: ToolSummaryAction,
+): ToolRunSummaryBucket => (action === 'agentInternal' ? 'other' : action)
 
 const CLI_TOOL_RUN_SUMMARY_BUCKET_BY_NAME: Record<
   string,
@@ -346,34 +346,67 @@ const CLI_TOOL_RUN_SUMMARY_BUCKET_BY_NAME: Record<
 
 type ToolCallRequestLike = ChatToolMessage['toolCalls'][number]['request']
 
-const getToolRunSummaryBucket = (
+/**
+ * How one call is counted in a collapsed run summary.
+ *
+ * Host built-ins get a verb, because their set is closed and we define the
+ * semantics. MCP and module tools get no verb — `read_wiki_structure` looks
+ * like a read and `search_my_robots` looks like a search, but that is guessing
+ * from a name, and a wrong guess reads worse than no guess. What they do have
+ * is the tool set they belong to, which is both honest and the identity the
+ * model itself sees in `<tool_catalog>`.
+ */
+type ToolRunSummaryKey =
+  | { kind: 'builtin'; bucket: ToolRunSummaryBucket }
+  | { kind: 'toolSet'; setId: string; toolName: string }
+
+const getToolRunSummaryKey = (
   request: ToolCallRequestLike,
-): ToolRunSummaryBucket => {
+): ToolRunSummaryKey => {
   const cliToolCall = request.metadata?.cliToolCall
   if (cliToolCall) {
     if (isCliToolCallCapability(request, 'file_change')) {
-      return 'edit'
+      return { kind: 'builtin', bucket: 'edit' }
     }
     if (isCliToolCallCapability(request, 'command_execution')) {
-      return 'command'
+      return { kind: 'builtin', bucket: 'command' }
     }
     const cliBucket =
       CLI_TOOL_RUN_SUMMARY_BUCKET_BY_NAME[cliToolCall.name.toLowerCase()]
-    if (cliBucket) {
-      return cliBucket
-    }
-    return 'other'
+    return { kind: 'builtin', bucket: cliBucket ?? 'other' }
   }
 
-  let toolName = request.name
+  let parsed: { serverName: string; toolName: string } | null = null
   try {
-    toolName = parseToolName(request.name).toolName
+    parsed = parseToolName(request.name)
   } catch (error) {
     if (!(error instanceof InvalidToolNameException)) {
       throw error
     }
   }
-  return TOOL_RUN_SUMMARY_BUCKET_BY_TOOL[toolName] ?? 'other'
+  if (!parsed) {
+    return { kind: 'builtin', bucket: 'other' }
+  }
+
+  // Scoped to the host server: an MCP tool that happens to be called `fs_read`
+  // is not a host file read. Retired built-in names (`fs_create_file` and the
+  // like) no longer resolve to a definition and fall to `other` — a historical
+  // conversation loses one verb, which is not worth a name table.
+  if (parsed.serverName === getLocalFileToolServerName()) {
+    const definition = getToolDefinition(parsed.toolName)
+    return {
+      kind: 'builtin',
+      bucket: definition
+        ? toolSummaryActionBucket(definition.summaryAction)
+        : 'other',
+    }
+  }
+
+  return {
+    kind: 'toolSet',
+    setId: parsed.serverName,
+    toolName: parsed.toolName,
+  }
 }
 
 const TOOL_RUN_SUMMARY_LABELS: Record<
@@ -409,6 +442,35 @@ const TOOL_RUN_SUMMARY_LABELS: Record<
   },
 }
 
+const TOOL_SET_SUMMARY_LABEL = {
+  key: 'chat.toolRunSummary.toolSet',
+  fallback: '{name} {count} time(s)',
+}
+
+/**
+ * A single call names the tool instead of counting to one: "deepwiki 1 time"
+ * says nothing the reader could act on, and the point of the collapsed line is
+ * to be readable without expanding. Mirrors what the built-in buckets already
+ * do for a lone file edit.
+ */
+const TOOL_SET_SUMMARY_SINGLE_LABEL = {
+  key: 'chat.toolRunSummary.toolSetSingle',
+  fallback: '{name} · {tool}',
+}
+
+/**
+ * Non-builtin calls in a run, tallied per tool set. Kept separate from
+ * `bucketCounts` because tool sets are an open set — they cannot live in that
+ * record's fixed key space.
+ */
+type ToolSetTally = {
+  setId: string
+  label: string
+  count: number
+  /** Set only when `count` is 1, for the named-tool form. */
+  soleToolName: string | null
+}
+
 type ToolRunSegment = {
   key: string
   startIndex: number
@@ -420,6 +482,8 @@ type ToolRunSegment = {
    */
   boundaryIndex: number | null
   bucketCounts: Partial<Record<ToolRunSummaryBucket, number>>
+  /** Per-tool-set tallies, already sorted and labelled for display. */
+  toolSetTallies: ToolSetTally[]
   /**
    * 本段里已成功完成的文件编辑聚合（复用 footer 用的同一套按路径去重 + 净差异
    * 逻辑）。为 null 表示本段没有任何编辑调用已经成功返回——可能是纯只读段，
@@ -427,7 +491,18 @@ type ToolRunSegment = {
    */
   editSummary: GroupEditSummary | null
   requiresUserAction: boolean
+  /**
+   * 本段此刻还有事情没做完：有请求还没建出工具消息、有调用还没落定，或者成员
+   * 助手消息仍在流式生成。折叠行不会因此多出或少掉任何一个字——它只用来给整
+   * 行文字挂上光流动画，所以这个状态的开关是零布局代价的。
+   */
+  isActive: boolean
 }
+
+const isSettledToolCallStatus = (status: ToolCallResponseStatus): boolean =>
+  status !== ToolCallResponseStatus.Running &&
+  status !== ToolCallResponseStatus.PendingApproval &&
+  status !== ToolCallResponseStatus.AwaitingUserInput
 
 const getFileBaseName = (path: string): string => {
   const segments = path.split('/')
@@ -462,44 +537,122 @@ const EDIT_FILE_SUMMARY_LABELS: Record<
 const buildToolRunSummaryDisplay = (
   segment: ToolRunSegment,
   t: (keyPath: string, fallback?: string) => string,
-): { clauses: string[]; separator: string; stats: [number, number] | null } => {
+): {
+  clauses: { key: string; node: ReactNode }[]
+  separator: string
+  stats: [number, number] | null
+} => {
   const { editSummary } = segment
-  const clauses: string[] = []
+  const clauses: { key: string; node: ReactNode }[] = []
+
+  // 按 {count} 拆模板而不是直接插值：数字必须单独成节点，才能在它变化时靠换
+  // key 重挂来重播入场动画。拆而不是插值的理由和下面 {tool} 那处一样——数字
+  // 在句子里的位置由各语言的模板决定，这里不能假设它在末尾。
+  const renderCountLabel = (
+    template: string,
+    count: number,
+    replacements: Record<string, string> = {},
+  ): ReactNode => {
+    const fill = (text: string) =>
+      Object.entries(replacements).reduce(
+        (filled, [token, value]) => filled.replace(`{${token}}`, value),
+        text,
+      )
+    const [before, after = ''] = template.split('{count}')
+    return (
+      <>
+        {fill(before)}
+        <span key={count} className="yolo-tool-run-summary__count">
+          {count}
+        </span>
+        {fill(after)}
+      </>
+    )
+  }
 
   if (editSummary && editSummary.totalFiles === 1) {
     const file = editSummary.files[0]
     const label = EDIT_FILE_SUMMARY_LABELS[file.operation]
-    clauses.push(
-      t(label.key, label.fallback).replace(
+    clauses.push({
+      key: 'edit-file',
+      node: t(label.key, label.fallback).replace(
         '{name}',
         getFileBaseName(file.path),
       ),
-    )
+    })
   } else if (editSummary && editSummary.totalFiles >= 2) {
     const label = TOOL_RUN_SUMMARY_LABELS.edit
-    clauses.push(
-      t(label.key, label.fallback).replace(
-        '{count}',
-        String(editSummary.totalFiles),
+    clauses.push({
+      key: 'edit',
+      node: renderCountLabel(
+        t(label.key, label.fallback),
+        editSummary.totalFiles,
       ),
-    )
+    })
   }
 
-  TOOL_RUN_SUMMARY_BUCKET_ORDER.forEach((bucket) => {
-    if (bucket === 'edit' && editSummary) {
-      return
-    }
+  const pushBucketClause = (bucket: ToolRunSummaryBucket) => {
     const count = segment.bucketCounts[bucket]
     if (!count) {
       return
     }
     const label = TOOL_RUN_SUMMARY_LABELS[bucket]
-    clauses.push(t(label.key, label.fallback).replace('{count}', String(count)))
+    clauses.push({
+      key: bucket,
+      node: renderCountLabel(t(label.key, label.fallback), count),
+    })
+  }
+
+  // `other` is appended after the tool sets rather than in bucket order: it is
+  // the residue of everything we could not name, so it belongs at the tail.
+  TOOL_RUN_SUMMARY_BUCKET_ORDER.forEach((bucket) => {
+    if (bucket === 'other' || (bucket === 'edit' && editSummary)) {
+      return
+    }
+    pushBucketClause(bucket)
   })
+
+  for (const tally of segment.toolSetTallies) {
+    if (!tally.soleToolName) {
+      clauses.push({
+        key: `set:${tally.setId}`,
+        node: renderCountLabel(
+          t(TOOL_SET_SUMMARY_LABEL.key, TOOL_SET_SUMMARY_LABEL.fallback),
+          tally.count,
+          { name: tally.label },
+        ),
+      })
+      continue
+    }
+    // The tool name sits a layer below the set name, so it gets its own span.
+    // Split the template on `{tool}` rather than interpolating and slicing the
+    // result: a locale is free to put the tool first, and only the template
+    // knows the order.
+    const [before, after] = t(
+      TOOL_SET_SUMMARY_SINGLE_LABEL.key,
+      TOOL_SET_SUMMARY_SINGLE_LABEL.fallback,
+    ).split('{tool}')
+    clauses.push({
+      key: `set:${tally.setId}`,
+      node: (
+        <>
+          {before.replace('{name}', tally.label)}
+          <span className="yolo-tool-run-summary__tool">
+            {tally.soleToolName}
+          </span>
+          {(after ?? '').replace('{name}', tally.label)}
+        </>
+      ),
+    })
+  }
+
+  pushBucketClause('other')
 
   return {
     clauses,
     separator: editSummary ? ', ' : ' · ',
+    // 折叠状态下成员一律不渲染，所以还没回来的那次调用只能由这行说出来。它是
+    // 纯追加的行尾标记：出现和消失都不碰前面任何一个字，也不改变它们的位置。
     stats:
       editSummary && editSummary.totalLineStatsAvailable
         ? [editSummary.totalAddedLines, editSummary.totalRemovedLines]
@@ -578,7 +731,6 @@ export type AssistantToolMessageGroupItemProps = {
   onOpenEditSummaryFile: (file: GroupEditSummary['files'][number]) => void
   onUndoEditSummary?: (summary: GroupEditSummary) => void
   undoingEditSummaryTarget?: string | null
-  pendingCompactionAnchorMessageId?: string | null
   hidePendingAssistantPlaceholders?: boolean
   showRunningToolFooter?: boolean
 }
@@ -624,13 +776,13 @@ function AssistantToolMessageGroupItem({
   onOpenEditSummaryFile,
   onUndoEditSummary,
   undoingEditSummaryTarget,
-  pendingCompactionAnchorMessageId,
   hidePendingAssistantPlaceholders = false,
   showRunningToolFooter = true,
 }: AssistantToolMessageGroupItemProps) {
   const app = useApp()
   const { t } = useLanguage()
   const { settings } = useSettings()
+  const discoveredCatalogs = settings.mcp.discoveredCatalogs ?? {}
   const containerRef = useRef<HTMLDivElement | null>(null)
   const pendingScrollRestoreRef = useRef<{
     scrollContainer: HTMLElement
@@ -749,6 +901,20 @@ function AssistantToolMessageGroupItem({
         messages)
     return selectedMessages
   }, [branchGroups, hasMultipleBranches, messages, resolvedActiveBranchKey])
+  // The footer's usage may span several groups (a background-task bridge), but
+  // within this group it must count only the branch on display: each branch is
+  // its own conversation with its own context.
+  const footerUsageMessages = useMemo(() => {
+    const source = inlineInfoMessages ?? displayedMessages
+    if (!hasMultipleBranches) {
+      return source
+    }
+    const displayedBranchId = displayedMessages[0]?.metadata?.branchId
+    return source.filter((message) => {
+      const branchId = message.metadata?.branchId
+      return !branchId || branchId === displayedBranchId
+    })
+  }, [displayedMessages, hasMultipleBranches, inlineInfoMessages])
   const effectiveConversationId = useMemo(() => {
     if (!hasMultipleBranches) {
       return conversationId
@@ -807,16 +973,19 @@ function AssistantToolMessageGroupItem({
     [displayedMessages, hidePendingAssistantPlaceholders],
   )
 
-  // A run of two or more tool calls — plus any thinking-only assistant
-  // messages interleaved with them — gets a stable summary as soon as it is
-  // observed. Details stay collapsed by default; only a run requiring user
-  // action expands automatically so approval and answer controls remain
-  // immediately available.
+  // A run of two or more tool calls — plus the assistant messages that only
+  // narrate it (thinking blocks, the in-flight tool preview, the empty shell a
+  // turn opens with) — gets a stable summary as soon as it is observed.
+  // Details stay collapsed by default; only a run requiring user action
+  // expands automatically so approval and answer controls remain immediately
+  // available.
   const toolRunSegments = useMemo(() => {
     const segments: ToolRunSegment[] = []
     let firstMemberIndex = -1
     let lastMemberIndex = -1
     let toolMessages: ChatToolMessage[] = []
+    let pendingRequestCount = 0
+    let hasStreamingMember = false
 
     const addMember = (index: number) => {
       if (firstMemberIndex === -1) {
@@ -828,18 +997,45 @@ function AssistantToolMessageGroupItem({
     const close = (boundaryIndex: number | null) => {
       if (toolMessages.length > 0) {
         const toolCalls = toolMessages.flatMap((message) => message.toolCalls)
-        if (toolCalls.length >= 2) {
+        // A request the model has emitted but whose tool message does not exist
+        // yet counts toward the threshold. Without it the summary line would
+        // only materialize one beat later, when that tool message lands, and
+        // everything below it would shift by a row in the meantime.
+        if (toolCalls.length + pendingRequestCount >= 2) {
           const bucketCounts: ToolRunSegment['bucketCounts'] = {}
+          const bySet = new Map<
+            string,
+            { count: number; toolNames: string[] }
+          >()
           for (const call of toolCalls) {
-            const bucket = getToolRunSummaryBucket(call.request)
-            bucketCounts[bucket] = (bucketCounts[bucket] ?? 0) + 1
+            const key = getToolRunSummaryKey(call.request)
+            if (key.kind === 'builtin') {
+              bucketCounts[key.bucket] = (bucketCounts[key.bucket] ?? 0) + 1
+              continue
+            }
+            const tally = bySet.get(key.setId) ?? { count: 0, toolNames: [] }
+            tally.count += 1
+            tally.toolNames.push(key.toolName)
+            bySet.set(key.setId, tally)
           }
+          const toolSetTallies = [...bySet.entries()]
+            .map(([setId, tally]) => ({
+              setId,
+              label: resolveToolSetLabel(
+                setId,
+                discoveredCatalogs[setId]?.serverInfo,
+              ),
+              count: tally.count,
+              soleToolName: tally.count === 1 ? tally.toolNames[0] : null,
+            }))
+            .sort((a, b) => a.label.localeCompare(b.label))
           segments.push({
             key: toolMessages[0].id,
             startIndex: firstMemberIndex,
             endIndex: lastMemberIndex,
             boundaryIndex,
             bucketCounts,
+            toolSetTallies,
             editSummary: collectGroupEditSummary(toolMessages),
             requiresUserAction: toolCalls.some(
               (call) =>
@@ -848,12 +1044,20 @@ function AssistantToolMessageGroupItem({
                 call.response.status ===
                   ToolCallResponseStatus.AwaitingUserInput,
             ),
+            isActive:
+              pendingRequestCount > 0 ||
+              hasStreamingMember ||
+              toolCalls.some(
+                (call) => !isSettledToolCallStatus(call.response.status),
+              ),
           })
         }
       }
       firstMemberIndex = -1
       lastMemberIndex = -1
       toolMessages = []
+      pendingRequestCount = 0
+      hasStreamingMember = false
     }
 
     displayedMessages.forEach((message, index) => {
@@ -864,8 +1068,16 @@ function AssistantToolMessageGroupItem({
       }
       const plan =
         message.role === 'assistant' ? messageRenderPlans[index] : null
-      if (plan?.rendersOnlyReasoning) {
+      if (message.role === 'assistant' && plan?.rendersOnlyRunAffordances) {
         addMember(index)
+        if (plan.shouldShowAssistantToolPreview) {
+          // Only an unanswered request belongs here. A thinking-only message
+          // whose requests already have a tool message would double-count.
+          pendingRequestCount += message.toolCallRequests?.length ?? 0
+        }
+        if (message.metadata?.generationState === 'streaming') {
+          hasStreamingMember = true
+        }
         return
       }
       const rendersNothing =
@@ -880,7 +1092,7 @@ function AssistantToolMessageGroupItem({
     close(null)
 
     return segments
-  }, [displayedMessages, messageRenderPlans])
+  }, [displayedMessages, messageRenderPlans, discoveredCatalogs])
 
   const toolRunSegmentByIndex = useMemo(() => {
     const byIndex = new Map<number, ToolRunSegment>()
@@ -1017,7 +1229,6 @@ function AssistantToolMessageGroupItem({
           { roundId: file.firstRoundId, filePath: file.path },
           { roundId: file.latestRoundId, filePath: file.path },
         ]),
-        settings,
       })
 
       if (cancelled) {
@@ -1028,7 +1239,15 @@ function AssistantToolMessageGroupItem({
         const firstSnapshot = snapshots[index * 2]
         const latestSnapshot = snapshots[index * 2 + 1]
 
-        if (!firstSnapshot || !latestSnapshot) {
+        // 内容超上限的快照只记了行数，没留正文（见
+        // `MAX_SNAPSHOT_CONTENT_CHARS`）——拿空串去 diff 会算出一个自信的错
+        // 数字，不如沿用逐次统计。
+        if (
+          !firstSnapshot ||
+          !latestSnapshot ||
+          !firstSnapshot.contentAvailable ||
+          !latestSnapshot.contentAvailable
+        ) {
           return null
         }
 
@@ -1059,7 +1278,7 @@ function AssistantToolMessageGroupItem({
     // baseGroupEditSummary changes every streaming frame and MUST NOT be a
     // dep — it would retrigger this effect at ~60Hz and re-parse the full
     // snapshot JSON on every frame.
-  }, [snapshotFetchKey, app, conversationId, settings])
+  }, [snapshotFetchKey, app, conversationId])
 
   const groupEditSummary = useMemo<GroupEditSummary | null>(() => {
     if (!baseGroupEditSummary) {
@@ -1330,9 +1549,6 @@ function AssistantToolMessageGroupItem({
                   <ToolMessage
                     message={message}
                     conversationId={effectiveConversationId}
-                    isCompactionPending={
-                      message.id === pendingCompactionAnchorMessageId
-                    }
                     showRunningFooter={showRunningToolFooter}
                     terminalCommandResultsByToolCallId={
                       terminalCommandResultsByToolCallId
@@ -1363,12 +1579,17 @@ function AssistantToolMessageGroupItem({
                   type="button"
                   className={`yolo-tool-run-summary${
                     isSegmentExpanded ? ' is-expanded' : ''
-                  }`}
+                  }${toolRunSegment.isActive ? ' is-active' : ''}`}
                   aria-expanded={isSegmentExpanded}
                   onClick={() => toggleToolRunSegment(toolRunSegment.key)}
                 >
                   <span className="yolo-tool-run-summary__text">
-                    {summaryDisplay.clauses.join(summaryDisplay.separator)}
+                    {summaryDisplay.clauses.map((clause, clauseIndex) => (
+                      <Fragment key={clause.key}>
+                        {clauseIndex > 0 ? summaryDisplay.separator : null}
+                        {clause.node}
+                      </Fragment>
+                    ))}
                   </span>
                   {summaryDisplay.stats && (
                     <span className="yolo-tool-run-summary__stats">
@@ -1420,9 +1641,7 @@ function AssistantToolMessageGroupItem({
         !suppressFooter && (
           <div className="yolo-assistant-message-footer">
             {showInlineInfo && (
-              <LLMResponseInlineInfo
-                messages={inlineInfoMessages ?? displayedMessages}
-              />
+              <LLMResponseInlineInfo messages={footerUsageMessages} />
             )}
             <AssistantToolMessageGroupActions
               messages={displayedMessages}

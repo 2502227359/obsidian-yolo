@@ -1,3 +1,15 @@
+/**
+ * The programmatic entry point for running the agent: one call in, an event
+ * stream out, for callers with no conversation to own and no UI to wire up —
+ * host features under `src/features/`, and every module call arriving through
+ * `host.agent.stream`.
+ *
+ * `AgentSessionService` (service.ts) sits below it and owns the *session*:
+ * state, persistence, approval routed to a chat surface. Chat views use it
+ * directly because they have a conversation; nobody else should hand-assemble
+ * its run input — come through `stream()`/`run()` here and state the trust
+ * tier as `capability` instead.
+ */
 import type {
   SerializedEditorState,
   SerializedElementNode,
@@ -6,8 +18,6 @@ import type {
 import type { App } from 'obsidian'
 import { v4 as uuidv4 } from 'uuid'
 
-import { resolveWorkspaceScopeForRuntimeInput } from '../../components/chat-view/chat-runtime-inputs'
-import { resolveChatModeRuntime } from '../../components/chat-view/chat-runtime-profiles'
 import type { YoloSettings } from '../../settings/schema/setting.types'
 import type { AssistantWorkspaceScope } from '../../types/assistant.types'
 import type {
@@ -22,16 +32,26 @@ import { getChatModelClient } from '../llm/manager'
 import type { InProcessToolServer } from '../mcp/inProcessToolServer'
 import type { McpManager } from '../mcp/mcpManager'
 import { getToolName } from '../mcp/tool-name-utils'
+import type {
+  ModuleToolSetRegistry,
+  RegisteredModuleToolSetV1,
+} from '../modules/moduleToolSetRegistry'
+import { toModuleToolSetEnablement } from '../modules/moduleToolSetRegistry'
 import { listLiteSkillEntries } from '../skills/liteSkills'
 import { isSkillEnabledForAssistant } from '../skills/skillPolicy'
 
 import { resolveAgentApiContext } from './agent-api-context'
+import { resolveAgentCapabilityProfile } from './capability-profile'
+import type { YoloAgentCapability } from './capability-profile'
+import { resolveWorkspaceScopeForRuntimeInput } from './chat-runtime-inputs'
+import { resolveChatModeRuntime } from './chat-runtime-profiles'
+import { resolveAutoContextCompactionInput } from './compaction'
 import { DEFAULT_ASSISTANT_ID } from './default-assistant'
 import type {
   AgentConversationState,
   AgentRunActivity,
   AgentRunStatus,
-  AgentService,
+  AgentSessionService,
 } from './service'
 import { getEnabledAssistantToolNames } from './tool-preferences'
 import type { AgentRuntimeLoopConfig, AgentRuntimeRunInput } from './types'
@@ -63,6 +83,17 @@ export type YoloAgentRunRequest = {
   /** Auto-approve tool calls (YOLO). Only effective in Agent mode. */
   yolo?: boolean
   context?: YoloAgentContext[]
+  /**
+   * Trust tier shorthand for callers that have no chat surface to resolve a
+   * chat mode from: expands to this run's host tool grant and its
+   * `bashReadOnly` setting through `resolveAgentCapabilityProfile`, so a
+   * caller can ask for "a read-only agent" without hand-assembling a tool
+   * name list.
+   *
+   * `tools.allowedToolNames` and `bashReadOnly` still win when given
+   * explicitly — the tier only fills in what the caller left unsaid.
+   */
+  capability?: YoloAgentCapability
   tools?: {
     allowedToolNames?: string[]
     /**
@@ -89,8 +120,8 @@ export type YoloAgentRunRequest = {
   workspaceScope?: AssistantWorkspaceScope
   /**
    * 强制本次 run 的 bash 工具调用使用结构性只读变体：mkdir/mv/rm/rmdir 一律
-   * command not found，且不受审批档位影响。供仅授予只读能力的调用方使用
-   * （见 `src/core/modules/moduleAgent.ts` 的 `vault-read` module agent 能力）。
+   * command not found，且不受审批档位影响。通常不必显式传：`capability:
+   * 'vault-read'` 已经会把它设成 true。
    */
   bashReadOnly?: boolean
   systemPromptOverride?: string
@@ -158,17 +189,24 @@ type AgentApiRunInput = {
   activity?: AgentRunActivity
 }
 
-export type YoloAgentApiServiceOptions = {
+export type AgentRunApiOptions = {
   app: App
   getSettings: () => YoloSettings
-  getAgentService: () => AgentService
+  getAgentService: () => AgentSessionService
   getMcpManager: () => Promise<McpManager>
+  /**
+   * Optional so pre-existing test fixtures that construct this service
+   * without a plugin instance keep compiling — a caller that omits it simply
+   * gets no module tool sets in `assistantEnabledToolNames`, matching the
+   * behavior before module tool sets existed. The real host (`main.ts`) always provides it.
+   */
+  getModuleToolSetRegistry?: () => ModuleToolSetRegistry
 }
 
-export class YoloAgentApiService implements YoloAgentApi {
+export class AgentRunApi implements YoloAgentApi {
   private readonly abortControllers = new Map<string, AbortController>()
 
-  constructor(private readonly options: YoloAgentApiServiceOptions) {}
+  constructor(private readonly options: AgentRunApiOptions) {}
 
   async run(request: YoloAgentRunRequest): Promise<YoloAgentRunResult> {
     let conversationId = ''
@@ -232,6 +270,7 @@ export class YoloAgentApiService implements YoloAgentApi {
         settings: this.options.getSettings(),
         agentService: this.options.getAgentService(),
         mcpManager,
+        moduleToolSets: this.options.getModuleToolSetRegistry?.().getSnapshot(),
       })
 
       for await (const event of streamResolvedAgentRunEvents({
@@ -281,7 +320,7 @@ export async function* streamResolvedAgentRunEvents({
   loopConfig: AgentRuntimeLoopConfig
   input: AgentRuntimeRunInput
   activity?: AgentRunActivity
-  agentService: AgentService
+  agentService: AgentSessionService
 }): AsyncIterable<YoloAgentEvent> {
   const queue = new AsyncEventQueue<YoloAgentEvent>()
   let previous = createEmptySnapshotTracker()
@@ -411,14 +450,23 @@ export async function resolveAgentApiRunInput({
   settings,
   agentService,
   mcpManager,
+  moduleToolSets,
 }: {
   request: YoloAgentRunRequest
   conversationId: string
   abortSignal: AbortSignal
   app: App
   settings: YoloSettings
-  agentService: AgentService
+  agentService: AgentSessionService
   mcpManager: McpManager
+  /**
+   * Registry snapshot of module-contributed tool sets (whiteboard, etc.).
+   * Optional so
+   * the many test call sites that don't exercise module tool sets don't need
+   * to pass one; a caller that omits it just resolves with none available,
+   * same as before this parameter existed.
+   */
+  moduleToolSets?: readonly RegisteredModuleToolSetV1[]
 }): Promise<AgentApiRunInput> {
   const assistantId =
     request.assistantId ?? settings.currentAssistantId ?? DEFAULT_ASSISTANT_ID
@@ -434,7 +482,10 @@ export async function resolveAgentApiRunInput({
   const provider = settings.providers.find(
     (candidate) => candidate.id === resolvedClient.model.providerId,
   )
-  const assistantEnabledToolNames = getEnabledAssistantToolNames(assistant)
+  const assistantEnabledToolNames = getEnabledAssistantToolNames(
+    assistant,
+    toModuleToolSetEnablement(moduleToolSets ?? []),
+  )
   const requestedMode = request.mode ?? 'ask'
   const mode = requestedMode === 'agent-full' ? 'agent' : requestedMode
   const chatModeRuntime = resolveChatModeRuntime({
@@ -444,10 +495,17 @@ export async function resolveAgentApiRunInput({
     assistant,
     assistantEnabledToolNames,
   })
+  const capabilityProfile =
+    request.capability !== undefined
+      ? resolveAgentCapabilityProfile(request.capability)
+      : undefined
   const allowedToolNames = mergeInProcessServerToolNames(
     narrowAllowedToolNames(
       chatModeRuntime.allowedToolNames,
-      request.tools?.allowedToolNames,
+      request.tools?.allowedToolNames ??
+        (capabilityProfile
+          ? [...capabilityProfile.allowedHostToolNames]
+          : undefined),
     ),
     request.tools?.inProcessServer,
   )
@@ -469,6 +527,8 @@ export async function resolveAgentApiRunInput({
         agentService.getPromptSourceWatcher().getRevision(),
       promptSourcePathsCallback: (paths) =>
         agentService.getPromptSourceWatcher().setWatchedPaths(paths),
+      resolveModuleFileTextRenderer: (extension) =>
+        mcpManager.resolveModuleFileTextRenderer(extension),
     },
   )
   const resolvedContext = await resolveAgentApiContext({
@@ -531,12 +591,11 @@ export async function resolveAgentApiRunInput({
       abortSignal,
       allowedToolNames,
       systemPromptOverride: request.systemPromptOverride,
-      enableToolDisclosure: settings.mcp.enableToolDisclosure,
       toolPreferences: chatModeRuntime.toolPreferences,
       builtinCapabilityPreferences:
         chatModeRuntime.builtinCapabilityPreferences,
       toolServerPreferences: chatModeRuntime.toolServerPreferences,
-      toolCapabilityMode: chatModeRuntime.toolCapabilityMode,
+      runtimeMode: chatModeRuntime.runtimeMode,
       bypassToolApproval: chatModeRuntime.bypassToolApproval,
       modePersonaPrompt: chatModeRuntime.modePersonaPrompt,
       modePersonaModuleId: chatModeRuntime.modePersonaModuleId,
@@ -544,8 +603,12 @@ export async function resolveAgentApiRunInput({
       workspaceScope:
         request.workspaceScope ??
         resolveWorkspaceScopeForRuntimeInput(assistant),
-      bashReadOnly: request.bashReadOnly,
+      bashReadOnly: request.bashReadOnly ?? capabilityProfile?.bashReadOnly,
       allowedSkillPaths,
+      autoContextCompaction: resolveAutoContextCompactionInput({
+        settings,
+        model: resolvedClient.model,
+      }),
       requestParams: {
         deliveryMode: 'incremental',
         primaryRequestTimeoutMs:

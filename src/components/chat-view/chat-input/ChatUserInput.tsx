@@ -19,6 +19,14 @@ import {
 import { useApp } from '../../../contexts/app-context'
 import { useLanguage } from '../../../contexts/language-context'
 import { useSettings } from '../../../contexts/settings-context'
+import type {
+  ChatModeSelectValue,
+  ToolChatMode,
+} from '../../../core/agent/chat-mode'
+import {
+  availableBuiltinChatModes,
+  isModuleChatMode,
+} from '../../../core/agent/chat-mode'
 import type { CliContextUsageCategory } from '../../../core/cli-runtime/types'
 import { getYoloSnippetsPath } from '../../../core/paths/yoloPaths'
 import type { LiteSkillEntry } from '../../../core/skills/liteSkills'
@@ -47,17 +55,15 @@ import {
   resolveChatInputEditorSeed,
 } from './chatInputDraft'
 import {
-  CHAT_MODES,
   ChatModeSelect,
-  type ChatModeSelectValue,
   type ModuleChatModeOption,
-  isModuleChatMode,
+  type YoloByMode,
   narrowToMentionChatMode,
 } from './ChatModeSelect'
 import { ChatQuickAccess } from './ChatQuickAccess'
 import ChatSkillBadge from './ChatSkillBadge'
 import { FileUploadButton } from './FileUploadButton'
-import MentionableBadge from './MentionableBadge'
+import MentionableBadge, { selectBadgeMentionables } from './MentionableBadge'
 import MessageInputCore, { type MessageInputCoreRef } from './MessageInputCore'
 import { ModelSelect } from './ModelSelect'
 import { canAcceptDrop } from './plugins/drop/resolveDrop'
@@ -75,6 +81,9 @@ export type ChatUserInputRef = {
 }
 
 export type ChatUserInputControlLayout = 'composer-toolbar' | 'inline'
+
+/** Stable default so the mode selector's props identity survives re-renders. */
+const EMPTY_YOLO_BY_MODE: YoloByMode = {}
 
 export type ChatUserInputProps = {
   initialSerializedEditorState: SerializedEditorState | null
@@ -116,8 +125,9 @@ export type ChatUserInputProps = {
   onChatModeChange?: (mode: ChatModeSelectValue) => void
   chatModeOptions?: readonly ChatModeSelectValue[]
   moduleModeOptions?: readonly ModuleChatModeOption[]
-  yoloEnabled?: boolean
-  onYoloChange?: (enabled: boolean) => void
+  yoloByMode?: YoloByMode
+  onYoloChange?: (mode: ToolChatMode, enabled: boolean) => void
+  showYoloToggle?: boolean
   controlLayout?: ChatUserInputControlLayout
   onControlPopoverOpenChange?: (isOpen: boolean) => void
   allowAgentModeOption?: boolean
@@ -149,6 +159,7 @@ export type ChatUserInputProps = {
   quickAccessSkillEntries?: LiteSkillEntry[]
   quickAccessSnippetEntries?: SnippetEntry[]
   skipImageModelCapabilityCheck?: boolean
+  allowImageAttachments?: boolean
 }
 
 const DEFAULT_INPUT_HEIGHT = 80
@@ -190,10 +201,11 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
       onSelectChatModeForConversation,
       chatMode,
       onChatModeChange,
-      chatModeOptions = CHAT_MODES,
+      chatModeOptions = availableBuiltinChatModes(),
       moduleModeOptions,
-      yoloEnabled = false,
+      yoloByMode = EMPTY_YOLO_BY_MODE,
       onYoloChange,
+      showYoloToggle = true,
       controlLayout = 'composer-toolbar',
       onControlPopoverOpenChange,
       allowAgentModeOption = true,
@@ -210,6 +222,7 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
       quickAccessSkillEntries,
       quickAccessSnippetEntries,
       skipImageModelCapabilityCheck = false,
+      allowImageAttachments = true,
     },
     ref,
   ) => {
@@ -266,6 +279,10 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
     const effectiveMentionables = useMemo(
       () => displayMentionables ?? mentionables,
       [displayMentionables, mentionables],
+    )
+    const badgeMentionables = useMemo(
+      () => selectBadgeMentionables(effectiveMentionables, mentionDisplayMode),
+      [effectiveMentionables, mentionDisplayMode],
     )
     const effectiveSelectedSkills = useMemo(
       () => (enableSkills ? selectedSkills : []),
@@ -669,8 +686,9 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
           onChange={onChatModeChange}
           availableModes={chatModeOptions}
           moduleModeOptions={moduleModeOptions}
-          yoloEnabled={yoloEnabled}
+          yoloByMode={yoloByMode}
           onYoloChange={onYoloChange ?? (() => {})}
+          showYoloToggle={showYoloToggle}
           side="top"
           sideOffset={8}
         />
@@ -775,27 +793,23 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
               ))}
             </div>
           )}
-        {!hideBadgeMentionables &&
-          mentionDisplayMode === 'badge' &&
-          effectiveMentionables.length > 0 && (
-            <div className="yolo-chat-user-input-files">
-              {effectiveMentionables.map((mentionable) => {
-                const mentionableKey = getMentionableKey(
-                  serializeMentionable(mentionable),
-                )
-                return (
-                  <MentionableBadge
-                    key={mentionableKey}
-                    mentionable={mentionable}
-                    onDelete={() =>
-                      handleDeleteMentionableFromBadge(mentionable)
-                    }
-                    onClick={() => {}}
-                  />
-                )
-              })}
-            </div>
-          )}
+        {!hideBadgeMentionables && badgeMentionables.length > 0 && (
+          <div className="yolo-chat-user-input-files">
+            {badgeMentionables.map((mentionable) => {
+              const mentionableKey = getMentionableKey(
+                serializeMentionable(mentionable),
+              )
+              return (
+                <MentionableBadge
+                  key={mentionableKey}
+                  mentionable={mentionable}
+                  onDelete={() => handleDeleteMentionableFromBadge(mentionable)}
+                  onClick={() => {}}
+                />
+              )
+            })}
+          </div>
+        )}
         <div
           className="yolo-chat-user-input-container"
           ref={containerRef}
@@ -887,6 +901,7 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
               displayMentionablesForDelete={effectiveMentionables}
               enableSkills={enableSkills}
               enableAttachments
+              allowImageAttachments={allowImageAttachments}
               skipImageModelCapabilityCheck={skipImageModelCapabilityCheck}
               selectedSkills={effectiveSelectedSkills}
               setSelectedSkills={enableSkills ? setSelectedSkills : undefined}
@@ -920,6 +935,7 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
             <div className="yolo-chat-user-input-controls">
               <div className="yolo-chat-user-input-controls__left">
                 <FileUploadButton
+                  allowImages={allowImageAttachments}
                   onUpload={(files) => coreRef.current?.uploadFiles(files)}
                 />
                 {runtimeControls ?? (
@@ -939,6 +955,7 @@ const ChatUserInput = forwardRef<ChatUserInputRef, ChatUserInputProps>(
           {!compact && controlLayout === 'composer-toolbar' && (
             <div className="yolo-chat-user-input-send-row">
               <FileUploadButton
+                allowImages={allowImageAttachments}
                 onUpload={(files) => coreRef.current?.uploadFiles(files)}
               />
               <div className="yolo-chat-user-input-send-row__right">

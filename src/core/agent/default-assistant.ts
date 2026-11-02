@@ -23,13 +23,10 @@ export const createDefaultAssistant = (): Assistant => ({
   systemPrompt: DEFAULT_ASSISTANT_SYSTEM_PROMPT,
   // Omit modelId so new Default agents follow the global chat model.
   persona: 'balanced',
-  enableTools: true,
-  includeBuiltinTools: true,
   enabledToolNames: [],
   toolPreferences: {},
   builtinCapabilityPreferences: buildDefaultBuiltinCapabilityPreferences(),
   toolServerPreferences: {},
-  enabledSkills: [],
   skillPreferences: {},
   includeCurrentFileContent: true,
   timeContextEnabled: true,
@@ -48,8 +45,6 @@ const hasDefaultAssistantChanged = (
     current.systemPrompt !== normalized.systemPrompt ||
     current.modelId !== normalized.modelId ||
     current.persona !== normalized.persona ||
-    current.enableTools !== normalized.enableTools ||
-    current.includeBuiltinTools !== normalized.includeBuiltinTools ||
     JSON.stringify(current.enabledToolNames ?? []) !==
       JSON.stringify(normalized.enabledToolNames ?? []) ||
     JSON.stringify(current.toolPreferences ?? {}) !==
@@ -58,8 +53,6 @@ const hasDefaultAssistantChanged = (
       JSON.stringify(normalized.builtinCapabilityPreferences ?? {}) ||
     JSON.stringify(current.toolServerPreferences ?? {}) !==
       JSON.stringify(normalized.toolServerPreferences ?? {}) ||
-    JSON.stringify(current.enabledSkills ?? []) !==
-      JSON.stringify(normalized.enabledSkills ?? []) ||
     JSON.stringify(current.skillPreferences ?? {}) !==
       JSON.stringify(normalized.skillPreferences ?? {}) ||
     (current.includeCurrentFileContent ?? true) !==
@@ -82,8 +75,6 @@ const normalizeDefaultAssistant = (assistant: Assistant): Assistant => {
         : DEFAULT_ASSISTANT_SYSTEM_PROMPT,
     // Keep empty/undefined modelId as "follow global default"; never rewrite it.
     modelId: assistant.modelId || undefined,
-    enableTools: assistant.enableTools ?? true,
-    includeBuiltinTools: assistant.includeBuiltinTools ?? true,
     enabledToolNames: assistant.enabledToolNames ?? [],
     toolPreferences:
       Object.keys(toolPreferences).length > 0
@@ -93,7 +84,6 @@ const normalizeDefaultAssistant = (assistant: Assistant): Assistant => {
           ),
     builtinCapabilityPreferences: assistant.builtinCapabilityPreferences ?? {},
     toolServerPreferences: assistant.toolServerPreferences ?? {},
-    enabledSkills: assistant.enabledSkills ?? [],
     skillPreferences: assistant.skillPreferences ?? {},
     includeCurrentFileContent: assistant.includeCurrentFileContent ?? true,
     timeContextEnabled: assistant.timeContextEnabled ?? true,
@@ -122,10 +112,14 @@ export const ensureDefaultAssistantInSettings = (
     ? normalizeDefaultAssistant(existingDefault)
     : createDefaultAssistant()
 
-  const nextAssistants: Assistant[] = [
-    normalizedDefault,
-    ...assistants.filter((assistant) => !isDefaultAssistantId(assistant.id)),
-  ]
+  // The default agent keeps the position the user sorted it to; a missing
+  // one is added at the front.
+  const nextAssistants: Assistant[] = existingDefault
+    ? assistants.flatMap((assistant) => {
+        if (!isDefaultAssistantId(assistant.id)) return [assistant]
+        return assistant === existingDefault ? [normalizedDefault] : []
+      })
+    : [normalizedDefault, ...assistants]
 
   return {
     ...settings,

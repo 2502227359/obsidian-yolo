@@ -74,13 +74,15 @@ export const en: TranslationKeys = {
       menuLabel: 'CLI provider',
       claudeCodeLabel: 'Claude Code',
       claudeCodeShortLabel: 'CC',
-      claudeCodeDescription: 'Claude Code on this device',
       codexLabel: 'Codex',
-      codexDescription: 'Codex on this device',
       hermesLabel: 'Hermes',
-      hermesDescription: 'Hermes on this device',
       piLabel: 'Pi',
-      piDescription: 'Pi on this device',
+      ompLabel: 'omp',
+      variantToggleHint:
+        'Switch between {base} and {variant} — changing channel starts a new session',
+      grokLabel: 'Grok',
+      codebuddyLabel: 'CodeBuddy',
+      codebuddyShortLabel: 'CB',
     },
     chatList: {
       searchPlaceholder: 'Search conversations',
@@ -121,9 +123,6 @@ export const en: TranslationKeys = {
         'Configure continuation parameters and context before generating.',
       backToChat: 'Back to chat',
       modelSectionTitle: 'Model',
-      continuationModel: 'Continuation model',
-      continuationModelDesc:
-        'When super continuation is enabled, this view uses this model for continuation tasks.',
       contextSectionTitle: 'Context sources',
       ragToggle: 'Enable retrieval with embeddings',
       ragToggleDesc:
@@ -194,7 +193,9 @@ export const en: TranslationKeys = {
     },
     supportYolo: {
       name: 'Support the project',
-      desc: 'If you find this plugin valuable, consider supporting its development!',
+      desc: 'If you find this plugin valuable, consider supporting its development.',
+      feedbackHint: 'Hit a problem or have an idea? {bug} or {feature}',
+      star: 'Star YOLO',
       afdian: 'Afdian (CN)',
       buyMeACoffee: 'Buy Me a Coffee',
       reportBug: 'Report Bug',
@@ -217,6 +218,8 @@ export const en: TranslationKeys = {
       globalSystemPrompt: 'Global system prompt',
       globalSystemPromptDesc:
         'This prompt is added to the beginning of every chat conversation.',
+      globalSystemPromptPlaceholder:
+        "Write ![[Note]] to embed that note's full text",
       continuationSystemPrompt: 'Default continuation system prompt',
       continuationSystemPromptDesc:
         'Used as the system message when generating continuation text; leave empty to fall back to the built-in default.',
@@ -280,6 +283,9 @@ export const en: TranslationKeys = {
         ready: 'Ready on this device',
         failed: 'Failed',
       },
+      updateCore: 'Update YOLO Core',
+      needsCore: 'Update YOLO Core to install this module',
+      nextVersionNeedsCore: 'Version {version} needs a newer YOLO Core',
       incompatibleReason: 'Incompatible: {reason}',
       compatibility: {
         platform: 'platform',
@@ -346,6 +352,13 @@ export const en: TranslationKeys = {
           impact:
             'Turning this off disables local embedding models; RAG falls back to a remote embedding provider.',
         },
+        claudeAgentSdk: {
+          name: 'Claude Agent SDK',
+          description:
+            'Connects YOLO to your local Claude Code for the Claude Code agent and the Claude Code login provider.',
+          impact:
+            'Turning this off disables the Claude Code agent and models that use the Claude Code login.',
+        },
         statuses: {
           missing: 'Waiting to install',
           downloading: 'Downloading',
@@ -381,8 +394,6 @@ export const en: TranslationKeys = {
       actionCategoryDesc: 'Category this action belongs to',
       actionIcon: 'Icon',
       actionIconDesc: 'Choose an icon',
-      actionEnabled: 'Enabled',
-      actionEnabledDesc: 'Whether to show this action in smart space',
       moveUp: 'Move up',
       moveDown: 'Move down',
       duplicate: 'Duplicate',
@@ -441,6 +452,10 @@ export const en: TranslationKeys = {
         'Rewrite instruction (required for preset prompt).',
       actionInstructionRewritePlaceholder:
         'For example: make it concise and keep Markdown structure.',
+      actionAssistant: 'Assistant',
+      actionAssistantDesc:
+        'Assistant used when running this action; leave it empty to follow the current selection.',
+      actionAssistantFollowCurrent: 'Follow current selection',
       duplicate: 'Duplicate',
       copySuffix: ' (copy)',
       dragHandleAria: 'Drag to reorder',
@@ -455,32 +470,8 @@ export const en: TranslationKeys = {
         'Adjust the overall scale of the chat interface (default 100%).',
     },
     assistants: {
-      title: 'Assistants',
-      desc: 'Create and manage custom AI assistants',
-      configureAssistants: 'Configure assistants',
-      assistantsCount: 'Configured {count} assistants',
-      addAssistant: 'Add assistant',
       editAssistant: 'Edit assistant',
-      deleteAssistant: 'Delete assistant',
-      name: 'Name',
-      description: 'Description',
-      systemPrompt: 'System prompt',
-      systemPromptDesc:
-        'This prompt will be added to the beginning of every chat.',
-      systemPromptPlaceholder:
-        "Enter system prompt to define assistant's behavior and capabilities",
-      namePlaceholder: 'Enter assistant name',
-      defaultAssistantName: 'New assistant',
-      deleteConfirmTitle: 'Confirm delete assistant',
-      deleteConfirmMessagePrefix: 'Are you sure you want to delete assistant',
-      deleteConfirmMessageSuffix: ' This action cannot be undone.',
-      addAssistantAria: 'Add new assistant',
-      deleteAssistantAria: 'Delete assistant',
-      actions: 'Actions',
-      noAssistants: 'No assistants available',
       noAssistant: 'Default',
-      selectAssistant: 'Select assistant',
-      duplicate: 'Duplicate',
       manageAll: 'Manage all…',
     },
     agent: {
@@ -498,10 +489,6 @@ export const en: TranslationKeys = {
       skillsCountWithEnabled: '{count} skills (enabled {enabled})',
       skillsGlobalDesc:
         'Skills are discovered from built-in skills, {path}/*.md files, and {path}/<folder>/SKILL.md packages. Disable a skill here to block it for all agents.',
-      yoloBaseDir: 'YOLO base folder',
-      yoloBaseDirDesc:
-        'Enter a vault-relative path (without a leading /). Example: use YOLO at vault root, or setting/YOLO under the setting folder.',
-      yoloBaseDirPlaceholder: 'YOLO',
       yoloBaseDirHiddenPath:
         'YOLO root cannot use hidden folders. Remove the dot at the beginning of the folder name, for example change .yolo to yolo.',
       yoloBaseDirMigrated:
@@ -517,8 +504,6 @@ export const en: TranslationKeys = {
       yoloBaseDirConflictTitle: 'YOLO root was not moved',
       yoloBaseDirConflictMessage:
         '{target} already exists and contains files. Nothing was moved to avoid overwriting or merging data. Choose an empty or nonexistent folder.',
-      skillsSourcePath:
-        'Source: built-in skills + {path}/*.md + {path}/<folder>/SKILL.md',
       refreshSkills: 'Refresh',
       skillsEmptyHint:
         'No skills found. Create a Markdown file or a folder containing SKILL.md under {path}.',
@@ -601,15 +586,16 @@ export const en: TranslationKeys = {
       toolsEnabledCount: '{count} enabled',
       manageTools: 'Manage tools',
       manageSkills: 'Manage skills',
-      enableToolDisclosure: 'Enable on-demand tool loading (Beta)',
-      enableToolDisclosureDesc:
-        "Optional tools start as short descriptions, then load full details when needed. Recommended when you have many MCP tools enabled. Note: this mechanism relies on the model's own tool-use capability — some models may not reliably recognize tools loaded this way.",
       expandDescription: 'Expand',
       collapseDescription: 'Collapse',
       viewAllTools: 'View all tools',
       viewAllSkills: 'View all skills',
       enableAllTools: 'Enable all',
       disableAllTools: 'Disable all',
+      searchTools: 'Search tools…',
+      searchSkills: 'Search skills…',
+      noMatchingTools: 'No matching tools',
+      noMatchingSkills: 'No matching skills',
       descriptionColumn: 'Description',
       builtinFsReadLabel: 'Read',
       builtinFsReadDesc:
@@ -626,6 +612,9 @@ export const en: TranslationKeys = {
       builtinBashLabel: 'Virtual terminal',
       builtinBashDesc:
         'Search and inspect vault files, plus mkdir/mv/rm path operations',
+      builtinVaultSearchLabel: 'Vault Search',
+      builtinVaultSearchDesc:
+        'Search the vault by meaning, combining knowledge-base vector retrieval with keyword matching.',
       safetyControls: 'Safety Controls',
       safetyControlsDesc:
         'Configure extra review behavior before agents perform risky file operations.',
@@ -634,15 +623,6 @@ export const en: TranslationKeys = {
         'When enabled, agent fs_edit changes open inline/apply review before writing the file.',
       builtinFsEditOpsLabel: 'File Editing Toolset',
       builtinFsEditOpsDesc: 'Edit targeted text or write full file content',
-      builtinMemoryOpsLabel: 'Memory Toolset',
-      builtinMemoryOpsDesc: 'Add, update, and delete memory',
-      builtinMemoryAddLabel: 'Add Memory',
-      builtinMemoryAddDesc:
-        'Add one memory item into global or assistant memory and auto-assign an id.',
-      builtinMemoryUpdateLabel: 'Update Memory',
-      builtinMemoryUpdateDesc: 'Update an existing memory item by id.',
-      builtinMemoryDeleteLabel: 'Delete Memory',
-      builtinMemoryDeleteDesc: 'Delete an existing memory item by id.',
       builtinOpenSkillLabel: 'Open Skill',
       builtinOpenSkillDesc: 'Load a skill markdown',
       builtinWebSearchLabel: 'Web Search',
@@ -659,12 +639,18 @@ export const en: TranslationKeys = {
       builtinTerminalCommandLabel: 'Terminal Commands',
       builtinTerminalCommandDesc:
         'Run commands in the local terminal, desktop-only',
+      builtinNativeFilesLabel: 'Local Filesystem Toolset',
+      builtinNativeFilesDesc:
+        'Read, write, and edit files directly on the local filesystem, at any path and any extension. Desktop-only, and only available in Max mode.',
+      builtinReadFileLabel: 'Read Local File',
+      builtinWriteFileLabel: 'Write Local File',
+      builtinEditFileLabel: 'Edit Local File',
       builtinDelegateSubagentLabel: 'Delegate Subagent',
       builtinDelegateSubagentDesc:
         'Dispatch an isolated temporary subagent to complete a self-contained task asynchronously.',
       builtinTodoWriteLabel: 'Task List',
       builtinTodoWriteDesc:
-        'Let the agent plan and track multi-step task progress autonomously. Agent mode only.',
+        'Let the agent plan and track multi-step task progress autonomously. Agent and Max modes only.',
       builtinAskUserQuestionLabel: 'Ask User',
       builtinAskUserQuestionDesc:
         'Ask the user a question when required information is missing, then resume after the answer.',
@@ -681,7 +667,6 @@ export const en: TranslationKeys = {
         toolBypassNotice:
           'Agents with terminal commands or third-party MCP tools enabled can go around this range — it is not a security boundary.',
       },
-      editorTabModel: 'Model',
       editorName: 'Name',
       editorNameDesc: 'Agent display name',
       editorDescription: 'Description',
@@ -691,53 +676,25 @@ export const en: TranslationKeys = {
       editorChooseIcon: 'Choose icon',
       editorSystemPrompt: 'System prompt',
       editorSystemPromptDesc: 'Primary behavior instruction for this agent.',
+      editorSystemPromptPlaceholder:
+        "Write ![[Note]] to embed that note's full text",
       editorSystemPromptExpand: 'Expand editor',
       editorSystemPromptCollapse: 'Close expanded editor',
       editorEnableProjectInstructions: 'Load project instruction files',
       editorEnableProjectInstructionsDesc:
         'Auto-load AGENTS.md and CLAUDE.md from the vault root for this agent. Compatible with Codex / Claude Code / Cursor and similar tools.',
-      editorEnableTools: 'Enable tools',
-      editorEnableToolsDesc: 'Allow this agent to call tools',
-      editorIncludeBuiltinTools: 'Include built-in tools',
-      editorIncludeBuiltinToolsDesc:
-        'Allow local vault file tools for this agent',
       toolApproval: 'Approval',
       toolApprovalFullAccess: 'Full access',
       toolApprovalRequire: 'Require approval',
       toolApprovalDangerousOnly: 'Approve dangerous operations',
-      toolDisclosureAuto: 'Auto',
-      toolDisclosureAutoSelect: 'Auto select',
       toolDisclosureAlways: 'In context',
-      toolDisclosureMixed: 'Mixed',
       toolDisclosureOnDemand: 'On demand',
-      editorEnabled: 'Enabled',
-      editorDisabled: 'Disabled',
       editorModel: 'Model',
       editorModelDesc: 'Select the model used by this agent',
       followDefaultModel: 'Follow default model',
-      editorModelCurrent: 'Current: {model}',
-      editorModelSampling: 'Sampling parameters',
-      editorModelResetDefaults: 'Restore defaults',
-      modelPresetFocused: 'Focused',
-      modelPresetBalanced: 'Balanced',
-      modelPresetCreative: 'Creative',
-      editorTemperature: 'Temperature',
-      editorTemperatureDesc: '0.0 - 2.0',
-      editorTopP: 'Top P',
-      editorTopPDesc: '0.0 - 1.0',
-      editorMaxOutputTokens: 'Max output tokens',
-      editorMaxOutputTokensDesc: 'Maximum generated tokens',
-      editorMaxContextMessages: 'Max context messages',
-      editorCustomParameters: 'Custom parameters',
-      editorCustomParametersDesc:
-        'Additional request fields for this agent. Same keys override model-level parameters',
-      editorCustomParametersAdd: 'Add parameter',
-      editorCustomParametersKeyPlaceholder: 'Key',
-      editorCustomParametersValuePlaceholder: 'Value',
       editorToolsCount: '{count} tools',
       editorEstimatedContextTokens: '~{count} tokens',
       editorSkillsCount: '{count} skills',
-      editorSkillsCountWithEnabled: '{count} skills (enabled {enabled})',
       skillLoadAlways: 'Full inject',
       skillLoadLazy: 'On demand',
       skillDisabledGlobally: 'Disabled globally',
@@ -774,26 +731,34 @@ export const en: TranslationKeys = {
       piCliPathName: 'Pi CLI path',
       piCliPathDesc:
         'Custom path to the pi executable — paste the output of "which pi" ("where pi" on Windows). Leave empty to auto-detect. Stored on this device only.',
+      ompCliPathName: 'omp CLI path',
+      ompCliPathDesc:
+        'Custom path to the omp executable — paste the output of "which omp" ("where omp" on Windows). Leave empty to auto-detect. Stored on this device only.',
+      grokCliPathName: 'Grok CLI path',
+      grokCliPathDesc:
+        'Custom path to the grok executable — paste the output of "which grok" ("where grok" on Windows). Leave empty to auto-detect. Stored on this device only.',
+      codebuddyCliPathName: 'CodeBuddy CLI path',
+      codebuddyCliPathDesc:
+        'Custom path to the codebuddy executable — paste the output of "which codebuddy" ("where codebuddy" on Windows). Leave empty to auto-detect. Stored on this device only.',
       cliPathMissing:
         'This path does not exist on this device; auto-detection will be used instead.',
       autoContextCompactionBlockTitle: 'Context compaction',
       autoContextCompaction: 'Automatic context compaction',
       autoContextCompactionDesc:
-        'When the context reaches the threshold, remind the Agent to run the context compaction command.',
-      autoContextCompactionThresholdMode: 'Compaction threshold mode',
-      autoContextCompactionModeTokens: 'Absolute prompt tokens',
-      autoContextCompactionModeRatio: 'Fraction of context window',
-      autoContextCompactionThresholdTokens: 'Prompt token threshold',
-      autoContextCompactionThresholdTokensDesc:
-        "Trigger when the last reply's reported prompt_tokens is at least this value.",
+        'Before a request that would reach the threshold, automatically compact earlier conversation. The Agent can still call the compaction tool on its own at any time.',
       autoContextCompactionThresholdRatioPercent: 'Context window usage (%)',
       autoContextCompactionThresholdRatioPercentDesc:
-        "Trigger when prompt_tokens divided by the chat model's max context window reaches this percentage. Requires max context tokens on the model.",
+        "Compact when the next request is estimated to fill this share of the model's context window. The window comes from the model's max context setting, or 200k when unset. To compact earlier, lower the percentage or the model's max context.",
       mcpServerBlockTitle: 'External agent access',
       mcpServerEnabled: 'Allow external agent access',
       mcpServerDesc:
         'Allow external agents to search the Vault through MCP and delegate tasks to configured YOLO agents.',
       mcpServerDesktopOnly: 'The MCP service is available on desktop only.',
+      mcpServerPort: 'Port',
+      mcpServerPortDesc:
+        'Local port the MCP service listens on. Change it if another app or plugin already uses this port, then update your client configuration.',
+      mcpServerPortInUse:
+        'Port {port} is already in use — often by another Obsidian plugin in this same process, such as Local REST API. Pick a different port above.',
       mcpServerClientConfig: 'MCP connection configuration',
       mcpServerCopyConfig: 'Copy',
       mcpServerError: 'Failed to start',
@@ -921,6 +886,7 @@ export const en: TranslationKeys = {
         zhipu: 'Zhipu Web Search',
         exa: 'Exa',
         anysearch: 'AnySearch',
+        deepseek: 'DeepSeek',
       },
       fieldName: 'Display name',
       fieldApiKey: 'API key',
@@ -1037,7 +1003,7 @@ export const en: TranslationKeys = {
       responseStreamingModeNonStreaming: 'Non-streaming',
       promptCaching: 'Prompt caching',
       promptCachingDesc:
-        'Enable Anthropic ephemeral prompt caching. Reuses system prompt, tools, and conversation history across turns to cut input tokens. Cache writes carry a 25% premium; reads cost ~10% of normal input. Available whenever the provider API type is Anthropic; upstream must actually honor the cache_control field.',
+        'Anthropic ephemeral prompt caching, on by default. Reuses system prompt, tools, and conversation history across turns to cut input tokens. Cache writes carry a 25% premium; reads cost ~10% of normal input. Turn it off only if your upstream endpoint rejects or mishandles the cache_control field.',
       customHeaders: 'Custom headers',
       customHeadersDesc:
         'Attach extra HTTP headers to all requests sent through this provider.',
@@ -1074,6 +1040,34 @@ export const en: TranslationKeys = {
       chatgptOAuthCodeCopied: 'Device code copied.',
       chatgptOAuthOpenDevicePage: 'Open authorization page',
       chatgptOAuthCancelDevice: 'Cancel',
+      copilotOAuthTitle: 'GitHub Copilot',
+      copilotOAuthLogin: 'Log in with GitHub',
+      copilotOAuthConnecting: 'Waiting for authorization...',
+      copilotOAuthDisconnect: 'Disconnect',
+      copilotOAuthLoadingStatus: 'Checking GitHub Copilot login...',
+      copilotOAuthConnected: 'Connected',
+      copilotOAuthDisconnectedHelp:
+        'Not connected. Log in with GitHub to use the models in your Copilot subscription.',
+      copilotOAuthReauthRequired:
+        'GitHub no longer accepts the saved login. Log in again.',
+      copilotOAuthNoSubscription:
+        'This GitHub account has no Copilot access, or an organization policy disables it.',
+      copilotOAuthStatusError: 'Could not check the Copilot login: {message}',
+      copilotOAuthDeviceOpened:
+        'Enter the displayed code on the GitHub page that just opened.',
+      copilotOAuthConnectedNotice: 'GitHub Copilot connected.',
+      copilotOAuthDisconnectedNotice: 'GitHub Copilot disconnected.',
+      copilotOAuthDisconnectFailed: 'Failed to disconnect GitHub Copilot.',
+      copilotOAuthDeviceExpired:
+        'The code expired before it was approved. Start the login again.',
+      copilotOAuthAccessDenied: 'Authorization was declined on GitHub.',
+      copilotOAuthPendingCode: 'Code',
+      copilotOAuthDeviceHelp:
+        'Enter this code at github.com/login/device before it expires. Continue only if you started this login.',
+      copilotOAuthCopyCode: 'Copy code',
+      copilotOAuthCodeCopied: 'Code copied.',
+      copilotOAuthOpenDevicePage: 'Open GitHub',
+      copilotOAuthCancel: 'Cancel',
       oauthDesktopOnly:
         'OAuth login is only available on desktop. Please connect on desktop first.',
       geminiOAuthTitle: 'Gemini OAuth',
@@ -1109,6 +1103,7 @@ export const en: TranslationKeys = {
       addCustomEmbeddingModel: 'Add custom embedding model',
       editChatModel: 'Edit chat model',
       editEmbeddingModel: 'Edit embedding model',
+      dragHandle: 'Drag to reorder',
       editCustomChatModel: 'Edit custom chat model',
       editCustomEmbeddingModel: 'Edit custom embedding model',
       modelId: 'Model ID',
@@ -1146,6 +1141,7 @@ export const en: TranslationKeys = {
       },
       availableModelsAuto: 'Available models (auto-fetched)',
       searchModels: 'Search models...',
+      addMode: 'Add mode',
       modeSingle: 'Single',
       modeBatch: 'Batch',
       batchSelectAll: 'Select all',
@@ -1226,6 +1222,8 @@ export const en: TranslationKeys = {
       requestParameters: 'Request parameters',
       requestParametersDesc:
         'Usually no adjustment is needed. Fields left disabled use the provider defaults.',
+      samplingNotSentForModel:
+        'This model does not accept Temperature or Top P, so they are not sent.',
       requestParametersEnabledCount: '{count} request parameters enabled',
       clearRequestParameterOverrides: 'Clear overrides',
       additionalParameters: 'Other parameters',
@@ -1365,6 +1363,10 @@ export const en: TranslationKeys = {
       chunks: 'Chunks',
       pendingFiles: '{{n}} file(s) changed',
       lastUpdated: 'Last updated {{time}}',
+      updatedJustNow: 'Updated just now',
+      updatedMinutesAgo: 'Updated {{n}} minute(s) ago',
+      updatedHoursAgo: 'Updated {{n}} hour(s) ago',
+      updatedDaysAgo: 'Updated {{n}} day(s) ago',
       enableAndIndex: 'Enable and index',
       disable: 'Disable indexing',
       rebuildThis: 'Rebuild this base',
@@ -1380,6 +1382,10 @@ export const en: TranslationKeys = {
       localEmbedding: {
         groupLabel: 'Local',
         groupDesc: 'Runs on your device — your notes never leave this machine.',
+        deviceAriaLabel: 'Local inference device',
+        deviceCpu: 'CPU',
+        deviceGpu: 'GPU',
+        deviceGpuUnsupported: 'GPU inference is not supported on this device',
         desktopOnly: 'Local embedding models are only available on desktop.',
         metaLine: '{{dimension}} dims · {{size}}',
         download: 'Download',
@@ -1439,6 +1445,10 @@ export const en: TranslationKeys = {
         'e.g. Daily meeting notes and current project docs',
       scopeTitle: 'Scope',
       scopeDesc: 'Decides which folders go into this knowledge base.',
+      scopeWholeVault: 'Entire vault',
+      scopeOnlyPrefix: 'Only',
+      scopeAndMore: ' and more ({{n}} in total)',
+      scopeExcludeSuffix: ', excluding {{n}} folder(s)',
       nameRequired: 'Enter a name for the knowledge base',
       nameDuplicate: 'A knowledge base with this name already exists',
       saveFailed: 'Failed to save the knowledge base',
@@ -1596,12 +1606,6 @@ export const en: TranslationKeys = {
       title: 'Sparkle',
       aiSubsectionTitle: 'Super continuation',
       tabSubsectionTitle: 'Tab completion',
-      superContinuation: 'Enable Sparkle view',
-      superContinuationDesc:
-        'Enable the Sparkle sidebar view where you can configure dedicated continuation models, parameters, rules, and reference sources; when disabled, only the chat view is available.',
-      continuationModel: 'Continuation model',
-      continuationModelDesc:
-        'Select the model used for continuation in Sparkle.',
       selectionChatSubsectionTitle: 'Cursor chat',
       selectionChatDescription:
         'Provides inline ask, rewrite, explain, and other quick actions around selected text.',
@@ -1644,9 +1648,6 @@ export const en: TranslationKeys = {
       tabCompletion: 'Enable tab completion',
       tabCompletionDesc:
         'Request a completion when a trigger rule matches, then show it as gray ghost text that can be accepted with the tab key.',
-      tabCompletionMultipleCandidates: 'Generate multiple candidates',
-      tabCompletionMultipleCandidatesDesc:
-        'Generate three completion suggestions when enabled.',
       tabCompletionModel: 'Completion model',
       tabCompletionModelDesc:
         'Choose the model used for tab completion and length adjustment.',
@@ -1672,15 +1673,6 @@ export const en: TranslationKeys = {
       tabCompletionLengthPresetMedium: 'Medium',
       tabCompletionLengthPresetLong: 'Long',
       tabCompletionAdvanced: 'Advanced settings',
-      tabCompletionContextRange: 'Context range',
-      tabCompletionContextRangeDesc:
-        'Total characters of context sent to the model (split 4:1 between before and after cursor).',
-      tabCompletionMinContextLength: 'Minimum context length',
-      tabCompletionMinContextLengthDesc:
-        'Skip tab completion unless the text before the cursor contains at least this many characters.',
-      tabCompletionTemperature: 'Sampling temperature',
-      tabCompletionTemperatureDesc:
-        'Controls creativity for prefix suggestions (0 = deterministic, higher = more diverse).',
       tabCompletionRequestTimeout: 'Request timeout (seconds)',
       tabCompletionRequestTimeoutDesc:
         'Abort a tab completion request if it takes longer than this many seconds. Raise it for slower or long-reasoning models.',
@@ -1704,14 +1696,18 @@ export const en: TranslationKeys = {
     },
     etc: {
       title: 'Other',
-      pluginUpdateNotice: 'Update notifications',
-      pluginUpdateNoticeDesc:
-        'When enabled, YOLO checks for new versions and lets you know.',
-      pluginAutoUpdate: 'Auto-download updates',
-      pluginAutoUpdateDesc:
-        'When enabled, new versions are downloaded automatically in the background when detected.',
-      pluginAutoUpdateDescUnavailable:
-        'Module updates are downloaded automatically; one-click Core installation still requires desktop and a writable plugin folder.',
+      pluginUpdateMode: 'Updates',
+      pluginUpdateModeAuto: 'Update automatically',
+      pluginUpdateModeNotify: 'Notify me',
+      pluginUpdateModeOff: "Don't notify",
+      pluginUpdateModeAutoDesc:
+        'New versions are downloaded and installed automatically, then shown with their release notes. Only YOLO reloads, not Obsidian, and it waits for running AI tasks to finish.',
+      pluginUpdateModeAutoDescUnavailable:
+        'Modules update automatically. The core cannot install itself on this device, so new versions are still announced with a link to community plugins.',
+      pluginUpdateModeNotifyDesc:
+        'New versions are announced and downloaded in the background, ready to install when you confirm.',
+      pluginUpdateModeOffDesc:
+        'Nothing is announced or downloaded. Update by hand in community plugins or Settings → Modules.',
       exportConfig: 'Export settings',
       exportConfigDesc:
         'Export current plugin settings to a JSON file for use in other vaults.',
@@ -1837,6 +1833,12 @@ export const en: TranslationKeys = {
   },
 
   chat: {
+    ribbonMenu: {
+      openInSidebar: 'Open in sidebar',
+      openInTab: 'Open in tab',
+      openInSplit: 'Open in split',
+      openInWindow: 'Open in window',
+    },
     placeholder:
       'Type a message...「@ to add references or models, / to choose a skill or command」',
     placeholderCompact: 'Click to expand and edit...',
@@ -1915,6 +1917,8 @@ export const en: TranslationKeys = {
       controlsLabel: 'Diagram controls',
     },
     stopGeneration: 'Stop generation',
+    scrollToBottom: 'Scroll to bottom',
+    scrollToBottomWhileStreaming: 'Scroll to bottom and keep following',
     queueMessage: {
       tooltip: 'Queue this message — it will be sent after the current step',
       hint: 'Waiting for the agent to finish the current step...',
@@ -1922,6 +1926,10 @@ export const en: TranslationKeys = {
         'Approve or reject the pending tool call before sending a new message.',
       blockedAwaitingInput:
         "Answer the agent's question in the chat before sending a new message.",
+      blockedActiveTool:
+        'Wait for the running tool call to finish before sending a new message.',
+      blockedActiveTooltip:
+        'You can send again once the running tool call finishes',
       abortedRestoredOne: 'Queued message restored to the input box',
       abortedRestoredMany:
         'Restored the latest queued message to the input box ({{count}} dropped)',
@@ -1950,6 +1958,7 @@ export const en: TranslationKeys = {
     dropFilesHint: 'Drop to add to the conversation',
     imageUnsupportedByModel:
       'This model has not declared image support. Enable the "Vision" input modality in the model settings to attach images.',
+    imageUnsupportedByRuntime: 'This CLI runtime does not accept image input.',
     unsupportedFileType: 'Unsupported file type: {names}',
     processImagesFailed: 'Failed to process uploaded images',
     readPdfFailed: 'Failed to read PDF "{name}": {error}',
@@ -2022,14 +2031,18 @@ export const en: TranslationKeys = {
       agentTitle: 'Let AI execute',
       agentDescription:
         'Enable tools to handle search, read/write operations, and multi-step tasks.',
-      agentFullTitle: 'Let AI execute · YOLO Mode',
+      agentFullTitle: 'Let AI execute · YOLO',
       agentFullDescription:
         'Auto-approve tool calls for search, read/write operations, and multi-step tasks.',
+      maxTitle: 'Work together, beyond the vault',
+      maxDescription: 'Any file, a real terminal.',
+      maxFullTitle: 'Work together, beyond the vault · YOLO',
+      maxFullDescription: 'Any file, a real terminal. Get it done fast.',
     },
     cliSurface: {
       emptyTitle: 'Use CLI Agent',
       emptyDescription:
-        'Connect Claude Code or Codex to run complex tasks on this device.',
+        'Connect a supported CLI agent to run complex tasks on this device.',
       emptyUserMessage: 'Empty message',
       error: 'CLI session error: {message}',
       runtimeError: 'Could not start the CLI runtime: {message}',
@@ -2037,6 +2050,8 @@ export const en: TranslationKeys = {
       cancelError: 'Could not stop the CLI run: {message}',
       openError: 'Could not open the CLI session: {message}',
       transitionError: 'Could not leave the current CLI session: {message}',
+      unboundMessageError:
+        'The CLI session has not been established yet, so this provider message cannot be shown.',
       sessionFallbackDividerTitle: 'Switched to default',
       sessionFallbackDividerDescription:
         'The original agent "{profile}" is unavailable, so this conversation switched to default — earlier messages are not in its memory.',
@@ -2049,6 +2064,9 @@ export const en: TranslationKeys = {
       defaultModel: '{provider} default model',
       loadError: 'Could not load CLI models: {message}',
       updateError: 'Could not update CLI configuration: {message}',
+      defaultBadge: 'Default',
+      setAsDefault: 'Set as default',
+      removeDefault: 'Remove default',
     },
     claudePlugins: {
       title: 'Manage Plugins',
@@ -2096,6 +2114,10 @@ export const en: TranslationKeys = {
         'Codex MCP server status is read-only here. Manage servers in the terminal.',
       codexUnsupportedVersion:
         'This Codex CLI version does not support querying MCP server status. Please upgrade Codex CLI.',
+    },
+    modelSelect: {
+      searchPlaceholder: 'Search models',
+      empty: 'No matching model',
     },
     quickAccess: {
       manage: 'Manage quick access',
@@ -2225,6 +2247,14 @@ export const en: TranslationKeys = {
       undoFailed: 'Undo failed. Please try again.',
       fileDeleted: 'This file was deleted. Use undo to restore it.',
       fileMissing: 'The file no longer exists or has been moved.',
+      snapshotUnavailable:
+        'This device has no snapshot of that edit, so it cannot be undone or reviewed. Snapshots stay on the device that made the edit.',
+      reviewOutsideVault:
+        'This file lives outside the vault, so it cannot be reviewed in the editor.',
+      reviewWhileRunning:
+        'The agent is still running and may edit the file again. Review it once the run finishes.',
+      reviewContentChanged:
+        'The file has changed again since this edit, so the review cannot be opened.',
     },
     errorCard: {
       title: 'This response failed to generate',
@@ -2297,9 +2327,6 @@ export const en: TranslationKeys = {
         fs_edit: 'Text editing',
         fs_edit_ops: 'File Editing Toolset',
         bash: 'Bash',
-        memory_add: 'Add memory',
-        memory_update: 'Update memory',
-        memory_delete: 'Delete memory',
         open_skill: 'Open skill',
       },
       dangerousBash: {
@@ -2332,8 +2359,16 @@ export const en: TranslationKeys = {
       abort: 'Abort',
       alwaysAllowThisTool: 'Always allow this tool',
       allowForThisChat: 'Allow for this chat',
+      outsideVaultNotice: 'This path is outside the vault: {path}',
       approvePlan: 'Approve plan',
       stayInPlan: 'Stay in plan',
+      editDiff: {
+        originalUnavailable:
+          'The pre-edit content is not available on this device; below is only the content this call wrote.',
+        collapsedLines: '⋯ {{count}} unchanged lines hidden',
+        truncatedLines: '{{count}} more lines not shown',
+        readingCurrent: 'Reading the current file…',
+      },
     },
     toolSummary: {
       todoWrite: {
@@ -2361,6 +2396,8 @@ export const en: TranslationKeys = {
       command: 'Ran {count} command(s)',
       analysis: '{count} sandbox run(s)',
       other: '{count} other action(s)',
+      toolSet: '{name} {count} time(s)',
+      toolSetSingle: '{name} · {tool}',
     },
     liveTask: {
       statusRunning: 'Running',
@@ -2429,6 +2466,7 @@ export const en: TranslationKeys = {
       'Index complete · {{count}} file(s) could not be indexed.',
     continueComplete: 'Resumed index completed.',
     continueFailed: 'Resumed index failed.',
+    indexCancelled: 'Indexing cancelled.',
     openYoloNewChatFailed:
       'Failed to open the YOLO chat window; try the command palette first.',
     updatingIndex: 'Updating vault index…',
@@ -2439,6 +2477,13 @@ export const en: TranslationKeys = {
       'Failed to migrate to JSON storage; please check the console for details.',
     reloadingPlugin: 'Reloading "next-composer" due to migration',
     settingsInvalid: 'Invalid settings',
+    settingsUpdateFailed: 'Failed to update settings',
+    settingsFileUnreadable:
+      'YOLO could not read its settings file (data.json) and is running with default settings. Changes will not be saved until the file can be read again. If a sync tool is updating it, wait for the sync to finish.',
+    settingsNotSavedUnreadable:
+      'Not saved: YOLO still cannot read its settings file (data.json).',
+    settingsReloadedRedo:
+      'YOLO reloaded your settings from data.json. Your last change was not saved — please redo it.',
     transportModeAutoPromoted:
       'Detected network/CORS issue. Automatically switched this provider to {mode}.',
     capturePdfNoLeaf: 'No PDF file is currently open.',
@@ -2457,8 +2502,8 @@ export const en: TranslationKeys = {
 
   statusBar: {
     agentRunningWithApproval:
-      'There are currently {count} running agents ({approvalCount} awaiting approval)',
-    agentRunning: 'There are currently {count} running agents',
+      'Agents running: {count} ({approvalCount} awaiting approval)',
+    agentRunning: 'Agents running: {count}',
     agentStatusAriaLabel: 'Agent status, click to view running conversations',
     agentStatusTitle:
       'Click to view running conversations and open one in a new chat tab',
@@ -2472,8 +2517,7 @@ export const en: TranslationKeys = {
     cliStatusWaitingUser: 'Awaiting input',
     backgroundStatusPanelTitle: 'Activity and reminders',
     backgroundStatusPanelEmpty: 'There is no activity or reminder',
-    backgroundTasksRunning:
-      'There are currently {count} background tasks running',
+    backgroundTasksRunning: 'Background tasks running: {count}',
     backgroundTasksNeedAttention: 'A background task needs attention',
     ragAutoUpdateRunning: 'Knowledge base updating in background',
     ragAutoUpdateRunningDetail:
@@ -2602,6 +2646,8 @@ export const en: TranslationKeys = {
     rewriteDesc: 'Only modify the current selection',
     agent: 'Agent',
     agentDesc: 'Tools for complex tasks',
+    max: 'Max',
+    maxDesc: 'Work directly on local files and the terminal (desktop)',
     continue: 'Write',
     continueDesc: 'Continue writing at the cursor, press Tab to accept',
     plan: 'Plan',
@@ -2610,6 +2656,8 @@ export const en: TranslationKeys = {
     agentFullDesc: 'Auto-approve tool calls for complex tasks',
     yolo: 'YOLO',
     yoloDesc: 'Auto-approve tool calls for complex tasks',
+    maxYoloDesc:
+      'Auto-approve every tool call, including paths outside the vault and terminal commands that write',
     fullAccessWarning: {
       title: 'Please confirm before enabling YOLO Mode',
       description:
@@ -2753,7 +2801,7 @@ export const en: TranslationKeys = {
       currentAssistantId: 'Current agent',
       quickAskAssistantId: 'Quick Ask agent',
       jsSandbox: 'JS sandbox permissions',
-      pluginUpdateAutoDownloadEnabled: 'Automatically download plugin updates',
+      pluginUpdateMode: 'Plugin update mode',
       moduleConfigs: 'Module configuration',
     },
   },
@@ -2795,5 +2843,16 @@ export const en: TranslationKeys = {
     viewOnGitHub: 'View on GitHub',
     updateInCommunityPlugins: 'Update in community plugins',
     manualInstallOnGitHub: "Can't update? Install manually from GitHub",
+    modulesFollowedCore: '{modules} updated along with YOLO',
+    updatesAvailable: '{count} updates available',
+    updateAll: 'Update all',
+    updated: 'Updated',
+    autoUpdateLater: 'Update automatically from now on',
+    autoUpdatedTitle: '{name} updated automatically',
+    autoUpdatedCount: '{count} updates installed automatically',
+  },
+  moduleFileView: {
+    inactivePlaceholder:
+      'This file type is provided by a module that is not currently active.',
   },
 }

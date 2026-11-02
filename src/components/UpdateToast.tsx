@@ -1,10 +1,15 @@
-import { X } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { History, X } from 'lucide-react'
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { Root, createRoot } from 'react-dom/client'
 
 import { LanguageProvider, useLanguage } from '../contexts/language-context'
 import { PluginProvider, usePlugin } from '../contexts/plugin-context'
-import { parseChangelog } from '../core/update/updateChecker'
+import type { AutoUpdatedItem } from '../core/update/autoUpdateReport'
+import type { ModuleUpdateOffer } from '../core/update/moduleUpdateController'
+import {
+  type ReleaseNotesByLanguage,
+  parseChangelog,
+} from '../core/update/updateChecker'
 import { useModuleUpdates } from '../hooks/useModuleUpdates'
 import { usePluginUpdatePrimaryCta } from '../hooks/usePluginUpdatePrimaryCta'
 import { useUpdateCheck } from '../hooks/useUpdateCheck'
@@ -37,6 +42,54 @@ function fallbackModuleReleaseNotes(
   }
 }
 
+function fallbackAutoUpdatedReleaseNotes(
+  version: string,
+  name: string,
+): { en: string; zh: string } {
+  return {
+    en: `## ${version} ${name} update
+
+### ✅ Updated automatically
+
+- **Release notes unavailable**: The update is installed; its details could not be loaded.`,
+    zh: `## ${version} ${name} 更新
+
+### ✅ 已自动更新
+
+- **更新说明暂时无法加载**：更新已经安装完成，只是详细说明未能加载。`,
+  }
+}
+
+const NO_AUTO_UPDATES: readonly AutoUpdatedItem[] = Object.freeze([])
+
+/** How long the card reporting automatic updates stays up untouched. */
+const AUTO_UPDATED_DISMISS_MS = 5_000
+
+type UpdateItem = Readonly<{
+  key: string
+  name: string
+  version: string
+  releaseNotes: ReleaseNotesByLanguage
+  /** Absent for the core update. */
+  moduleOffer: ModuleUpdateOffer | null
+}>
+
+const CORE_ITEM_KEY = 'core'
+
+/**
+ * Every pending update in one card, one tab each, behind one button.
+ *
+ * With a core update in the card the button updates the core and restarts;
+ * the modules beside it — those that run on this core and those that need
+ * the new one alike — are installed by `followCoreUpdate` on the next start,
+ * so one click covers a coordinated release. Without one, the button
+ * installs the module updates one after another. A module that needs the
+ * new core is only listed while that core update is here to bring it.
+ *
+ * Once nothing waits on the user, the same card reports what automatic
+ * updating installed, and closes itself after a countdown that hovering or
+ * focusing the card holds.
+ */
 function UpdateToast() {
   const { language, t } = useLanguage()
   const plugin = usePlugin()
@@ -44,23 +97,65 @@ function UpdateToast() {
   const { result: coreResult, muteUpdateVersion } = useUpdateCheck()
   const moduleOffers = useModuleUpdates()
   const coreUpdate = coreResult?.hasUpdate ? coreResult : null
-  const moduleOffer = coreUpdate ? null : (moduleOffers[0] ?? null)
-  const latestVersion = coreUpdate
-    ? coreUpdate.latestVersion
-    : (moduleOffer?.latestVersion ?? null)
-  const releaseNotes = useMemo(() => {
-    if (coreUpdate) return coreUpdate.releaseNotes
-    if (!moduleOffer) return null
-    return (
-      moduleOffer.releaseNotes ??
-      fallbackModuleReleaseNotes(moduleOffer.latestVersion, moduleOffer.name)
-    )
-  }, [
-    coreUpdate,
-    moduleOffer?.latestVersion,
-    moduleOffer?.name,
-    moduleOffer?.releaseNotes,
-  ])
+  const pendingItems = useMemo((): readonly UpdateItem[] => {
+    const modules = moduleOffers
+      .filter((offer) => coreUpdate !== null || !offer.awaitingCoreUpdate)
+      .map(
+        (offer): UpdateItem => ({
+          key: offer.key,
+          name: offer.name,
+          version: offer.latestVersion,
+          releaseNotes:
+            offer.releaseNotes ??
+            fallbackModuleReleaseNotes(offer.latestVersion, offer.name),
+          moduleOffer: offer,
+        }),
+      )
+    if (!coreUpdate) return modules
+    return [
+      {
+        key: CORE_ITEM_KEY,
+        name: 'YOLO',
+        version: coreUpdate.latestVersion,
+        releaseNotes: coreUpdate.releaseNotes,
+        moduleOffer: null,
+      },
+      ...modules,
+    ]
+  }, [coreUpdate, moduleOffers])
+  const autoUpdated = useSyncExternalStore(
+    plugin.subscribeAutoUpdated,
+    plugin.getAutoUpdatedSnapshot,
+    () => NO_AUTO_UPDATES,
+  )
+  const showsAutoUpdated = pendingItems.length === 0 && autoUpdated.length > 0
+  const items = useMemo(
+    (): readonly UpdateItem[] =>
+      showsAutoUpdated
+        ? autoUpdated.map((item) => ({
+            key: item.key,
+            name: item.name,
+            version: item.version,
+            releaseNotes:
+              item.releaseNotes ??
+              fallbackAutoUpdatedReleaseNotes(item.version, item.name),
+            moduleOffer: null,
+          }))
+        : pendingItems,
+    [autoUpdated, pendingItems, showsAutoUpdated],
+  )
+  const moduleItems = items.filter((item) => item.moduleOffer !== null)
+  const [updateMode, setUpdateMode] = useState(
+    () => plugin.settings.pluginUpdateMode,
+  )
+  useEffect(
+    () =>
+      plugin.addSettingsChangeListener((settings) => {
+        setUpdateMode(settings.pluginUpdateMode)
+      }),
+    [plugin],
+  )
+
   const {
     primaryCta,
     hasSelfUpdate,
@@ -74,50 +169,73 @@ function UpdateToast() {
 
   const [exiting, setExiting] = useState(false)
   const [hiddenForSession, setHiddenForSession] = useState(false)
+  const [hovered, setHovered] = useState(false)
+  const [focused, setFocused] = useState(false)
+  const countdownPaused = hovered || focused
+  const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [lang, setLang] = useState<ReleaseLanguage>('en')
-  const moduleOfferKey = moduleOffer?.key ?? null
-  const activeKey = moduleOfferKey ?? latestVersion
+  const selected =
+    items.find((item) => item.key === selectedKey) ?? items[0] ?? null
+  const itemsKey = items.map((item) => item.key).join('|')
 
-  // Reset transient view state whenever a different version surfaces.
+  // Reset transient view state whenever a different set of updates surfaces.
   useEffect(() => {
-    if (!activeKey) return
+    if (!itemsKey) return
     setExiting(false)
     setHiddenForSession(false)
-  }, [activeKey])
+  }, [itemsKey])
 
+  const selectedNotes = selected?.releaseNotes ?? null
   useEffect(() => {
-    if (!releaseNotes) return
-    setLang(resolveDefaultLanguage(releaseNotes, language))
-  }, [activeKey, language, releaseNotes])
+    if (!selectedNotes) return
+    setLang(resolveDefaultLanguage(selectedNotes, language))
+  }, [selected?.key, language, selectedNotes])
 
-  // Closing plays the exit animation first, then hides for this session only.
-  // Use "Skip this version" in the header to persist a mute across launches.
-  // Timer-driven rather than onAnimationEnd so it still fires under
-  // prefers-reduced-motion (where the animation is disabled). Keep in sync with
-  // the 160ms exit duration in input.css.
+  // Closing plays the exit animation first, then hides every update for this
+  // session only. "Skip this version" in the header is what persists, for the
+  // selected update alone. Timer-driven rather than onAnimationEnd so it still
+  // fires under prefers-reduced-motion (where the animation is disabled). Keep
+  // in sync with the 160ms exit duration in input.css.
   useEffect(() => {
-    if (!exiting || !activeKey) return
+    if (!exiting) return
     const id = window.setTimeout(() => {
-      if (moduleOfferKey) plugin.dismissModuleUpdateForSession(moduleOfferKey)
-      else {
-        plugin.dismissUpdateForSession()
-        setHiddenForSession(true)
+      if (showsAutoUpdated) {
+        plugin.dismissAutoUpdated()
+        setExiting(false)
+        return
+      }
+      for (const item of items) {
+        if (item.moduleOffer) {
+          plugin.dismissModuleUpdateForSession(item.moduleOffer.key)
+        } else {
+          plugin.dismissUpdateForSession()
+        }
       }
       setExiting(false)
     }, 160)
     return () => window.clearTimeout(id)
-  }, [activeKey, exiting, moduleOfferKey, plugin])
+  }, [exiting, items, plugin, showsAutoUpdated])
+
+  // Leaving the card starts the countdown over: whoever paused it was reading.
+  useEffect(() => {
+    if (!showsAutoUpdated || countdownPaused || exiting) return
+    const id = window.setTimeout(
+      () => setExiting(true),
+      AUTO_UPDATED_DISMISS_MS,
+    )
+    return () => window.clearTimeout(id)
+  }, [showsAutoUpdated, countdownPaused, exiting, itemsKey])
 
   // The header (title + subtitle) tracks the UI's default language; only the
   // body changelog follows the 中文/EN toggle.
-  const headerLang = releaseNotes
-    ? resolveDefaultLanguage(releaseNotes, language)
+  const headerLang = selectedNotes
+    ? resolveDefaultLanguage(selectedNotes, language)
     : 'en'
-  const headerNotes = releaseNotes ? (releaseNotes[headerLang] ?? '') : ''
-  const bodyLang = releaseNotes
-    ? resolveDefaultLanguage(releaseNotes, lang)
+  const headerNotes = selectedNotes ? (selectedNotes[headerLang] ?? '') : ''
+  const bodyLang = selectedNotes
+    ? resolveDefaultLanguage(selectedNotes, lang)
     : 'en'
-  const bodyNotes = releaseNotes ? (releaseNotes[bodyLang] ?? '') : ''
+  const bodyNotes = selectedNotes ? (selectedNotes[bodyLang] ?? '') : ''
   const subtitle = useMemo(
     () => parseChangelog(headerNotes).subtitle,
     [headerNotes],
@@ -127,35 +245,63 @@ function UpdateToast() {
     [bodyNotes],
   )
 
-  if (!latestVersion || !releaseNotes || hiddenForSession) {
+  if (!selected || !selectedNotes || hiddenForSession) {
     return null
   }
 
-  const hasBilingual = hasBilingualReleaseNotes(releaseNotes)
+  const hasBilingual = hasBilingualReleaseNotes(selectedNotes)
   const separator = lang === 'zh' ? '：' : ': '
-
   const closeLabel = t('update.dismiss', 'Dismiss')
-  const isModule = Boolean(moduleOffer)
-  const moduleBusy =
-    moduleOffer?.status === 'downloading' ||
-    moduleOffer?.status === 'applying' ||
-    moduleOffer?.status === 'success'
-  const moduleCtaLabel = moduleOffer
-    ? moduleOffer.status === 'downloading'
-      ? t('update.downloading', 'Downloading {{progress}}%').replace(
-          '{{progress}}',
-          String(Math.round(moduleOffer.progress)),
+  const selectedOffer = selected.moduleOffer
+
+  const title = showsAutoUpdated
+    ? items.length > 1
+      ? t('update.autoUpdatedCount').replace('{count}', String(items.length))
+      : t('update.autoUpdatedTitle').replace('{name}', selected.name)
+    : items.length > 1
+      ? t('update.updatesAvailable', '{count} updates available').replace(
+          '{count}',
+          String(items.length),
         )
-      : moduleOffer.status === 'applying'
-        ? t('update.applying', 'Installing…')
-        : moduleOffer.status === 'error'
+      : selectedOffer
+        ? language === 'zh'
+          ? `${selectedOffer.name} 有新版本`
+          : `${selectedOffer.name} update available`
+        : t('update.toastTitle', 'YOLO update available')
+
+  // Module-only card: the button installs them all, and reports on whichever
+  // is being worked on.
+  const moduleOffersShown = moduleItems.map((item) => item.moduleOffer!)
+  const downloadingOffer = moduleOffersShown.find(
+    (offer) => offer.status === 'downloading',
+  )
+  const moduleBusy = moduleOffersShown.some(
+    (offer) => offer.status === 'downloading' || offer.status === 'applying',
+  )
+  const modulesDone = moduleOffersShown.every(
+    (offer) => offer.status === 'success',
+  )
+  const moduleCtaLabel = downloadingOffer
+    ? t('update.downloading', 'Downloading {{progress}}%').replace(
+        '{{progress}}',
+        String(Math.round(downloadingOffer.progress)),
+      )
+    : moduleBusy
+      ? t('update.applying', 'Installing…')
+      : modulesDone
+        ? t('update.updated', 'Updated')
+        : moduleOffersShown.some((offer) => offer.status === 'error')
           ? t('common.retry', 'Retry')
-          : moduleOffer.status === 'success'
-            ? language === 'zh'
-              ? '更新完成'
-              : 'Updated'
+          : moduleOffersShown.length > 1
+            ? t('update.updateAll', 'Update all')
             : t('update.goUpdate', 'Update')
-    : ''
+  const cta = coreUpdate
+    ? primaryCta
+    : {
+        label: moduleCtaLabel,
+        disabled: moduleBusy || modulesDone,
+        onClick: () => void plugin.applyAllModuleUpdates(),
+      }
 
   const langToggle = hasBilingual ? (
     <div
@@ -184,35 +330,47 @@ function UpdateToast() {
     <FloatingToast
       className={`yolo-update-toast${exiting ? ' yolo-update-toast--exiting' : ''}`}
       exiting={exiting}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      onFocus={() => setFocused(true)}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) {
+          setFocused(false)
+        }
+      }}
     >
       <div className="yolo-update-toast-header">
         <div className="yolo-update-toast-heading">
           <div className="yolo-update-toast-titlerow">
-            <span className="yolo-update-toast-title">
-              {isModule
-                ? language === 'zh'
-                  ? `${moduleOffer!.name} 有新版本`
-                  : `${moduleOffer!.name} update available`
-                : t('update.toastTitle', 'YOLO update available')}
-            </span>
-            <span className="yolo-update-toast-version">{latestVersion}</span>
+            <span className="yolo-update-toast-title">{title}</span>
+            {items.length === 1 ? (
+              <span className="yolo-update-toast-version">
+                {selected.version}
+              </span>
+            ) : null}
           </div>
           {subtitle ? (
             <div className="yolo-update-toast-subtitle">{subtitle}</div>
           ) : null}
         </div>
         <div className="yolo-update-toast-header-actions">
-          <button
-            type="button"
-            className="yolo-update-toast-skip-btn"
-            title={t('update.skipVersion', "Don't remind me for this version")}
-            onClick={() => {
-              if (moduleOffer) void plugin.muteModuleUpdate(moduleOffer.key)
-              else muteUpdateVersion(latestVersion)
-            }}
-          >
-            {t('update.skipVersion', "Don't remind me for this version")}
-          </button>
+          {showsAutoUpdated ? null : (
+            <button
+              type="button"
+              className="yolo-update-toast-skip-btn"
+              title={t(
+                'update.skipVersion',
+                "Don't remind me for this version",
+              )}
+              onClick={() => {
+                if (selectedOffer)
+                  void plugin.muteModuleUpdate(selectedOffer.key)
+                else muteUpdateVersion(selected.version)
+              }}
+            >
+              {t('update.skipVersion', "Don't remind me for this version")}
+            </button>
+          )}
           <button
             type="button"
             className="yolo-update-toast-icon-button"
@@ -220,31 +378,75 @@ function UpdateToast() {
             aria-label={closeLabel}
             title={closeLabel}
           >
+            {showsAutoUpdated ? (
+              <svg
+                className="yolo-update-toast-countdown"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <circle
+                  // Remounted on every run, so each one drains from full.
+                  key={countdownPaused ? 'held' : 'running'}
+                  className={
+                    countdownPaused
+                      ? 'yolo-update-toast-countdown-ring'
+                      : 'yolo-update-toast-countdown-ring is-running'
+                  }
+                  style={{
+                    animationDuration: `${AUTO_UPDATED_DISMISS_MS}ms`,
+                  }}
+                  cx="12"
+                  cy="12"
+                  r="11"
+                  pathLength={1}
+                />
+              </svg>
+            ) : null}
             <X size={14} strokeWidth={1.8} />
           </button>
         </div>
       </div>
 
+      {items.length > 1 ? (
+        <div className="yolo-update-toast-tabs" role="tablist">
+          {items.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              role="tab"
+              aria-selected={item.key === selected.key}
+              className={`yolo-update-toast-tab${item.key === selected.key ? ' is-active' : ''}`}
+              onClick={() => setSelectedKey(item.key)}
+            >
+              <span className="yolo-update-toast-tab-name">{item.name}</span>
+              <span className="yolo-update-toast-tab-version">
+                {item.version}
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+
       <div className="yolo-update-toast-divider" />
 
       <div className="yolo-update-toast-body">
-        {moduleOffer?.status === 'success' ? (
+        {selectedOffer?.status === 'success' ? (
           <div className="yolo-update-toast-success">
             {language === 'zh'
-              ? `✓ ${moduleOffer.name} 已更新到 ${moduleOffer.latestVersion}`
-              : `✓ ${moduleOffer.name} updated to ${moduleOffer.latestVersion}`}
+              ? `✓ ${selectedOffer.name} 已更新到 ${selectedOffer.latestVersion}`
+              : `✓ ${selectedOffer.name} updated to ${selectedOffer.latestVersion}`}
           </div>
         ) : (
           <UpdateChangelogSections sections={sections} separator={separator} />
         )}
       </div>
 
-      {moduleOffer?.status === 'downloading' ? (
+      {!coreUpdate && downloadingOffer ? (
         <div className="yolo-update-toast-progress" aria-hidden="true">
           <div
             className="yolo-update-toast-progress-fill"
             style={{
-              transform: `scaleX(${moduleOffer.progress / 100})`,
+              transform: `scaleX(${downloadingOffer.progress / 100})`,
             }}
           />
         </div>
@@ -256,54 +458,63 @@ function UpdateToast() {
           <button
             type="button"
             className="yolo-update-toast-history-btn"
-            title={t('update.viewHistory', 'View release history')}
+            aria-label={t('update.viewHistory', 'View release history')}
             onClick={() => {
               setHiddenForSession(true)
               new UpdateHistoryModal(
                 app,
                 plugin,
                 t('update.historyTitle', 'Release history'),
-                moduleOffer
-                  ? { kind: 'module', key: moduleOffer.key }
-                  : undefined,
+                selected.key === CORE_ITEM_KEY
+                  ? undefined
+                  : { kind: 'module', key: selected.key },
               ).open()
             }}
           >
-            {t('update.viewHistory', 'View release history')}
+            <History size={14} strokeWidth={1.8} aria-hidden="true" />
           </button>
         </div>
-        <div className="yolo-update-toast-footer-actions">
-          {!moduleOffer && showCommunityPluginsFallback && hasSelfUpdate ? (
+        {showsAutoUpdated ? null : (
+          <div className="yolo-update-toast-footer-actions">
+            {updateMode === 'notify' ? (
+              <button
+                type="button"
+                className="yolo-update-toast-secondary-btn"
+                title={t('update.autoUpdateLater')}
+                onClick={() => void plugin.switchToAutoUpdate()}
+              >
+                {t('update.autoUpdateLater')}
+              </button>
+            ) : null}
+            {coreUpdate && showCommunityPluginsFallback && hasSelfUpdate ? (
+              <button
+                type="button"
+                className="yolo-update-toast-secondary-btn"
+                title={t(
+                  'update.updateInCommunityPlugins',
+                  'Update in community plugins',
+                )}
+                onClick={openCommunityPlugins}
+              >
+                {t(
+                  'update.updateInCommunityPlugins',
+                  'Update in community plugins',
+                )}
+              </button>
+            ) : null}
             <button
               type="button"
-              className="yolo-update-toast-secondary-btn"
-              title={t(
-                'update.updateInCommunityPlugins',
-                'Update in community plugins',
-              )}
-              onClick={openCommunityPlugins}
+              className={`yolo-update-toast-cta${cta.disabled ? ' is-disabled' : ''}`}
+              title={cta.label}
+              disabled={cta.disabled}
+              onClick={cta.onClick}
             >
-              {t(
-                'update.updateInCommunityPlugins',
-                'Update in community plugins',
-              )}
+              {cta.label}
             </button>
-          ) : null}
-          <button
-            type="button"
-            className={`yolo-update-toast-cta${moduleOffer ? (moduleBusy ? ' is-disabled' : '') : primaryCta.disabled ? ' is-disabled' : ''}`}
-            title={moduleOffer ? moduleCtaLabel : primaryCta.label}
-            disabled={moduleOffer ? moduleBusy : primaryCta.disabled}
-            onClick={() => {
-              if (moduleOffer) void plugin.applyModuleUpdate(moduleOffer.key)
-              else primaryCta.onClick()
-            }}
-          >
-            {moduleOffer ? moduleCtaLabel : primaryCta.label}
-          </button>
-        </div>
+          </div>
+        )}
       </div>
-      {!moduleOffer && isSelfUpdateError && releaseUrl ? (
+      {coreUpdate && isSelfUpdateError && releaseUrl ? (
         <button
           type="button"
           className="yolo-update-toast-manual-link"

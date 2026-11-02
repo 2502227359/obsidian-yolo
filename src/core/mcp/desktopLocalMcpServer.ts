@@ -5,7 +5,8 @@ import { z } from 'zod/v4'
 import { BAKED_PLUGIN_VERSION } from '../../constants/bakedVersion'
 import type { YoloSettings } from '../../settings/schema/setting.types'
 import { loadDesktopNodeModule } from '../../utils/platform/desktopNodeModule'
-import type { AgentService } from '../agent/service'
+import type { AgentSessionService } from '../agent/service'
+import type { ModuleToolSetRegistry } from '../modules/moduleToolSetRegistry'
 import { describeKnowledgeBaseCatalog } from '../rag/knowledgeBaseCatalog'
 import type { RagKnowledgeAccess } from '../rag/ragAccess'
 
@@ -43,10 +44,12 @@ type LocalMcpSession = {
 type DesktopLocalMcpServerOptions = {
   app: App
   getSettings: () => YoloSettings
-  getAgentService: () => Promise<AgentService>
+  getAgentService: () => Promise<AgentSessionService>
   getMcpManager: () => Promise<McpManager>
   ragAccess: RagKnowledgeAccess
   openConversation: (conversationId: string) => Promise<void>
+  /** See `AgentRunApiOptions['getModuleToolSetRegistry']` — same optionality reason. */
+  getModuleToolSetRegistry?: () => ModuleToolSetRegistry
 }
 
 const MAX_REQUEST_BODY_BYTES = 1024 * 1024
@@ -216,6 +219,7 @@ export class DesktopLocalMcpServer implements LocalMcpServerRuntime {
       getAgentService: options.getAgentService,
       getMcpManager: options.getMcpManager,
       openConversation: options.openConversation,
+      getModuleToolSetRegistry: options.getModuleToolSetRegistry,
     })
   }
 
@@ -375,7 +379,20 @@ export class DesktopLocalMcpServer implements LocalMcpServerRuntime {
     const server = this.httpServer
     this.httpServer = null
     if (server) {
-      await new Promise<void>((resolve) => server.close(() => resolve()))
+      const closed = new Promise<void>((resolve) =>
+        server.close(() => resolve()),
+      )
+      // `close` stops new connections and resolves once the live ones end.
+      // Idle keep-alive sockets are dropped for us, but a connection sitting
+      // mid-request holds the port indefinitely — and Obsidian's `onunload` is
+      // synchronous, so the next plugin load would bind onto a port this
+      // server never released. Nothing is served from here on, so drop them.
+      // (`closeAllConnections` is Node 18.2+; Obsidian ships far newer, but
+      // this repo pins `@types/node` at 16.)
+      ;(
+        server as HttpServer & { closeAllConnections?: () => void }
+      ).closeAllConnections?.()
+      await closed
     }
   }
 

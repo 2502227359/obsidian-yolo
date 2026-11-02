@@ -2,7 +2,11 @@ import { v4 as uuidv4 } from 'uuid'
 
 import type { ChatMessage, ChatUserMessage } from '../../types/chat'
 import type { ResponseUsage } from '../../types/llm/response'
-import type { ToolEditSummary } from '../../types/tool-call.types'
+import {
+  type ToolCallResponse,
+  ToolCallResponseStatus,
+  type ToolEditSummary,
+} from '../../types/tool-call.types'
 
 import { attachCliTurnEditSummary } from './turn-edit-summary'
 import type {
@@ -56,6 +60,9 @@ export type CliConversationSnapshot = Readonly<{
   >
   /** Latest provider-reported context usage for the input ring; not persisted. */
   contextUsage?: CliContextUsage | null
+  /** Bumped each time the runtime's skills change (`listSkills` answers
+   * differently); not persisted. */
+  skillsRevision?: number
 }>
 
 export type CliConversationTurn = Readonly<{
@@ -266,6 +273,114 @@ const settleStreamingAssistantMessages = (
   return changed ? Object.freeze(settled) : messages
 }
 
+const PENDING_INTERACTION_STATUSES = [
+  ToolCallResponseStatus.PendingApproval,
+  ToolCallResponseStatus.AwaitingUserInput,
+] as const
+
+const isPendingInteraction = (response: ToolCallResponse): boolean =>
+  (
+    PENDING_INTERACTION_STATUSES as readonly ToolCallResponse['status'][]
+  ).includes(response.status)
+
+/**
+ * The run state while a card waits for the user is not something a runtime has
+ * to remember to announce: a card sitting at `PendingApproval` /
+ * `AwaitingUserInput` *is* the run waiting. Deriving it from the transcript is
+ * what makes it impossible for an adapter to forget — and it cannot disagree
+ * with what the user sees, because it is read off the same messages.
+ *
+ * Only a live turn is reinterpreted; an idle or finished snapshot keeps the
+ * state the runtime reported.
+ */
+const deriveRunState = (
+  runState: CliRuntimeRunState,
+  messages: readonly ChatMessage[],
+): CliRuntimeRunState => {
+  if (
+    runState !== 'running' &&
+    runState !== 'waiting_for_approval' &&
+    runState !== 'waiting_for_user'
+  ) {
+    return runState
+  }
+  let waiting: CliRuntimeRunState = 'running'
+  // Only the current turn can hold a live request, so the scan stops at the
+  // user message that opened it rather than walking the whole transcript.
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message?.role === 'user') break
+    if (message?.role !== 'tool') continue
+    for (const { response } of message.toolCalls) {
+      if (response.status === ToolCallResponseStatus.AwaitingUserInput) {
+        return 'waiting_for_user'
+      }
+      if (response.status === ToolCallResponseStatus.PendingApproval) {
+        waiting = 'waiting_for_approval'
+      }
+    }
+  }
+  return waiting
+}
+
+/**
+ * A turn cannot end with a question still on screen. Settling here covers
+ * every runtime at once — including the ones whose `cancel()` only interrupts
+ * the provider and never touched their own cards.
+ */
+const abortPendingInteractions = (
+  messages: readonly ChatMessage[],
+): readonly ChatMessage[] => {
+  let changed = false
+  const settled = messages.map((message) => {
+    if (message.role !== 'tool') return message
+    if (
+      !message.toolCalls.some(({ response }) => isPendingInteraction(response))
+    ) {
+      return message
+    }
+    changed = true
+    return {
+      ...message,
+      toolCalls: message.toolCalls.map((toolCall) =>
+        isPendingInteraction(toolCall.response)
+          ? {
+              ...toolCall,
+              response: { status: ToolCallResponseStatus.Aborted } as const,
+            }
+          : toolCall,
+      ),
+    }
+  })
+  return changed ? Object.freeze(settled) : messages
+}
+
+const settleToolCallResponse = (
+  messages: readonly ChatMessage[],
+  toolCallId: string,
+  response: ToolCallResponse,
+): readonly ChatMessage[] => {
+  let changed = false
+  const settled = messages.map((message) => {
+    if (
+      message.role !== 'tool' ||
+      !message.toolCalls.some((toolCall) => toolCall.request.id === toolCallId)
+    ) {
+      return message
+    }
+    changed = true
+    return {
+      ...message,
+      toolCalls: message.toolCalls.map((toolCall) =>
+        toolCall.request.id === toolCallId
+          ? { ...toolCall, response }
+          : toolCall,
+      ),
+    }
+  })
+  return changed ? Object.freeze(settled) : messages
+}
+
 const appendAssistantError = (
   snapshot: CliConversationSnapshot,
   errorMessage: string,
@@ -380,6 +495,10 @@ export class CliConversationController {
   private readyTail: Promise<void> = Promise.resolve()
   private permissionUpdateTail: Promise<void> = Promise.resolve()
   private appliedPermissionProfile: CliPermissionProfileUpdate | null = null
+  // Model/effort the user explicitly picked before the session bound. Only
+  // this is applied on bind: a staged configuration is display state, and
+  // anything not picked stays on the runtime's own configured default.
+  private pendingConfigurationUpdate: CliRuntimeConfigurationUpdate = {}
   private disposed = false
 
   constructor(
@@ -502,15 +621,12 @@ export class CliConversationController {
   ): Promise<void> {
     this.assertActive()
     const operation = this.captureOperation()
-    const stagedConfiguration = this.snapshot.configuration
+    const merged = {
+      ...initialConfiguration,
+      ...this.pendingConfigurationUpdate,
+    }
     const configurationToApply =
-      initialConfiguration ??
-      (stagedConfiguration
-        ? {
-            modelId: stagedConfiguration.modelId,
-            reasoningEffort: stagedConfiguration.reasoningEffort,
-          }
-        : undefined)
+      Object.keys(merged).length > 0 ? merged : undefined
     const task = this.readyTail
       .catch(() => undefined)
       .then(async () => {
@@ -725,6 +841,24 @@ export class CliConversationController {
   }
 
   /**
+   * Publishes the settled state of an approval / question card the user just
+   * answered — see `CliRuntime.respondApproval`. The runtime declares what the
+   * card becomes; applying it is the host's own job, so no adapter can leave
+   * the buttons on screen waiting for the provider's next event. The run state
+   * follows from the card itself (`deriveRunState`), so there is nothing else
+   * to publish here.
+   */
+  settleToolCard(toolCallId: string, response: ToolCallResponse): void {
+    const messages = settleToolCallResponse(
+      this.snapshot.messages,
+      toolCallId,
+      response,
+    )
+    if (messages === this.snapshot.messages) return
+    this.publish({ ...this.snapshot, messages })
+  }
+
+  /**
    * Accepts a composer turn into the local transcript before provider setup.
    * Native acceptance remains owned by `sendTurn`.
    */
@@ -771,7 +905,17 @@ export class CliConversationController {
   ): Promise<CliRuntimeConfiguration | undefined> {
     this.assertActive()
     if (!this.acceptingEvents) {
-      return this.stageConfiguration(update)
+      const staged = this.stageConfiguration(update)
+      if (staged) {
+        this.pendingConfigurationUpdate = {
+          ...this.pendingConfigurationUpdate,
+          ...('modelId' in update ? { modelId: staged.modelId } : {}),
+          ...('reasoningEffort' in update
+            ? { reasoningEffort: staged.reasoningEffort }
+            : {}),
+        }
+      }
+      return staged
     }
     const operation = this.captureOperation()
     try {
@@ -832,13 +976,9 @@ export class CliConversationController {
     const current = this.snapshot.configuration
     const requestedModelId =
       'modelId' in update ? update.modelId : current?.modelId
-    // No invented selection: when nothing is requested/remembered (or the
-    // remembered id is no longer in the catalog), stage `null` — "the
-    // runtime's own current model". Falling back to the catalog head here
-    // would not just display an arbitrary model, it would be applied via
-    // set_model once the session binds (the runtime restores its real model
-    // on bind and the orchestration layer remembers it, so a fresh
-    // conversation's staged null resolves to the truth one turn later).
+    // No invented selection: when nothing is requested (or the requested id
+    // is no longer in the catalog), stage `null` — "the runtime's own current
+    // model", which the runtime reports once the session binds.
     const modelId =
       requestedModelId != null &&
       models.some((model) => model.id === requestedModelId)
@@ -922,6 +1062,7 @@ export class CliConversationController {
       this.acceptingEvents = true
       this.bindingTarget = undefined
       this.bindingEpoch = null
+      this.pendingConfigurationUpdate = {}
       this.publish({
         ...this.snapshot,
         configuration,
@@ -973,6 +1114,7 @@ export class CliConversationController {
   private beginSessionTransition(ref: CliSessionRef | null): void {
     this.conversationEpoch += 1
     this.resetEventGate()
+    this.pendingConfigurationUpdate = {}
     this.pendingOptimisticUserMessageId = null
     this.reconciledNativeUserMessageIds.clear()
     this.restoredCacheHitRate = null
@@ -1067,6 +1209,16 @@ export class CliConversationController {
       ) {
         this.publish({ ...this.snapshot, sessionRef: event.ref })
       }
+      return
+    }
+
+    // Not transcript content, and sent while the session is still binding:
+    // the runtime's current answer, whenever it arrives.
+    if (event.type === 'skills_changed') {
+      this.publish({
+        ...this.snapshot,
+        skillsRevision: (this.snapshot.skillsRevision ?? 0) + 1,
+      })
       return
     }
 
@@ -1220,22 +1372,24 @@ export class CliConversationController {
       }
       return
     }
-    if (
-      event.state !== 'running' &&
-      event.state !== 'waiting_for_approval' &&
-      event.state !== 'waiting_for_user'
-    ) {
+    if (event.state !== 'running') {
       this.pendingOptimisticUserMessageId = null
       this.currentTurnMessageIds.clear()
-      this.currentTurnMetrics = null
+      // The metrics window deliberately stays open past the terminal state: a
+      // runtime that reports usage and duration as two separate events (Codex,
+      // pi) would otherwise lose whichever one loses the race, silently. It is
+      // reset when the next turn opens, which is the only moment the previous
+      // turn's metrics stop being the right answer.
     }
     const messages =
       event.state === 'completed' ||
       event.state === 'aborted' ||
       event.state === 'error'
-        ? settleStreamingAssistantMessages(
-            this.snapshot.messages,
-            event.state === 'aborted' ? 'aborted' : 'completed',
+        ? abortPendingInteractions(
+            settleStreamingAssistantMessages(
+              this.snapshot.messages,
+              event.state === 'aborted' ? 'aborted' : 'completed',
+            ),
           )
         : this.snapshot.messages
     if (event.state === 'error' && event.error) {
@@ -1255,11 +1409,7 @@ export class CliConversationController {
       messages,
       runState: event.state,
       error: event.error ?? null,
-      ...(event.state !== 'running' &&
-      event.state !== 'waiting_for_approval' &&
-      event.state !== 'waiting_for_user'
-        ? { isCompacting: false }
-        : {}),
+      ...(event.state !== 'running' ? { isCompacting: false } : {}),
     })
   }
 
@@ -1431,7 +1581,10 @@ export class CliConversationController {
 
   private publish(snapshot: CliConversationSnapshot): void {
     if (this.disposed) return
-    this.snapshot = Object.freeze(snapshot)
+    const runState = deriveRunState(snapshot.runState, snapshot.messages)
+    this.snapshot = Object.freeze(
+      runState === snapshot.runState ? snapshot : { ...snapshot, runState },
+    )
     this.notify()
   }
 

@@ -14,6 +14,7 @@ import {
 } from 'react'
 
 import { useLanguage } from '../../contexts/language-context'
+import type { ChatMode } from '../../core/agent/chat-mode'
 import type { AgentConversationRunSummary } from '../../core/agent/service'
 import type {
   ChatRuntimeActions,
@@ -57,7 +58,6 @@ import { getNodeWindow } from '../../utils/dom/window-context'
 import { formatTokenCount } from '../../utils/llm/formatTokenCount'
 import { stampUserMessageTimeContext } from '../../utils/prompt/timeContext'
 
-import type { ChatMode } from './chat-input/ChatModeSelect'
 import type { ChatUserInputRef } from './chat-input/ChatUserInput'
 import { editorStateToPlainText } from './chat-input/utils/editor-state-to-plain-text'
 import { ChatRuntimeActionsProvider } from './chat-runtime-actions-context'
@@ -254,7 +254,7 @@ export type YoloChatSurfaceProps = {
   handleChatModeChange: ChatRuntimePreferences['handleChatModeChange']
   handleUserMessageSubmit: ChatDomainActions['handleUserMessageSubmit']
   handleRecoverPendingToolCall: ChatDomainActions['handleRecoverPendingToolCall']
-  // 架构治理第三步分期 C3：retry/continue/recover 收编进
+  // retry/continue/recover 收编进
   // ChatSessionController——类型不再从 useChatDomainActions 派生,直接写
   // 消费方（AssistantToolMessageGroupItem）期望的函数签名。
   handleRecoverAnswerUserQuestion: (payload: {
@@ -505,6 +505,27 @@ export function YoloChatSurface({
   )
   const compactionDividerAnchorMessageId =
     latestCompactionState?.anchorMessageId ?? null
+  // The latest divider sits inside a turn that goes on past it — the model
+  // compacted through its tool, or the runtime compacted mid-run — so the
+  // slice above it is not where that turn ends and gets no footer.
+  const compactionAnchorSplitsTurn = useMemo(() => {
+    if (compactionDividerAnchorMessageId === null) {
+      return false
+    }
+    if (latestCompactionState?.triggerToolCallId) {
+      return true
+    }
+    const { messageIds, messagesById } = chatTimelineReadModel
+    const nextMessageId =
+      messageIds[messageIds.indexOf(compactionDividerAnchorMessageId) + 1]
+    const nextMessage =
+      nextMessageId === undefined ? undefined : messagesById.get(nextMessageId)
+    return nextMessage !== undefined && nextMessage.role !== 'user'
+  }, [
+    chatTimelineReadModel,
+    compactionDividerAnchorMessageId,
+    latestCompactionState?.triggerToolCallId,
+  ])
   const previousPendingCompactionAnchorMessageIdRef = useRef<string | null>(
     null,
   )
@@ -961,8 +982,7 @@ export function YoloChatSurface({
           (message) => message.id === compactionDividerAnchorMessageId,
         )
       const shouldSuppressCompactionAnchorFooter =
-        containsCompactionAnchor &&
-        Boolean(latestCompactionState?.triggerToolCallId)
+        containsCompactionAnchor && compactionAnchorSplitsTurn
 
       return {
         conversationId: currentConversationId,
@@ -1026,7 +1046,6 @@ export function YoloChatSurface({
         onUndoEditSummary: (...args) =>
           timelineHandlersRef.current.handleUndoEditSummary(...args),
         undoingEditSummaryTarget,
-        pendingCompactionAnchorMessageId,
         hidePendingAssistantPlaceholders:
           shouldHidePendingAssistantPlaceholders,
       }
@@ -1042,8 +1061,7 @@ export function YoloChatSurface({
       currentConversationRunSummary,
       editingAssistantMessageId,
       foregroundAgentVisualTurnPlan,
-      latestCompactionState?.triggerToolCallId,
-      pendingCompactionAnchorMessageId,
+      compactionAnchorSplitsTurn,
       runSummaryAssistantGroupId,
       shouldHidePendingAssistantPlaceholders,
       subagentResultsByToolCallId,
@@ -1409,8 +1427,7 @@ export function YoloChatSurface({
           compactionDividerAnchorMessageId !== null &&
           timelineItem.messageIds.includes(compactionDividerAnchorMessageId)
         const shouldSuppressCompactionAnchorFooter =
-          containsCompactionAnchor &&
-          Boolean(latestCompactionState?.triggerToolCallId)
+          containsCompactionAnchor && compactionAnchorSplitsTurn
         const isRunSummaryGroup =
           timelineItem.groupId === runSummaryAssistantGroupId
         const isEditingGroup =
@@ -1447,7 +1464,6 @@ export function YoloChatSurface({
           getRenderVersionObjectId(terminalCommandResultsByToolCallId),
           getRenderVersionObjectId(subagentResultsByToolCallId),
           isEditingGroup ? editingAssistantMessageId : '',
-          pendingCompactionAnchorMessageId ?? '',
           shouldHidePendingAssistantPlaceholders,
           undoingEditSummaryTarget ?? '',
           isRunSummaryGroup,
@@ -1522,10 +1538,9 @@ export function YoloChatSurface({
       foregroundAgentVisualTurnPlan,
       isCurrentConversationRunActive,
       runSummaryAssistantGroupId,
-      latestCompactionState?.triggerToolCallId,
+      compactionAnchorSplitsTurn,
       messageModelMap,
       messageReasoningMap,
-      pendingCompactionAnchorMessageId,
       queryProgress,
       reasoningLevel,
       selectedAssistantTimeContextEnabled,
@@ -1592,8 +1607,23 @@ export function YoloChatSurface({
         emptyStateAgentTitle={t('chat.emptyState.agentTitle', '让 AI 去执行')}
         emptyStateAgentFullTitle={t(
           'chat.emptyState.agentFullTitle',
-          '让 AI 自主执行 · YOLO 模式',
+          '让 AI 自主执行 · YOLO',
         )}
+        emptyStateMaxCopy={{
+          title: t('chat.emptyState.maxTitle', '协作，不止于 vault'),
+          description: t(
+            'chat.emptyState.maxDescription',
+            '任意文件、真实终端',
+          ),
+          fullTitle: t(
+            'chat.emptyState.maxFullTitle',
+            '协作，不止于 vault · YOLO',
+          ),
+          fullDescription: t(
+            'chat.emptyState.maxFullDescription',
+            '任意文件、真实终端，快速完成任务',
+          ),
+        }}
         emptyStateWorkspaceTitle={emptyStateWorkspaceTitle}
         emptyStateModuleContent={emptyStateModuleContent}
         emptyStateAskDescription={t(

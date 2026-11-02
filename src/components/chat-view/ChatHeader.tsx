@@ -8,6 +8,8 @@ import type {
 import { useEffect, useRef } from 'react'
 
 import { useLanguage } from '../../contexts/language-context'
+import type { ChatMode } from '../../core/agent/chat-mode'
+import { isModuleChatMode } from '../../core/agent/chat-mode'
 import type { AgentConversationRunSummary } from '../../core/agent/service'
 import {
   type ChatRuntimeId,
@@ -28,7 +30,6 @@ import type { ConversationOverrideSettings } from '../../types/conversation-sett
 import type { MentionableBlockData } from '../../types/mentionable'
 
 import { AssistantSelector } from './AssistantSelector'
-import { type ChatMode, isModuleChatMode } from './chat-input/ChatModeSelect'
 import { ChatListDropdown } from './ChatListDropdown'
 import { HermesProfileSelector } from './HermesProfileSelector'
 import { RuntimeSelector } from './RuntimeSelector'
@@ -85,7 +86,7 @@ export type ChatHeaderProps = {
     cliSession?: ChatConversationCliSession
   } | null>
   /**
-   * issue #567 Step 2：删除会话后的清理（CLI overlay 移除）+ 会话切换逻辑
+   * issue #567：删除会话后的清理（CLI overlay 移除）+ 会话切换逻辑
    * 下沉到 Chat.tsx 单一实现，供本组件与 `ChatRef.deleteCurrentConversation`
    * 共用，取代原先直接内联在 `onDelete` 里的那段逻辑。
    */

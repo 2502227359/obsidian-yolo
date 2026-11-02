@@ -3,6 +3,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
 import { Notice } from 'obsidian'
 import {
+  type ReactNode,
   memo,
   useCallback,
   useEffect,
@@ -30,6 +31,8 @@ import {
   parseLocalFsActionFromToolArgs,
 } from '../../core/mcp/localFileTools'
 import { parseToolName } from '../../core/mcp/tool-name-utils'
+import { resolveFileChangeRows } from '../../core/tools/file-change-resolver'
+import { INVOKE_TOOL_NAME } from '../../core/tools/internal/invoke_tool/definition'
 import {
   LOAD_TOOL_SCHEMAS_CHAT_LABEL,
   LOAD_TOOL_SCHEMAS_TOOL_NAME,
@@ -73,6 +76,7 @@ import {
   handleRuntimeToolRejection,
 } from './runtime-action-handlers'
 import { CliSubagentCard } from './tool-cards/CliSubagentCard'
+import { FileChangeList } from './tool-cards/EditDiffView'
 import { LiveTaskCard } from './tool-cards/LiveTaskCard'
 import { type ToolRenderer, getToolRenderer } from './tool-renderers'
 import {
@@ -104,6 +108,7 @@ export type ToolLabels = {
   reject: string
   abort: string
   allowForThisChat: string
+  outsideVaultNotice: (path: string) => string
   approvePlan: string
   stayInPlan: string
   todoWriteCleared: string
@@ -136,6 +141,40 @@ type ToolRequestLike = {
 
 const DEFAULT_WRITE_ACTION_LABELS: Record<string, string> = {
   write: 'Write file',
+}
+
+/**
+ * Whether the approval card must hide "always allow for this chat" and offer
+ * only a one-off Allow.
+ *
+ * Reads the call's own creation-time snapshot before the live registry, in
+ * this order:
+ *   1. `exit_plan_mode` — a plan hand-off is a decision, never a standing rule.
+ *   2. A module chat mode tool declared `requiresApproval: true`: an
+ *      unconditional per-call gate the service layer refuses to bypass anyway
+ *      (see `AgentToolGateway.attachChatModeSnapshot` and
+ *      `AgentSessionService.approveToolCall`).
+ *   3. The running mode's own override, if it stated one — Max opens "always
+ *      allow" on the terminal. Snapshotted, so a call
+ *      already on screen keeps the option it was created with.
+ *   4. The owning capability's static `approval.allowAlwaysAllow`
+ *      declaration. Tools no capability owns — third-party MCP tools,
+ *      retired local names — resolve to `undefined`, i.e. not disabled.
+ */
+export const isAlwaysAllowDisabledForRequest = (
+  request: ToolRequestLike,
+): boolean => {
+  if (request.name === CLAUDE_EXIT_PLAN_MODE_TOOL) return true
+  if (request.metadata?.approvalPolicy === 'always-require-user') return true
+  if (request.metadata?.allowAlwaysAllow !== undefined) {
+    return !request.metadata.allowAlwaysAllow
+  }
+  try {
+    const { toolName } = parseToolName(request.name)
+    return getCapabilityForTool(toolName)?.approval.allowAlwaysAllow === false
+  } catch {
+    return false
+  }
 }
 
 export const getToolLabels = (t?: TranslateFn): ToolLabels => {
@@ -184,9 +223,9 @@ export const getToolLabels = (t?: TranslateFn): ToolLabels => {
     // fs_create_dir, fs_move, and their even older fs_create_file /
     // fs_delete_file / fs_delete_dir aliases) used to get their own explicit
     // overrides here purely to keep historical conversations rendering a
-    // friendly label. D8/D10 (master.md decision 10) deliberately drop that:
-    // they now fall through to the `?? toolName` default just below, same as
-    // any other retired or third-party tool name — self-consistent with how
+    // friendly label. That was deliberately dropped: they now fall through to
+    // the `?? toolName` default just below, same as any other retired or
+    // third-party tool name — self-consistent with how
     // module tools and remote MCP tools have always rendered, and with how
     // this same map already treats every OTHER retired tool. The only
     // user-visible effect is on conversations from before 2026-08-08 (schema
@@ -249,6 +288,11 @@ export const getToolLabels = (t?: TranslateFn): ToolLabels => {
       'chat.toolCall.allowForThisChat',
       'Allow for this chat',
     ),
+    outsideVaultNotice: (path: string) =>
+      translate(
+        'chat.toolCall.outsideVaultNotice',
+        'This path is outside the vault: {path}',
+      ).replace('{path}', path),
     approvePlan: translate('chat.toolCall.approvePlan', 'Approve plan'),
     stayInPlan: translate('chat.toolCall.stayInPlan', 'Stay in plan'),
     todoWriteCleared: translate(
@@ -338,8 +382,8 @@ const isVirtualBashRequest = (request: ToolRequestLike): boolean => {
 /**
  * Looks up this request's `TOOL_RENDERERS` entry — but only for local
  * built-in tools, mirroring the `serverName === localServerName` gate
- * `getToolDisplayInfo` already uses (D8: "内置工具查 TOOL_RENDERERS，其余走
- * generic", master.md's own framing for this gate after D8). Returns `null`
+ * `getToolDisplayInfo` already uses ("内置工具查 TOOL_RENDERERS，其余走
+ * generic"). Returns `null`
  * for remote MCP tools, retired local tool names, and any request whose name
  * doesn't parse — `getToolRenderer` itself already degrades unknown names to
  * `genericRenderer`, but that's the wrong answer here: a *remote* tool that
@@ -361,6 +405,31 @@ const getLocalBuiltinToolRenderer = (
     }
     return null
   }
+}
+
+/**
+ * The expanded body of a CLI `file_change` call: the rows its runtime's
+ * mapping layer built, through the same `resolveFileChangeRows` the native
+ * file tools' card uses — so which statuses draw a change is decided in one
+ * place for both. Like a `kind: 'content'` renderer it owns the whole content
+ * area; `null` (not a file change, or nothing pre-built) leaves the default
+ * sections.
+ *
+ * An inline capability branch rather than a `TOOL_RENDERERS` entry for the
+ * same reason as `LiveTaskCard` below: CLI calls carry provider-native names
+ * that never pass `getLocalBuiltinToolRenderer`'s server gate. Read-only in
+ * every status, approval included — the agent executes the write and hears
+ * only approve or reject, so per-hunk choices here would reach no one.
+ */
+const renderCliFileChange = (
+  request: ToolCallRequest,
+  response: ToolCallResponse,
+): ReactNode => {
+  if (!isCliToolCallCapability(request, 'file_change')) return null
+  const resolution = resolveFileChangeRows(request, response)
+  return resolution?.type === 'rows' ? (
+    <FileChangeList files={resolution.files} />
+  ) : null
 }
 
 const extractLegacyExternalAgentArgs = (
@@ -659,7 +728,7 @@ const getDelegateSubagentSummary = ({
 }
 
 /**
- * By-name summary dispatch (D8, phase2-migration.md). Replaced a ~12-branch
+ * By-name summary dispatch. Replaced a ~12-branch
  * `if (toolName === 'x')` chain with a lookup into `TOOL_RENDERERS`
  * (`getToolRenderer(toolName).summary`) — the same exhaustive wiring table
  * `ToolMessage.tsx` uses below for custom card rendering.
@@ -668,8 +737,7 @@ const getDelegateSubagentSummary = ({
  * `fs_move`, and their even older `fs_create_file`/`fs_delete_file`/
  * `fs_delete_dir` aliases) have no registry entry, so they fall straight
  * through to the final dead-but-harmless fallback below and render with no
- * summary text at all (master.md decision 10 — deliberately not preserved;
- * see that decision's argument for why).
+ * summary text at all (deliberately not preserved).
  */
 const getLocalToolSummaryText = ({
   toolName,
@@ -718,12 +786,70 @@ const getLocalToolSummaryText = ({
   return undefined
 }
 
+const resolveInvokeToolEnvelope = (
+  request: ToolRequestLike,
+): ToolRequestLike => {
+  let toolName: string
+  try {
+    toolName = parseToolName(request.name).toolName
+  } catch {
+    return request
+  }
+  if (toolName !== INVOKE_TOOL_NAME) {
+    return request
+  }
+  const envelope = parseToolArguments(request.arguments)
+  const realName = envelope?.tool_name
+  if (typeof realName !== 'string' || realName.trim().length === 0) {
+    return request
+  }
+  return {
+    ...request,
+    name: realName.trim(),
+    arguments: createCompleteToolCallArguments({
+      value: readEnvelopeArguments(envelope?.arguments),
+    }),
+  }
+}
+
+/**
+ * The envelope's `arguments` is an object on most providers and a
+ * JSON-encoded string on Gemini. Both have to resolve, or the Gemini preview
+ * would lose the per-tool summary (a shell command, an edited path) that the
+ * renderers derive from the arguments.
+ */
+const readEnvelopeArguments = (inner: unknown): Record<string, unknown> => {
+  if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+    return inner as Record<string, unknown>
+  }
+  if (typeof inner === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(inner)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>
+      }
+    } catch {
+      // Still streaming, or malformed — the preview simply shows no summary.
+    }
+  }
+  return {}
+}
+
 export const getToolDisplayInfo = (
   request: ToolRequestLike,
   labels: ToolLabels = getToolLabels(),
 ): ToolDisplayInfo => {
   const localServerName = getLocalFileToolServerName()
-  const argumentsObject = parseToolArguments(request.arguments)
+  // Executed calls have already had the `invoke_tool` envelope opened by the
+  // gateway, so `request.name` is the real tool. The streaming preview is the
+  // exception: it renders the assistant's in-flight requests, which are still
+  // in envelope form. Resolve the real name here so the user never sees the
+  // wrapper. Mid-stream the arguments JSON may still be incomplete, in which
+  // case `tool_name` is simply absent and the preview corrects itself on the
+  // next chunk.
+  const resolved = resolveInvokeToolEnvelope(request)
+  const argumentsObject = parseToolArguments(resolved.arguments)
+  request = resolved
   const cliToolCall = request.metadata?.cliToolCall
   if (cliToolCall) {
     const isCommandExecution = cliToolCall.capability === 'command_execution'
@@ -809,7 +935,6 @@ export const getToolMessageContent = (
 const ToolMessage = memo(function ToolMessage({
   message,
   conversationId,
-  isCompactionPending = false,
   showRunningFooter = true,
   terminalCommandResultsByToolCallId,
   subagentResultsByToolCallId,
@@ -820,7 +945,6 @@ const ToolMessage = memo(function ToolMessage({
 }: {
   message: ChatToolMessage
   conversationId: string
-  isCompactionPending?: boolean
   showRunningFooter?: boolean
   terminalCommandResultsByToolCallId?: ReadonlyMap<
     string,
@@ -891,9 +1015,6 @@ const ToolMessage = memo(function ToolMessage({
               response={toolCall.response}
               conversationId={conversationId}
               toolMessageId={message.id}
-              showCompactionPendingHint={
-                isCompactionPending && index === message.toolCalls.length - 1
-              }
               showRunningFooter={showRunningFooter}
               terminalCommandResult={terminalCommandResultsByToolCallId?.get(
                 toolCall.request.id,
@@ -917,7 +1038,6 @@ type ToolCallItemProps = {
   response: ToolCallResponse
   conversationId: string
   toolMessageId: string
-  showCompactionPendingHint?: boolean
   showRunningFooter?: boolean
   terminalCommandResult?: ChatTerminalCommandResultMessage
   subagentResult?: ChatSubagentResultMessage
@@ -954,7 +1074,6 @@ function ToolCallItem({
   response,
   conversationId,
   toolMessageId,
-  showCompactionPendingHint = false,
   showRunningFooter = true,
   terminalCommandResult,
   subagentResult,
@@ -1010,7 +1129,6 @@ function ToolCallItem({
       />
     )
   }
-  const COMPACTION_PENDING_EXIT_MS = 180
   const reduceMotion = useReducedMotion()
   const motionDuration = reduceMotion ? 0 : MOTION_DURATION_EXIT_S
   const {
@@ -1068,27 +1186,10 @@ function ToolCallItem({
       : response.status
   // 是否禁用"始终允许"按钮（某些高危工具每次必须人审）
   const isExitPlanMode = request.name === CLAUDE_EXIT_PLAN_MODE_TOOL
-  const isAlwaysAllowDisabled = useMemo(() => {
-    if (isExitPlanMode) return true
-    // Module chat mode tools declared `requiresApproval: true` are an
-    // unconditional per-call confirmation gate (see `tool-gateway.ts`'s
-    // `attachModuleChatModeSnapshot`) — the "always allow this
-    // conversation" option would be misleading since the service layer
-    // rejects it anyway (see `AgentService.approveToolCall`).
-    if (request.metadata?.approvalPolicy === 'always-require-user') return true
-    try {
-      // D7 (phase2-migration.md D7 item 7): "always allow" is now a
-      // capability-level fact (`approval.allowAlwaysAllow`) rather than a
-      // hand-maintained tool-name list. Non-capability tools (third-party
-      // MCP tools, retired local tool names) resolve to `undefined` here,
-      // which correctly means "not disabled" — the pre-refactor list only
-      // ever named `bash` and `terminal_command`.
-      const { toolName } = parseToolName(request.name)
-      return getCapabilityForTool(toolName)?.approval.allowAlwaysAllow === false
-    } catch {
-      return false
-    }
-  }, [isExitPlanMode, request.metadata?.approvalPolicy, request.name])
+  const isAlwaysAllowDisabled = useMemo(
+    () => isAlwaysAllowDisabledForRequest(request),
+    [request],
+  )
   const pendingAllowLabel = isExitPlanMode
     ? toolLabels.approvePlan
     : toolLabels.allow
@@ -1096,13 +1197,6 @@ function ToolCallItem({
     ? toolLabels.stayInPlan
     : toolLabels.reject
   const [showRunningActions, setShowRunningActions] = useState(false)
-  const [renderCompactionPendingHint, setRenderCompactionPendingHint] =
-    useState(
-      showCompactionPendingHint &&
-        effectiveStatus === ToolCallResponseStatus.Success,
-    )
-  const [isCompactionPendingHintExiting, setIsCompactionPendingHintExiting] =
-    useState(false)
   useEffect(() => {
     if (
       !showRunningFooter ||
@@ -1146,36 +1240,11 @@ function ToolCallItem({
   const shouldShowParameters =
     !isCompactLiveTaskRequest ||
     effectiveStatus === ToolCallResponseStatus.PendingApproval
-  useEffect(() => {
-    const shouldShowCompactionPendingHint =
-      showCompactionPendingHint &&
-      effectiveStatus === ToolCallResponseStatus.Success
-
-    if (shouldShowCompactionPendingHint) {
-      setRenderCompactionPendingHint(true)
-      setIsCompactionPendingHintExiting(false)
-      return
-    }
-
-    if (!renderCompactionPendingHint) {
-      return
-    }
-
-    setIsCompactionPendingHintExiting(true)
-    const timer = window.setTimeout(() => {
-      setRenderCompactionPendingHint(false)
-      setIsCompactionPendingHintExiting(false)
-    }, COMPACTION_PENDING_EXIT_MS)
-
-    return () => {
-      window.clearTimeout(timer)
-    }
-  }, [effectiveStatus, renderCompactionPendingHint, showCompactionPendingHint])
 
   // `kind: 'replace'` renderers (currently: only `delegate_subagent`'s
   // `SubagentCard`) take over the entire tool-call block — see
   // `tool-renderers/types.ts`'s doc comment. `render()` returns `null` while
-  // pending approval (matching the pre-D8 `effectiveStatus !==
+  // pending approval (matching the former `effectiveStatus !==
   // PendingApproval` guard this replaced — see `delegate_subagent/ui.tsx`'s
   // own doc comment), in which case we fall through to the normal
   // header/approval-footer rendering below exactly as before.
@@ -1305,102 +1374,106 @@ function ToolCallItem({
           // it — see `tool-renderers/types.ts`'s doc comment.
           const bodyRenderer =
             localToolRenderer?.kind === 'body' ? localToolRenderer : null
+          // `kind: 'content'` renderers own this whole content area — both
+          // the parameters section and the result/error sections below (see
+          // `tool-renderers/types.ts`). `null` means "not this call/state",
+          // and the default sections render instead.
+          const customContent =
+            localToolRenderer?.kind === 'content'
+              ? localToolRenderer.render({
+                  toolCallId: request.id,
+                  request,
+                  response,
+                  conversationId,
+                  onAbort: () => {
+                    void handleAbort()
+                  },
+                })
+              : renderCliFileChange(request, response)
 
           return (
             <div
               id={`yolo-toolcall-content-${request.id}`}
               className="yolo-toolcall-content"
             >
-              {shouldShowParameters && (
-                <div className="yolo-toolcall-content-section">
-                  <div>{toolLabels.parameters}:</div>
-                  <ObsidianCodeBlock language="json" content={parameters} />
-                </div>
-              )}
-              {bodyRenderer ? (
-                bodyRenderer.render({
-                  toolCallId: request.id,
-                  request,
-                  response: effectiveTerminalResponse,
-                  conversationId,
-                  terminalCommandResult,
-                  onAbort: () => {
-                    void handleAbort()
-                  },
-                })
-              ) : isTerminalLikeRequest ? (
-                // CLI `command_execution` capability calls and the legacy
-                // `delegate_external_agent` tool name also render through
-                // `LiveTaskCard`, but neither is tool-name-indexed, so both
-                // stay as this inline branch rather than a `TOOL_RENDERERS`
-                // entry (D8: non-tool-name branches stay as-is).
-                <LiveTaskCard
-                  toolCallId={request.id}
-                  response={effectiveTerminalResponse}
-                  args={
-                    isLegacyDelegateExternalAgentRequest(request)
-                      ? extractLegacyExternalAgentArgs(request.arguments)
-                      : extractTerminalCommandArgs(request.arguments)
-                  }
-                  initialStdout={
-                    terminalCommandResult?.stdout ??
-                    syntheticLiveTaskOutput.stdout
-                  }
-                  initialStderr={
-                    terminalCommandResult?.stderr ??
-                    syntheticLiveTaskOutput.stderr
-                  }
-                  onAbort={handleAbort}
-                />
-              ) : (
+              {customContent ?? (
                 <>
-                  {response.status === ToolCallResponseStatus.Success && (
+                  {shouldShowParameters && (
                     <div className="yolo-toolcall-content-section">
-                      <div>{toolLabels.result}:</div>
-                      <ObsidianCodeBlock content={resultDisplayText} />
+                      <div>{toolLabels.parameters}:</div>
+                      <ObsidianCodeBlock language="json" content={parameters} />
                     </div>
                   )}
-                  {response.status === ToolCallResponseStatus.Error && (
-                    <div className="yolo-toolcall-content-section">
-                      <div>{toolLabels.error}:</div>
-                      <ObsidianCodeBlock content={response.error} />
-                    </div>
+                  {bodyRenderer ? (
+                    bodyRenderer.render({
+                      toolCallId: request.id,
+                      request,
+                      response: effectiveTerminalResponse,
+                      conversationId,
+                      terminalCommandResult,
+                      onAbort: () => {
+                        void handleAbort()
+                      },
+                    })
+                  ) : isTerminalLikeRequest ? (
+                    // CLI `command_execution` capability calls and the legacy
+                    // `delegate_external_agent` tool name also render through
+                    // `LiveTaskCard`, but neither is tool-name-indexed, so both
+                    // stay as this inline branch rather than a `TOOL_RENDERERS`
+                    // entry.
+                    <LiveTaskCard
+                      toolCallId={request.id}
+                      response={effectiveTerminalResponse}
+                      args={
+                        isLegacyDelegateExternalAgentRequest(request)
+                          ? extractLegacyExternalAgentArgs(request.arguments)
+                          : extractTerminalCommandArgs(request.arguments)
+                      }
+                      initialStdout={
+                        terminalCommandResult?.stdout ??
+                        syntheticLiveTaskOutput.stdout
+                      }
+                      initialStderr={
+                        terminalCommandResult?.stderr ??
+                        syntheticLiveTaskOutput.stderr
+                      }
+                      onAbort={handleAbort}
+                    />
+                  ) : (
+                    <>
+                      {response.status === ToolCallResponseStatus.Success && (
+                        <div className="yolo-toolcall-content-section">
+                          <div>{toolLabels.result}:</div>
+                          <ObsidianCodeBlock content={resultDisplayText} />
+                        </div>
+                      )}
+                      {response.status === ToolCallResponseStatus.Error && (
+                        <div className="yolo-toolcall-content-section">
+                          <div>{toolLabels.error}:</div>
+                          <ObsidianCodeBlock content={response.error} />
+                        </div>
+                      )}
+                      {response.status === ToolCallResponseStatus.Rejected &&
+                        response.reason && (
+                          <div className="yolo-toolcall-content-section">
+                            <div>{toolLabels.rejectionReason}:</div>
+                            <ObsidianCodeBlock content={response.reason} />
+                          </div>
+                        )}
+                    </>
                   )}
-                  {response.status === ToolCallResponseStatus.Rejected &&
-                    response.reason && (
-                      <div className="yolo-toolcall-content-section">
-                        <div>{toolLabels.rejectionReason}:</div>
-                        <ObsidianCodeBlock content={response.reason} />
-                      </div>
-                    )}
                 </>
               )}
             </div>
           )
         })()}
-      {renderCompactionPendingHint && (
-        <div
-          className={cx(
-            'yolo-toolcall-compaction-pending',
-            isCompactionPendingHintExiting &&
-              'yolo-toolcall-compaction-pending--exiting',
-          )}
-          aria-live="polite"
-        >
-          <Loader2
-            size={12}
-            className="yolo-toolcall-compaction-pending-icon"
-          />
-          <span>
-            {t(
-              'chat.compaction.pendingStatus',
-              '正在整理上下文，稍后将从新的上下文继续。',
-            )}
-          </span>
-        </div>
-      )}
       {footerMode && (
         <div key={footerMode} className="yolo-toolcall-footer">
+          {footerMode === 'pending' && request.metadata?.outsideVaultPath && (
+            <div className="yolo-toolcall-footer-notice">
+              {toolLabels.outsideVaultNotice(request.metadata.outsideVaultPath)}
+            </div>
+          )}
           {footerMode === 'pending' && (
             <div className="yolo-toolcall-footer-actions">
               {isAlwaysAllowDisabled ? (
@@ -1521,7 +1594,6 @@ export const areToolCallItemPropsEqual = (
   prev.response === next.response &&
   prev.conversationId === next.conversationId &&
   prev.toolMessageId === next.toolMessageId &&
-  prev.showCompactionPendingHint === next.showCompactionPendingHint &&
   prev.showRunningFooter === next.showRunningFooter &&
   prev.terminalCommandResult === next.terminalCommandResult &&
   prev.subagentResult === next.subagentResult &&

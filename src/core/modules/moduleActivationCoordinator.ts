@@ -1,3 +1,5 @@
+import { withAbort } from '../../utils/async/settle'
+
 import {
   type ModuleArtifactDescriptor,
   type ModuleArtifactReadStore,
@@ -9,7 +11,7 @@ import type {
   ModuleDeviceStateTransaction,
 } from './moduleDeviceStateStore'
 import type { ModuleArtifactPlatform } from './moduleStore'
-import { selectInitialCompatibleVersion } from './officialModuleCatalog'
+import { isHostApiCompatible } from './officialModuleCatalog'
 import type {
   ModuleIntentStateSource,
   YoloModuleDefinition,
@@ -36,6 +38,7 @@ export type ModuleActivationCoordinatorOptions = Readonly<{
       version: string,
       signal?: AbortSignal,
     ): Promise<void>
+    isActive(moduleId: string, version?: string): boolean
   }>
   activationTimeoutMs?: number
   startupTimeoutMs?: number
@@ -85,6 +88,7 @@ export type ModuleActivationResult = Readonly<{
   error?: string
 }>
 
+const ACTIVATION_ABORTED = 'Module activation was aborted'
 const EMPTY_RESULTS = Object.freeze([]) as readonly ModuleActivationResult[]
 export const DEFAULT_MODULE_ACTIVATION_TIMEOUT_MS = 30_000
 
@@ -98,36 +102,6 @@ export class ModuleActivationCoordinator {
   private disposed = false
 
   constructor(private readonly options: ModuleActivationCoordinatorOptions) {
-    if (
-      !options ||
-      typeof options.deviceStateStore?.list !== 'function' ||
-      typeof options.deviceStateStore?.runExclusive !== 'function' ||
-      (options.intentStateSource !== undefined &&
-        typeof options.intentStateSource.load !== 'function') ||
-      !options.artifactStore ||
-      (options.platform !== 'desktop' && options.platform !== 'mobile') ||
-      typeof options.hostApi !== 'string' ||
-      typeof options.loader?.load !== 'function' ||
-      typeof options.runtime?.activate !== 'function' ||
-      (options.activationTimeoutMs !== undefined &&
-        (!Number.isSafeInteger(options.activationTimeoutMs) ||
-          options.activationTimeoutMs <= 0)) ||
-      (options.startupTimeoutMs !== undefined &&
-        (!Number.isSafeInteger(options.startupTimeoutMs) ||
-          options.startupTimeoutMs <= 0)) ||
-      (options.verifiedArtifactRegistry !== undefined &&
-        (typeof options.verifiedArtifactRegistry.publish !== 'function' ||
-          typeof options.verifiedArtifactRegistry.clear !== 'function' ||
-          typeof options.verifiedArtifactRegistry.clearAll !== 'function')) ||
-      (options.materializeSkills !== undefined &&
-        typeof options.materializeSkills !== 'function') ||
-      (options.reportActivationError !== undefined &&
-        typeof options.reportActivationError !== 'function') ||
-      (options.reportSkillProjectionError !== undefined &&
-        typeof options.reportSkillProjectionError !== 'function')
-    ) {
-      throw new Error('Module activation coordinator options are invalid')
-    }
     this.activationTimeoutMs =
       options.activationTimeoutMs ?? DEFAULT_MODULE_ACTIVATION_TIMEOUT_MS
     this.startupTimeoutMs =
@@ -189,6 +163,7 @@ export class ModuleActivationCoordinator {
       const states = await withAbort(
         this.options.deviceStateStore.list(),
         controller.signal,
+        ACTIVATION_ABORTED,
       )
       if (states.length === 0) return EMPTY_RESULTS
       const results = await withAbort(
@@ -200,6 +175,7 @@ export class ModuleActivationCoordinator {
             ),
         ),
         controller.signal,
+        ACTIVATION_ABORTED,
       )
       return Object.freeze(results)
     } catch (error) {
@@ -223,6 +199,7 @@ export class ModuleActivationCoordinator {
       const intents = await withAbort(
         this.options.intentStateSource?.load([moduleId]) ?? Promise.resolve([]),
         signal,
+        ACTIVATION_ABORTED,
       )
       const matches = intents.filter((intent) => intent.id === moduleId)
       if (matches.length !== 1 || matches[0]?.state !== 'enabled') {
@@ -245,17 +222,27 @@ export class ModuleActivationCoordinator {
     transaction: ModuleDeviceStateTransaction,
     signal: AbortSignal,
   ): Promise<ModuleActivationResult> {
-    const state = await withAbort(transaction.read(), signal)
-    if (!state) return result({ moduleId, status: 'skipped' })
-    if (state.moduleId !== moduleId) {
-      throw new Error(`Module "${moduleId}" returned mismatched device state`)
-    }
-    const descriptor = snapshotDescriptor(
-      state.pending?.descriptor ?? state.active,
+    const state = await withAbort(
+      transaction.read(),
+      signal,
+      ACTIVATION_ABORTED,
     )
+    if (!state) return result({ moduleId, status: 'skipped' })
+    const descriptor = state.pending?.descriptor ?? state.active
     if (!descriptor) return result({ moduleId, status: 'skipped' })
 
-    await this.activateDescriptor(descriptor, signal)
+    // Activation is idempotent. Installing a module writes its `enabled`
+    // intent and then activates it, and that same write wakes the startup
+    // reconciler, which activates it again: two activations of one descriptor
+    // reach here, serialized by the device-state lock but both intending to
+    // start it. The second must not start it again: `activateVerifiedArtifact`
+    // opens by clearing the verified artifact of the module that is already
+    // running, and `runtime.activate` then throws "already active", leaving a
+    // live module that can no longer read its own style or worker assets
+    // until the next restart.
+    if (!this.options.runtime.isActive(moduleId, descriptor.version)) {
+      await this.activateDescriptor(descriptor, signal)
+    }
     if (state.pending) {
       await transaction.write({
         ...state,
@@ -286,31 +273,16 @@ export class ModuleActivationCoordinator {
         subtleCrypto,
       ),
       signal,
+      ACTIVATION_ABORTED,
     )
     await this.activateVerifiedArtifact(artifact, descriptor, signal)
   }
 
   private assertCompatible(descriptor: ModuleArtifactDescriptor): void {
-    const selected = selectInitialCompatibleVersion(
-      {
-        id: descriptor.id,
-        versions: [
-          {
-            version: descriptor.version,
-            hostApi: descriptor.hostApi,
-            platforms: [descriptor.platform],
-            dataSchemas: descriptor.dataSchemas,
-            manifestUrl: descriptor.manifestUrl,
-            manifest: descriptor.manifest,
-          },
-        ],
-      },
-      {
-        hostApi: this.options.hostApi,
-        platform: this.options.platform,
-      },
-    )
-    if (!selected) {
+    if (
+      descriptor.platform !== this.options.platform ||
+      !isHostApiCompatible(this.options.hostApi, descriptor.hostApi)
+    ) {
       throw new Error(
         `Module "${descriptor.id}" version "${descriptor.version}" is incompatible with the current Host API or platform`,
       )
@@ -345,6 +317,17 @@ export class ModuleActivationCoordinator {
         artifact.entryBytes,
         controller.signal,
       )
+      // Published before runtime.activate, not after: activation commits the
+      // module's contributions, which can synchronously build file-view
+      // instances for already-open leaves — module code running there must
+      // be able to read its own assets (e.g. style.css). The artifact is
+      // already fully verified at this point, and the catch below clears the
+      // registry if activation fails.
+      this.options.verifiedArtifactRegistry?.publish(
+        descriptor.id,
+        descriptor.version,
+        artifact,
+      )
       await this.options.runtime.activate(
         definition,
         descriptor.version,
@@ -353,11 +336,6 @@ export class ModuleActivationCoordinator {
       if (this.disposed || parentSignal.aborted || controller.signal.aborted) {
         throw new Error(`Module "${descriptor.id}" activation was aborted`)
       }
-      this.options.verifiedArtifactRegistry?.publish(
-        descriptor.id,
-        descriptor.version,
-        artifact,
-      )
       try {
         const projection = this.options.materializeSkills?.(
           descriptor.id,
@@ -369,7 +347,9 @@ export class ModuleActivationCoordinator {
         // settles would otherwise outlive the abort and hold the whole
         // startup open. The signal it also receives lets it stop between
         // steps; this bounds the wait even when it cannot.
-        if (projection) await withAbort(projection, controller.signal)
+        if (projection) {
+          await withAbort(projection, controller.signal, ACTIVATION_ABORTED)
+        }
       } catch (error) {
         // An aborted projection (activation timeout, plugin unload) is not a
         // defect of the module and there is no one to act on it; the next
@@ -418,56 +398,6 @@ export class ModuleActivationCoordinator {
 
 function result(value: ModuleActivationResult): ModuleActivationResult {
   return Object.freeze({ ...value })
-}
-
-function snapshotDescriptor(
-  descriptor: ModuleArtifactDescriptor | null,
-): ModuleArtifactDescriptor | null {
-  if (!descriptor) return null
-  return Object.freeze({
-    ...descriptor,
-    dataSchemas: Object.freeze(
-      Object.fromEntries(
-        Object.entries(descriptor.dataSchemas).map(([namespace, schema]) => [
-          namespace,
-          Object.freeze({ ...schema }),
-        ]),
-      ),
-    ),
-    manifest: Object.freeze({ ...descriptor.manifest }),
-  })
-}
-
-function withAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => {
-      cleanup()
-      reject(abortedError())
-    }
-    const cleanup = () => signal.removeEventListener('abort', onAbort)
-    // Attached before the aborted check so that an operation abandoned by the
-    // race is still observed: losing it later is expected, an unhandled
-    // rejection is not.
-    void operation.then(
-      (value) => {
-        cleanup()
-        resolve(value)
-      },
-      (error) => {
-        cleanup()
-        reject(error instanceof Error ? error : new Error(String(error)))
-      },
-    )
-    if (signal.aborted) {
-      reject(abortedError())
-      return
-    }
-    signal.addEventListener('abort', onAbort, { once: true })
-  })
-}
-
-function abortedError(): Error {
-  return new Error('Module activation was aborted')
 }
 
 function disposedError(): Error {

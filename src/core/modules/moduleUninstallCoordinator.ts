@@ -41,21 +41,7 @@ export class ModuleUninstallRefreshError extends Error {
 
 /** Removes only local program artifacts and their device-local installation state. */
 export class ModuleUninstallCoordinator {
-  constructor(private readonly options: ModuleUninstallCoordinatorOptions) {
-    if (
-      !options ||
-      typeof options.artifactStore?.removeVersionArtifacts !== 'function' ||
-      typeof options.deviceStateStore?.runExclusive !== 'function' ||
-      typeof options.intentStore?.get !== 'function' ||
-      typeof options.manager?.refresh !== 'function' ||
-      typeof options.runtime?.runWithModuleQuiesced !== 'function' ||
-      (options.platform !== 'desktop' && options.platform !== 'mobile') ||
-      (options.removeSkillProjection !== undefined &&
-        typeof options.removeSkillProjection !== 'function')
-    ) {
-      throw new Error('Module uninstall coordinator options are invalid')
-    }
-  }
+  constructor(private readonly options: ModuleUninstallCoordinatorOptions) {}
 
   async uninstall(moduleId: string): Promise<void> {
     assertModuleId(moduleId, 'Module id')
@@ -65,8 +51,12 @@ export class ModuleUninstallCoordinator {
         this.options.deviceStateStore.runExclusive(
           moduleId,
           async (transaction) => {
+            // Nothing may still want the module. An intent that is gone
+            // entirely counts: the device state can outlive its Vault-side
+            // declaration, and cleanup must not depend on a file that is
+            // already deleted.
             const intent = await this.options.intentStore.get(moduleId)
-            if (intent !== 'uninstalled') {
+            if (intent === 'enabled' || intent === 'disabled') {
               throw new Error(
                 `Module "${moduleId}" uninstall requires uninstalled intent`,
               )

@@ -3,6 +3,7 @@ import {
   BookOpen,
   Check,
   ChevronDown,
+  ChevronRight,
   FolderOpen,
   Maximize2,
   User,
@@ -17,6 +18,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react'
 import { createPortal } from 'react-dom'
 
@@ -28,10 +30,10 @@ import {
   getAssistantModelSelectValue,
   modelIdFromAssistantModelSelectValue,
 } from '../../../core/agent/assistant-model'
+import { ASSISTANT_INERT_BUILTIN_TOOL_NAMES } from '../../../core/agent/chat-runtime-profiles'
 import { countEnabledVisibleAssistantTools } from '../../../core/agent/tool-display-count'
 import {
   buildDefaultBuiltinCapabilityPreferences,
-  buildServerToolTokenBudgets,
   getAssistantToolApprovalMode,
   getAssistantToolDisclosureMode,
   getAssistantToolPreferences,
@@ -39,12 +41,13 @@ import {
   getEnabledAssistantToolNames,
   getExplicitlyEnabledAssistantToolNames,
   isAssistantToolEnabled,
-  resolveDefaultDisclosureModeForServer,
 } from '../../../core/agent/tool-preferences'
 import { applyDynamicToolDescriptions } from '../../../core/agent/tool-selection'
 import { getJsSandboxSettings } from '../../../core/mcp/jsSandboxSettings'
 import { getLocalFileToolServerName } from '../../../core/mcp/localFileTools'
 import { getToolName, parseToolName } from '../../../core/mcp/tool-name-utils'
+import { resolveLocalizedText } from '../../../core/modules/moduleI18n'
+import { toModuleToolSetEnablement } from '../../../core/modules/moduleToolSetRegistry'
 import { getYoloSkillsDir } from '../../../core/paths/yoloPaths'
 import {
   LiteSkillEntry,
@@ -114,8 +117,7 @@ type AgentToolView = {
    * The owning built-in capability's id, for rows built from
    * `buildBuiltinCapabilityRows` (undefined for MCP server tool rows, which
    * have no capability). Used to look up this row's approval
-   * `allowedModes` (D7, phase2-migration.md D7 item 8) instead of a
-   * hardcoded two-option literal.
+   * `allowedModes` instead of a hardcoded two-option literal.
    */
   capabilityId?: BuiltinCapabilityId
 }
@@ -165,23 +167,12 @@ function buildToolTokenPayload(tool: McpTool): Record<string, unknown> {
 }
 
 /**
- * Token estimate payload for an on-demand tool stub. Mirrors the stable
- * stub registration: name + truncated description + permissive schema.
- * Kept conservative so the estimate is unaffected by which provider is
- * actually used at request time.
+ * Token estimate payload for a deferred tool. A deferred tool is not
+ * registered in `tools` at all — it costs exactly one indented line in the
+ * system-prompt `<tool_catalog>`, so that line is what we price.
  */
-function buildDeferredToolStubTokenPayload(tool: McpTool): unknown {
-  const description = (tool.description ?? '').trim()
-  const truncatedDescription =
-    description.length > 200 ? `${description.slice(0, 197)}...` : description
-  return {
-    type: 'function',
-    function: {
-      name: tool.name,
-      description: truncatedDescription,
-      parameters: { type: 'object', properties: {} },
-    },
-  }
+function buildDeferredToolCatalogLineTokenPayload(tool: McpTool): unknown {
+  return `  ${tool.name}\n`
 }
 
 function estimateToolDefaultContextTokens(tool: McpTool): Promise<number> {
@@ -200,7 +191,7 @@ function estimateToolDefaultContextTokens(tool: McpTool): Promise<number> {
 }
 
 function estimateToolDeferredContextTokens(tool: McpTool): Promise<number> {
-  const payload = buildDeferredToolStubTokenPayload(tool)
+  const payload = buildDeferredToolCatalogLineTokenPayload(tool)
   const cacheKey = `${tool.name}:${fnv1aHash(stableStringify(payload))}`
   const cached = toolDeferredContextTokenCache.get(cacheKey)
   if (cached) return cached
@@ -210,22 +201,6 @@ function estimateToolDeferredContextTokens(tool: McpTool): Promise<number> {
   })
   toolDeferredContextTokenCache.set(cacheKey, pending)
   return pending
-}
-
-function groupToolsByServer(tools: readonly McpTool[]): Map<string, McpTool[]> {
-  const serverTools = new Map<string, McpTool[]>()
-  for (const tool of tools) {
-    let serverName: string
-    try {
-      serverName = parseToolName(tool.name).serverName
-    } catch {
-      continue
-    }
-    const bucket = serverTools.get(serverName) ?? []
-    bucket.push(tool)
-    serverTools.set(serverName, bucket)
-  }
-  return serverTools
 }
 
 function buildSkillMetadataPrompt(skill: LiteSkillEntry): string {
@@ -286,6 +261,19 @@ async function estimateSkillDefaultContextTokens({
   return count
 }
 
+const toSearchTerms = (query: string): string[] =>
+  query.trim().toLowerCase().split(/\s+/).filter(Boolean)
+
+/** Every term must appear in some field; no terms matches everything. */
+const matchesSearch = (
+  terms: readonly string[],
+  fields: readonly (string | undefined)[],
+): boolean => {
+  if (terms.length === 0) return true
+  const haystack = fields.join('\n').toLowerCase()
+  return terms.every((term) => haystack.includes(term))
+}
+
 function createNewAgent(): Assistant {
   return {
     id: crypto.randomUUID(),
@@ -294,13 +282,10 @@ function createNewAgent(): Assistant {
     systemPrompt: '',
     persona: DEFAULT_PERSONA,
     // Omit modelId so new agents follow the global chat model.
-    enableTools: true,
-    includeBuiltinTools: true,
     enabledToolNames: [],
     toolPreferences: {},
     builtinCapabilityPreferences: buildDefaultBuiltinCapabilityPreferences(),
     toolServerPreferences: {},
-    enabledSkills: [],
     skillPreferences: {},
     includeCurrentFileContent: true,
     timeContextEnabled: true,
@@ -319,16 +304,13 @@ function toDraftAgent(assistant: Assistant): Assistant {
     toolPreferences: getAssistantToolPreferences(assistant),
     builtinCapabilityPreferences: assistant.builtinCapabilityPreferences ?? {},
     toolServerPreferences: assistant.toolServerPreferences ?? {},
-    enabledSkills: assistant.enabledSkills ?? [],
     skillPreferences: assistant.skillPreferences ?? {},
-    enableTools: assistant.enableTools ?? true,
-    includeBuiltinTools: assistant.includeBuiltinTools ?? true,
     includeCurrentFileContent: assistant.includeCurrentFileContent ?? true,
     timeContextEnabled: assistant.timeContextEnabled ?? true,
   }
 }
 
-// Remote MCP tools only, post-D9: built-in tool state no longer lives in
+// Remote MCP tools only: built-in tool state no longer lives in
 // `toolPreferences` at all (see `updateDraftBuiltinCapabilityPreferences`
 // below for the built-in counterpart).
 function updateDraftToolPreferences(
@@ -384,10 +366,29 @@ export function AgentsSectionContent({
 }: AgentsSectionContentProps) {
   const plugin = usePlugin()
   const { settings, setSettings } = useSettings()
-  const { t } = useLanguage()
+  const { t, language } = useLanguage()
+
+  // Module tool sets: same registry `useSyncExternalStore` pattern used elsewhere
+  // (`Chat.tsx`'s module chat mode subscription, `useChatStreamManager.ts`).
+  // The full snapshot (not just the reduced enablement projection) is kept
+  // too — the "库内操作" tool-group rows below need each set's own label,
+  // description, category, and availability, not just its enabled tool
+  // names.
+  const moduleToolSetRegistry = plugin.getModuleToolSetRegistry()
+  const moduleToolSetSnapshot = useSyncExternalStore(
+    moduleToolSetRegistry.subscribe,
+    moduleToolSetRegistry.getSnapshot,
+  )
+  const moduleToolSetEnablement = useMemo(
+    () => toModuleToolSetEnablement(moduleToolSetSnapshot),
+    [moduleToolSetSnapshot],
+  )
+  const moduleToolSetServerNames = useMemo(
+    () => new Set(moduleToolSetSnapshot.map((entry) => entry.serverName)),
+    [moduleToolSetSnapshot],
+  )
 
   const assistants = settings.assistants || []
-  const enableToolDisclosure = settings.mcp.enableToolDisclosure
   const isDirectEditEntry = Boolean(initialAssistantId)
   const isDirectCreateEntry = Boolean(initialCreate)
   const isDirectEntry = isDirectEditEntry || isDirectCreateEntry
@@ -410,6 +411,27 @@ export function AgentsSectionContent({
   })
   const [activeTab, setActiveTab] = useState<AgentEditorTab>('profile')
   const [isSystemPromptExpanded, setIsSystemPromptExpanded] = useState(false)
+  // MCP tool groups start collapsed: a single server contributes a dozen rows,
+  // and the page's job is to show which servers this agent can use — the
+  // individual tools are a detail you open when you actually want to change
+  // one. View state only, deliberately not persisted.
+  const [expandedToolGroups, setExpandedToolGroups] = useState<
+    ReadonlySet<string>
+  >(() => new Set())
+  // Search narrows what the tools and skills tabs show; it never changes the
+  // agent, so the header counts and token estimates keep describing the whole
+  // configuration. View state only, like the expanded groups above.
+  const [toolQuery, setToolQuery] = useState('')
+  const [skillQuery, setSkillQuery] = useState('')
+  const toggleToolGroupExpanded = (groupKey: string) => {
+    setExpandedToolGroups((prev) => {
+      const next = new Set(prev)
+      if (!next.delete(groupKey)) {
+        next.add(groupKey)
+      }
+      return next
+    })
+  }
   const expandedPromptTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const systemPromptWrapperRef = useRef<HTMLDivElement | null>(null)
   const [portalContainer, setPortalContainer] = useState<HTMLElement>()
@@ -488,12 +510,18 @@ export function AgentsSectionContent({
     let mounted = true
     void plugin
       .getMcpManager()
-      .then((manager) =>
-        manager.listAvailableTools({ includeBuiltinTools: true }),
-      )
+      .then((manager) => manager.listAvailableTools())
       .then((tools) => {
         if (mounted) {
-          setAvailableTools(tools)
+          // Filtered here, at the one place the catalog enters this editor, so
+          // the rows, the group counts, the header count and the token
+          // estimate all speak about the same set of tools rather than each
+          // re-deriving which ones belong.
+          setAvailableTools(
+            tools.filter(
+              (tool) => !ASSISTANT_INERT_BUILTIN_TOOL_NAMES.has(tool.name),
+            ),
+          )
         }
       })
       .catch((error: unknown) => {
@@ -762,26 +790,31 @@ export function AgentsSectionContent({
     if (!draftAgent) {
       return
     }
-    const current = new Set(draftAgent.enabledSkills ?? [])
-    const nextPreferences = {
-      ...(draftAgent.skillPreferences ?? {}),
-    }
-
-    if (enabled) {
-      current.add(skillName)
-    } else {
-      current.delete(skillName)
-    }
-
-    nextPreferences[skillName] = {
-      ...(nextPreferences[skillName] ?? {}),
-      enabled,
-    }
-
     setDraftAgent({
       ...draftAgent,
-      enabledSkills: [...current],
-      skillPreferences: nextPreferences,
+      skillPreferences: {
+        ...(draftAgent.skillPreferences ?? {}),
+        [skillName]: {
+          ...(draftAgent.skillPreferences?.[skillName] ?? {}),
+          enabled,
+        },
+      },
+    })
+  }
+
+  const setSkillsEnabled = (skillNames: string[], enabled: boolean) => {
+    setDraftAgent((prev) => {
+      if (!prev) {
+        return prev
+      }
+      const nextPreferences = { ...(prev.skillPreferences ?? {}) }
+      for (const skillName of skillNames) {
+        nextPreferences[skillName] = {
+          ...(nextPreferences[skillName] ?? {}),
+          enabled,
+        }
+      }
+      return { ...prev, skillPreferences: nextPreferences }
     })
   }
 
@@ -797,10 +830,6 @@ export function AgentsSectionContent({
       ...(draftAgent.skillPreferences ?? {}),
       [skillName]: {
         ...(draftAgent.skillPreferences?.[skillName] ?? {}),
-        enabled:
-          draftAgent.skillPreferences?.[skillName]?.enabled ??
-          draftAgent.enabledSkills?.includes(skillName) ??
-          true,
         loadMode,
       },
     }
@@ -814,15 +843,22 @@ export function AgentsSectionContent({
   const visibleToolGroups = useMemo(() => {
     const groups = new Map<
       string,
-      { title: string; tools: AgentToolView[]; isBuiltin: boolean }
+      {
+        title: string
+        tools: AgentToolView[]
+        /**
+         * A capability group — the host's own rows and any module-contributed
+         * ones, which sit in the same group as the host capabilities of their
+         * category. False only for a user-configured MCP server, which is the
+         * one thing here that folds and carries per-server controls.
+         */
+        isBuiltin: boolean
+      }
     >()
-    const includeBuiltinTools = draftAgent?.includeBuiltinTools !== false
     // Which built-in tool *short* names are actually present in this
     // request's tool catalog (`availableTools` — respects runtime
     // availability, unlike the global settings pages' `getLocalFileTools()`;
     // see `builtinCapabilityRows.ts`'s doc comment on that asymmetry).
-    // Populated only when built-in tools are included at all, matching the
-    // pre-D7 early-return.
     const builtinToolNamesPresent = new Set<string>()
 
     availableTools.forEach((tool) => {
@@ -840,9 +876,16 @@ export function AgentsSectionContent({
 
       const isBuiltin = serverName === localFsServerName
       if (isBuiltin) {
-        if (includeBuiltinTools) {
-          builtinToolNamesPresent.add(toolName)
-        }
+        builtinToolNamesPresent.add(toolName)
+        return
+      }
+
+      // Module tool sets get their own dedicated group below, built from the
+      // registry snapshot directly rather than from `availableTools` — that
+      // is what lets an `unavailable` set still render a row (its tools
+      // never reach `availableTools`, since the coordinator never registers
+      // them as an in-process server in that state).
+      if (moduleToolSetServerNames.has(serverName)) {
         return
       }
 
@@ -861,39 +904,78 @@ export function AgentsSectionContent({
       groups.set(key, group)
     })
 
-    if (includeBuiltinTools) {
-      const rows = buildBuiltinCapabilityRows({
-        toolOptions: settings.mcp.builtinCapabilityOptions,
-        t,
-      })
-      for (const row of rows) {
-        const presentMembers = row.memberToolNames.filter((name) =>
-          builtinToolNamesPresent.has(name),
-        )
-        if (presentMembers.length === 0) {
-          continue
-        }
-
-        const key = `__builtin:${row.category}`
-        const title = t(
-          BUILTIN_TOOL_CATEGORY_I18N[row.category].key,
-          BUILTIN_TOOL_CATEGORY_I18N[row.category].fallback,
-        )
-        const group = groups.get(key) ?? { title, tools: [], isBuiltin: true }
-        group.tools.push({
-          // Only used as a React list key — any present member's own FQN is
-          // fine, there is no group-vs-single-tool distinction to preserve
-          // post-D9 (decision 12: no virtual tool names anywhere).
-          fullName: getToolName(localFsServerName, presentMembers[0]),
-          toggleTargets: presentMembers.map((name) =>
-            getToolName(localFsServerName, name),
-          ),
-          displayName: row.label,
-          description: row.description,
-          capabilityId: row.id,
-        })
-        groups.set(key, group)
+    const rows = buildBuiltinCapabilityRows({
+      toolOptions: settings.mcp.builtinCapabilityOptions,
+      t,
+    })
+    for (const row of rows) {
+      const presentMembers = row.memberToolNames.filter((name) =>
+        builtinToolNamesPresent.has(name),
+      )
+      if (presentMembers.length === 0) {
+        continue
       }
+
+      const key = `__builtin:${row.category}`
+      const title = t(
+        BUILTIN_TOOL_CATEGORY_I18N[row.category].key,
+        BUILTIN_TOOL_CATEGORY_I18N[row.category].fallback,
+      )
+      const group = groups.get(key) ?? { title, tools: [], isBuiltin: true }
+      group.tools.push({
+        // Only used as a React list key — any present member's own FQN is
+        // fine, there is no group-vs-single-tool distinction to preserve
+        // (no virtual tool names anywhere).
+        fullName: getToolName(localFsServerName, presentMembers[0]),
+        toggleTargets: presentMembers.map((name) =>
+          getToolName(localFsServerName, name),
+        ),
+        displayName: row.label,
+        description: row.description,
+        capabilityId: row.id,
+      })
+      groups.set(key, group)
+    }
+
+    // Module tool sets: one capability row inside their own category's
+    // group, which is what a module contributes — a capability, sitting beside
+    // the host's own, differing only in where it came from. They used to be a
+    // group apiece, which put them through the MCP branch below (collapsed,
+    // with a per-server disclosure control) and made a first-party capability
+    // read like a server the user had wired up.
+    //
+    // Set members are one row, not one row each, for the same reason
+    // `fs_edit`'s are: what the user grants is the capability. `create_board`
+    // and `edit_board` are how it is implemented.
+    //
+    // An `unavailable` set is skipped rather than shown with its reason: the
+    // status is only ever reached by a registration throwing
+    // (`mcpCoordinator.ts`), and its reason is that exception's message —
+    // already logged, and nothing the reader of this panel can act on. A
+    // module that is absent or disabled never reaches the registry at all, so
+    // "the module is not here" is already spelled as no row.
+    for (const entry of moduleToolSetSnapshot) {
+      if (entry.availability.status !== 'available') continue
+      if (entry.set.tools.length === 0) continue
+      const key = `__builtin:${entry.set.category}`
+      const title = t(
+        BUILTIN_TOOL_CATEGORY_I18N[entry.set.category].key,
+        BUILTIN_TOOL_CATEGORY_I18N[entry.set.category].fallback,
+      )
+      const group = groups.get(key) ?? { title, tools: [], isBuiltin: true }
+      const targets = entry.set.tools.map((tool) =>
+        getToolName(entry.serverName, tool.name),
+      )
+      group.tools.push({
+        // React list key only, like the builtin rows above.
+        fullName: targets[0],
+        toggleTargets: targets,
+        displayName: resolveLocalizedText(entry.set.label, language),
+        description: entry.set.description
+          ? resolveLocalizedText(entry.set.description, language)
+          : '',
+      })
+      groups.set(key, group)
     }
 
     const builtinCategoryRank = new Map<string, number>(
@@ -913,8 +995,10 @@ export function AgentsSectionContent({
       .map(([key, value]) => ({ key, ...value }))
   }, [
     availableTools,
-    draftAgent?.includeBuiltinTools,
+    language,
     localFsServerName,
+    moduleToolSetServerNames,
+    moduleToolSetSnapshot,
     settings.mcp.builtinCapabilityOptions,
     t,
   ])
@@ -925,11 +1009,35 @@ export function AgentsSectionContent({
   )
 
   const enabledVisibleToolsCount = useMemo(() => {
-    return countEnabledVisibleAssistantTools(draftAgent, availableTools)
-  }, [availableTools, draftAgent])
+    return countEnabledVisibleAssistantTools(
+      draftAgent,
+      availableTools,
+      moduleToolSetEnablement,
+    )
+  }, [availableTools, draftAgent, moduleToolSetEnablement])
+
+  const toolQueryTerms = toSearchTerms(toolQuery)
+  const isSearchingTools = toolQueryTerms.length > 0
+  // A group whose own title matches keeps all its tools, so searching a
+  // server's name shows that server whole.
+  const shownToolGroups = visibleToolGroups.flatMap((group) => {
+    if (!isSearchingTools || matchesSearch(toolQueryTerms, [group.title])) {
+      return [{ group, shownTools: group.tools }]
+    }
+    const shownTools = group.tools.filter((tool) =>
+      matchesSearch(toolQueryTerms, [
+        tool.displayName,
+        tool.description,
+        ...tool.toggleTargets,
+      ]),
+    )
+    return shownTools.length > 0 ? [{ group, shownTools }] : []
+  })
 
   const groupEnabledCounts = useMemo(() => {
-    const enabled = new Set(getEnabledAssistantToolNames(draftAgent))
+    const enabled = new Set(
+      getEnabledAssistantToolNames(draftAgent, moduleToolSetEnablement),
+    )
     const counts = new Map<string, number>()
     for (const group of visibleToolGroups) {
       counts.set(
@@ -940,7 +1048,7 @@ export function AgentsSectionContent({
       )
     }
     return counts
-  }, [draftAgent, visibleToolGroups])
+  }, [draftAgent, moduleToolSetEnablement, visibleToolGroups])
 
   // Estimated tokens are scoped to a specific agent identity. Stale values
   // from a previous agent must NOT leak across an agent switch (would mislead
@@ -950,50 +1058,34 @@ export function AgentsSectionContent({
     agentId: string | null
     value: number | null
     perTool: Map<string, number>
-    serverToolTokenBudgets: Map<string, number>
   }>({
     agentId: null,
     value: null,
     perTool: new Map(),
-    serverToolTokenBudgets: new Map(),
   })
 
   useEffect(() => {
     let cancelled = false
     const currentAgentId = draftAgent?.id ?? null
 
-    if (!draftAgent?.enableTools) {
+    if (!draftAgent) {
       setEstimatedToolContextTokens({
         agentId: currentAgentId,
         value: 0,
         perTool: new Map(),
-        serverToolTokenBudgets: new Map(),
       })
       return
     }
 
-    const eligibleTools = availableTools.filter((tool) => {
-      let serverName = localFsServerName
-      try {
-        serverName = parseToolName(tool.name).serverName
-      } catch {
-        serverName = localFsServerName
-      }
-      if (
-        serverName === localFsServerName &&
-        draftAgent.includeBuiltinTools === false
-      ) {
-        return false
-      }
-      return isAssistantToolEnabled(draftAgent, tool.name)
-    })
+    const eligibleTools = availableTools.filter((tool) =>
+      isAssistantToolEnabled(draftAgent, tool.name, moduleToolSetEnablement),
+    )
 
     if (eligibleTools.length === 0) {
       setEstimatedToolContextTokens({
         agentId: currentAgentId,
         value: 0,
         perTool: new Map(),
-        serverToolTokenBudgets: new Map(),
       })
       return
     }
@@ -1007,7 +1099,6 @@ export function AgentsSectionContent({
             agentId: currentAgentId,
             value: null,
             perTool: new Map(),
-            serverToolTokenBudgets: new Map(),
           },
     )
 
@@ -1020,66 +1111,38 @@ export function AgentsSectionContent({
       settings,
     })
 
-    const automaticBudgetTools = enableToolDisclosure
-      ? resolvedTools.filter((tool) => {
-          try {
-            const { serverName } = parseToolName(tool.name)
-            return (
-              serverName !== localFsServerName &&
-              draftAgent.toolServerPreferences?.[serverName]?.disclosureMode ===
-                undefined
-            )
-          } catch {
-            return false
-          }
-        })
-      : []
-
-    void buildServerToolTokenBudgets(
-      groupToolsByServer(automaticBudgetTools),
-      estimateJsonTokens,
-    ).then(async (serverToolTokenBudgets) => {
+    void (async () => {
       const entries = await Promise.all(
         resolvedTools.map(async (tool) => {
           const disclosureMode = getAssistantToolDisclosureMode(
             draftAgent,
             tool.name,
-            { enableToolDisclosure, serverToolTokenBudgets },
           )
-          if (disclosureMode === 'on_demand') {
-            const stubCount = await estimateToolDeferredContextTokens(tool)
-            return [tool.name, stubCount] as const
-          }
           return [
             tool.name,
-            await estimateToolDefaultContextTokens(tool),
+            disclosureMode === 'on_demand'
+              ? await estimateToolDeferredContextTokens(tool)
+              : await estimateToolDefaultContextTokens(tool),
           ] as const
         }),
       )
       if (cancelled) return
-      const perTool = new Map(entries)
       setEstimatedToolContextTokens({
         agentId: currentAgentId,
         value: entries.reduce((sum, [, count]) => sum + count, 0),
-        perTool,
-        serverToolTokenBudgets,
+        perTool: new Map(entries),
       })
-    })
+    })()
 
     return () => {
       cancelled = true
     }
-  }, [
-    availableTools,
-    draftAgent,
-    draftAgent?.enableTools,
-    draftAgent?.includeBuiltinTools,
-    localFsServerName,
-    enableToolDisclosure,
-  ])
+  }, [availableTools, draftAgent, moduleToolSetEnablement])
 
   const groupEnabledTokens = useMemo(() => {
-    const enabledNames = new Set(getEnabledAssistantToolNames(draftAgent))
+    const enabledNames = new Set(
+      getEnabledAssistantToolNames(draftAgent, moduleToolSetEnablement),
+    )
     const perTool = estimatedToolContextTokens.perTool
     const result = new Map<string, number>()
     for (const group of visibleToolGroups) {
@@ -1094,7 +1157,12 @@ export function AgentsSectionContent({
       result.set(group.key, sum)
     }
     return result
-  }, [draftAgent, estimatedToolContextTokens.perTool, visibleToolGroups])
+  }, [
+    draftAgent,
+    estimatedToolContextTokens.perTool,
+    moduleToolSetEnablement,
+    visibleToolGroups,
+  ])
 
   const skillEntries = useLiteSkillEntries(app, { settings })
 
@@ -1137,16 +1205,22 @@ export function AgentsSectionContent({
       perSkill: new Map(),
     })
 
-  const alwaysSkillRows = useMemo(
-    () =>
-      skillRows.filter((skill) => skill.enabled && skill.loadMode === 'always'),
-    [skillRows],
+  const skillQueryTerms = toSearchTerms(skillQuery)
+  const shownSkillRows = skillRows.filter((skill) =>
+    matchesSearch(skillQueryTerms, [
+      humanizeSkillName(skill.name),
+      skill.name,
+      skill.description,
+    ]),
   )
-  const lazySkillRows = useMemo(
-    () =>
-      skillRows.filter((skill) => skill.enabled && skill.loadMode === 'lazy'),
-    [skillRows],
-  )
+
+  const enabledSkillCount = skillRows.filter((skill) => skill.enabled).length
+  const allSkillsEnabled = enabledSkillCount === skillRows.length
+  // Full injection is the one load mode that costs every request, so it is
+  // the only one worth surfacing in the header.
+  const alwaysSkillCount = skillRows.filter(
+    (skill) => skill.enabled && skill.loadMode === 'always',
+  ).length
 
   useEffect(() => {
     let cancelled = false
@@ -1212,8 +1286,7 @@ export function AgentsSectionContent({
     ],
     [t],
   )
-  // D7 (phase2-migration.md D7 item 8): every built-in row's approval
-  // dropdown offers exactly its own capability's `approval.allowedModes`.
+  // Every built-in row's approval dropdown offers exactly its own capability's `approval.allowedModes`.
   // This replaces both the hardcoded two-item literal that all non-bash rows
   // used to share and the separate bash-only three-item memo — `vault_shell`
   // is no longer a special case in this file, it is simply the one
@@ -1223,7 +1296,7 @@ export function AgentsSectionContent({
   //
   // Display order stays require -> dangerous -> full rather than following
   // each capability's own `allowedModes` declaration order, since reordering
-  // the dropdown is not an approved visible change (master.md §5).
+  // the dropdown is not an approved visible change.
   const capabilityApprovalOptionsById = useMemo(() => {
     const labelFor = (mode: AssistantToolApprovalMode): string => {
       switch (mode) {
@@ -1443,6 +1516,9 @@ export function AgentsSectionContent({
                 <ObsidianSetting className="yolo-settings-textarea">
                   <ObsidianTextArea
                     value={draftAgent.systemPrompt}
+                    placeholder={t(
+                      'settings.agent.editorSystemPromptPlaceholder',
+                    )}
                     onChange={(value) =>
                       setDraftAgent({ ...draftAgent, systemPrompt: value })
                     }
@@ -1505,6 +1581,9 @@ export function AgentsSectionContent({
                       <textarea
                         ref={expandedPromptTextareaRef}
                         className="yolo-agent-system-prompt-overlay-textarea"
+                        placeholder={t(
+                          'settings.agent.editorSystemPromptPlaceholder',
+                        )}
                         value={draftAgent.systemPrompt}
                         onChange={(e) =>
                           setDraftAgent({
@@ -1577,47 +1656,7 @@ export function AgentsSectionContent({
 
           {activeTab === 'tools' && (
             <div className="yolo-agent-editor-body">
-              <ObsidianSetting
-                name={t('settings.agent.editorEnableTools', 'Enable tools')}
-                desc={t(
-                  'settings.agent.editorEnableToolsDesc',
-                  'Allow this agent to call tools',
-                )}
-              >
-                <ObsidianToggle
-                  value={Boolean(draftAgent.enableTools)}
-                  onChange={(value) => {
-                    setDraftAgent({
-                      ...draftAgent,
-                      enableTools: value,
-                    })
-                  }}
-                />
-              </ObsidianSetting>
-              <ObsidianSetting
-                name={t(
-                  'settings.agent.editorIncludeBuiltinTools',
-                  'Include built-in tools',
-                )}
-                desc={t(
-                  'settings.agent.editorIncludeBuiltinToolsDesc',
-                  'Allow local vault file tools for this agent',
-                )}
-              >
-                <ObsidianToggle
-                  value={Boolean(draftAgent.includeBuiltinTools)}
-                  onChange={(value) => {
-                    setDraftAgent((prev) =>
-                      prev ? { ...prev, includeBuiltinTools: value } : prev,
-                    )
-                  }}
-                />
-              </ObsidianSetting>
-              <div
-                className={`yolo-agent-tools-panel${
-                  draftAgent.enableTools ? '' : ' is-disabled'
-                }`}
-              >
+              <div className="yolo-agent-tools-panel">
                 <div className="yolo-agent-tools-panel-head">
                   <div className="yolo-agent-tools-panel-title-row">
                     <div className="yolo-agent-tools-panel-title">
@@ -1634,48 +1673,44 @@ export function AgentsSectionContent({
                         )}
                       </div>
                     )}
+                    <div className="yolo-agent-tools-panel-estimate">
+                      {`${enabledVisibleToolsCount} / ${visibleToolsCount} ${t(
+                        'settings.agent.toolsActive',
+                        'active',
+                      )}`}
+                    </div>
                   </div>
-                  <div className="yolo-agent-tools-panel-count">
-                    {`${enabledVisibleToolsCount} / ${visibleToolsCount} ${t(
-                      'settings.agent.toolsActive',
-                      'active',
-                    )}`}
-                  </div>
+                  {visibleToolsCount > 0 && (
+                    <div className="yolo-agent-panel-search">
+                      <ObsidianTextInput
+                        value={toolQuery}
+                        placeholder={t(
+                          'settings.agent.searchTools',
+                          'Search tools…',
+                        )}
+                        onChange={setToolQuery}
+                      />
+                    </div>
+                  )}
                 </div>
 
-                {visibleToolGroups.map((group) => {
+                {shownToolGroups.map(({ group, shownTools }) => {
                   const groupEnabledCount =
                     groupEnabledCounts.get(group.key) ?? 0
                   const allGroupToolsEnabled =
                     group.tools.length > 0 &&
                     groupEnabledCount === group.tools.length
-                  const groupToggleTargets = group.tools.flatMap(
-                    (tool) => tool.toggleTargets,
-                  )
                   const showServerDisclosure =
-                    !group.isBuiltin &&
-                    enableToolDisclosure &&
-                    group.tools.length > 0
-                  const disclosureSelectionValue = showServerDisclosure
-                    ? (draftAgent.toolServerPreferences?.[group.key]
-                        ?.disclosureMode ?? 'auto')
-                    : 'auto'
-                  const autoDisclosureMode = (() => {
-                    const firstTarget = groupToggleTargets[0]
-                    if (!firstTarget) return null
-                    try {
-                      const { serverName } = parseToolName(firstTarget)
-                      const tokenBudget =
-                        estimatedToolContextTokens.serverToolTokenBudgets.get(
-                          serverName,
-                        )
-                      return tokenBudget === undefined
-                        ? null
-                        : resolveDefaultDisclosureModeForServer(tokenBudget)
-                    } catch {
-                      return null
-                    }
-                  })()
+                    !group.isBuiltin && group.tools.length > 0
+                  // No third "auto" choice: it used to pick a mode from the
+                  // server's schema token cost, and once everything that is
+                  // not a host built-in defers unconditionally it resolved to
+                  // `on_demand` every time — a label for a decision nobody was
+                  // making any more. Absence of an explicit preference is the
+                  // default, and the default is `on_demand`.
+                  const disclosureSelectionValue: AssistantToolDisclosureMode =
+                    draftAgent.toolServerPreferences?.[group.key]
+                      ?.disclosureMode ?? 'on_demand'
                   const disclosureModeLabel = (
                     mode: AssistantToolDisclosureMode,
                   ) =>
@@ -1685,22 +1720,9 @@ export function AgentsSectionContent({
                           'settings.agent.toolDisclosureAlways',
                           'Always loaded',
                         )
-                  const autoDisclosureLabel = `${t(
-                    'settings.agent.toolDisclosureAuto',
-                    'Auto',
-                  )}${
-                    autoDisclosureMode
-                      ? `: ${disclosureModeLabel(autoDisclosureMode)}`
-                      : ''
-                  }`
-                  const autoDisclosureOptionLabel = t(
-                    'settings.agent.toolDisclosureAutoSelect',
-                    'Auto select',
+                  const serverDisclosureLabel = disclosureModeLabel(
+                    disclosureSelectionValue,
                   )
-                  const serverDisclosureLabel =
-                    disclosureSelectionValue === 'auto'
-                      ? autoDisclosureLabel
-                      : disclosureModeLabel(disclosureSelectionValue)
                   const showServerApproval = !group.isBuiltin
                   const serverApprovalMode: AssistantToolApprovalMode =
                     draftAgent.toolServerPreferences?.[group.key]
@@ -1709,9 +1731,19 @@ export function AgentsSectionContent({
                     !group.isBuiltin &&
                     group.tools.length > 0 &&
                     groupEnabledCount === 0
+                  // Built-in capability rows are the panel's primary content
+                  // and stay put; only MCP servers fold.
+                  // A search shows every group it matched opened, without
+                  // touching what the user had folded.
+                  const isGroupExpanded =
+                    group.isBuiltin ||
+                    isSearchingTools ||
+                    expandedToolGroups.has(group.key)
                   const groupClassName = [
                     'yolo-agent-tool-group',
                     !group.isBuiltin ? 'yolo-agent-tool-group--mcp' : null,
+                    groupFullyDisabled ? 'is-disabled' : null,
+                    !group.isBuiltin && isGroupExpanded ? 'is-expanded' : null,
                   ]
                     .filter(Boolean)
                     .join(' ')
@@ -1719,7 +1751,25 @@ export function AgentsSectionContent({
                     <div key={group.key} className={groupClassName}>
                       <div className="yolo-agent-tool-group-title">
                         <span className="yolo-agent-tool-group-title-main">
-                          <span>{group.title}</span>
+                          {group.isBuiltin ? (
+                            <span className="yolo-agent-tool-group-name">
+                              {group.title}
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              className="yolo-agent-tool-group-name yolo-agent-tool-group-name--toggle"
+                              aria-expanded={isGroupExpanded}
+                              onClick={() => toggleToolGroupExpanded(group.key)}
+                            >
+                              <ChevronRight
+                                size={12}
+                                aria-hidden="true"
+                                className="yolo-agent-tool-group-chevron"
+                              />
+                              <span>{group.title}</span>
+                            </button>
+                          )}
                           {estimatedToolContextTokens.perTool.size > 0 && (
                             <span className="yolo-agent-tool-group-tokens">
                               {t(
@@ -1760,37 +1810,24 @@ export function AgentsSectionContent({
                                     className="yolo-simple-select__list"
                                     value={disclosureSelectionValue}
                                     onValueChange={(nextValue) => {
-                                      if (nextValue === 'auto') {
+                                      if (nextValue === 'always') {
+                                        setServerDisclosureMode(
+                                          group.key,
+                                          'always',
+                                        )
+                                        return
+                                      }
+                                      // Picking the default stores nothing, so
+                                      // "no preference" stays the one way to
+                                      // spell it.
+                                      if (nextValue === 'on_demand') {
                                         setServerDisclosureMode(
                                           group.key,
                                           undefined,
                                         )
-                                        return
-                                      }
-                                      if (
-                                        nextValue === 'always' ||
-                                        nextValue === 'on_demand'
-                                      ) {
-                                        setServerDisclosureMode(
-                                          group.key,
-                                          nextValue,
-                                        )
                                       }
                                     }}
                                   >
-                                    <DropdownMenu.RadioItem
-                                      className="yolo-simple-select__item"
-                                      value="auto"
-                                    >
-                                      <div className="yolo-simple-select__item-text">
-                                        <div className="yolo-simple-select__item-label">
-                                          {autoDisclosureOptionLabel}
-                                        </div>
-                                      </div>
-                                      <DropdownMenu.ItemIndicator className="yolo-simple-select__item-indicator">
-                                        <Check size={12} />
-                                      </DropdownMenu.ItemIndicator>
-                                    </DropdownMenu.RadioItem>
                                     <DropdownMenu.RadioItem
                                       className="yolo-simple-select__item"
                                       value="always"
@@ -1899,7 +1936,7 @@ export function AgentsSectionContent({
                               'active',
                             )}`}
                           </span>
-                          {group.tools.length > 0 && (
+                          {group.tools.length > 0 && !isSearchingTools && (
                             <button
                               type="button"
                               className="yolo-agent-tool-group-bulk-toggle"
@@ -1920,12 +1957,16 @@ export function AgentsSectionContent({
                           )}
                         </span>
                       </div>
-                      {!groupFullyDisabled && (
+                      {isGroupExpanded && (
                         <div className="yolo-agent-tool-list">
-                          {group.tools.map((tool) => {
+                          {shownTools.map((tool) => {
                             const selected = tool.toggleTargets.every(
                               (target) =>
-                                isAssistantToolEnabled(draftAgent, target),
+                                isAssistantToolEnabled(
+                                  draftAgent,
+                                  target,
+                                  moduleToolSetEnablement,
+                                ),
                             )
                             // Built-in rows offer their own capability's
                             // allowed tiers; MCP server tool rows have no
@@ -1939,11 +1980,11 @@ export function AgentsSectionContent({
                             // Only a capability that allows `dangerous_only`
                             // can display it — today that is `vault_shell`
                             // alone, but this reads the declaration rather
-                            // than naming bash (phase2-migration.md D7 item 8).
+                            // than naming bash.
                             const allowsDangerousOnly = approvalOptions.some(
                               (option) => option.value === 'dangerous_only',
                             )
-                            const approvalMode = !group.isBuiltin
+                            const approvalMode = !tool.capabilityId
                               ? 'require_approval'
                               : tool.toggleTargets.every(
                                     (target) =>
@@ -1977,7 +2018,13 @@ export function AgentsSectionContent({
                                   </div>
                                 </div>
                                 <div className="yolo-agent-tool-controls">
-                                  {group.isBuiltin && selected && (
+                                  {/* An approval tier belongs to a capability,
+                                      so a row without one has no tier to show:
+                                      an MCP server tool (governed per server),
+                                      and a module tool set, which has no
+                                      approval layer at all (safety rides on
+                                      its writes going through undo). */}
+                                  {tool.capabilityId && selected && (
                                     <>
                                       <div className="yolo-agent-tool-select">
                                         <SimpleSelect
@@ -2011,10 +2058,16 @@ export function AgentsSectionContent({
                   )
                 })}
 
-                {visibleToolsCount === 0 && (
+                {visibleToolsCount === 0 ? (
                   <div className="yolo-agent-tools-empty">
                     {t('settings.agent.noTools', 'No tools available')}
                   </div>
+                ) : (
+                  shownToolGroups.length === 0 && (
+                    <div className="yolo-agent-tools-empty">
+                      {t('settings.agent.noMatchingTools', 'No matching tools')}
+                    </div>
+                  )
                 )}
               </div>
             </div>
@@ -2039,36 +2092,53 @@ export function AgentsSectionContent({
                         )}
                       </div>
                     )}
+                    <div className="yolo-agent-tools-panel-estimate">
+                      {`${enabledSkillCount} / ${skillRows.length} ${t(
+                        'settings.agent.toolsActive',
+                        'active',
+                      )}`}
+                      {alwaysSkillCount > 0 &&
+                        ` · ${t(
+                          'settings.agent.skillLoadAlways',
+                          'Full inject',
+                        )} ${alwaysSkillCount}`}
+                    </div>
                   </div>
-                  <div className="yolo-agent-tools-panel-count">
-                    {t(
-                      'settings.agent.editorSkillsCountWithEnabled',
-                      '{count} skills (enabled {enabled})',
-                    )
-                      .replace('{count}', String(skillRows.length))
-                      .replace(
-                        '{enabled}',
-                        String(
-                          skillRows.filter((skill) => skill.enabled).length,
-                        ),
+                  {skillRows.length > 0 && (
+                    <div className="yolo-agent-tools-panel-actions">
+                      {skillQueryTerms.length === 0 && (
+                        <button
+                          type="button"
+                          className="yolo-agent-tool-group-bulk-toggle"
+                          onClick={() =>
+                            setSkillsEnabled(
+                              skillRows.map((skill) => skill.name),
+                              !allSkillsEnabled,
+                            )
+                          }
+                        >
+                          {allSkillsEnabled
+                            ? t('settings.agent.disableAllTools', 'Disable all')
+                            : t('settings.agent.enableAllTools', 'Enable all')}
+                        </button>
                       )}
-                  </div>
+                      <div className="yolo-agent-panel-search">
+                        <ObsidianTextInput
+                          value={skillQuery}
+                          placeholder={t(
+                            'settings.agent.searchSkills',
+                            'Search skills…',
+                          )}
+                          onChange={setSkillQuery}
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
 
-                <div className="yolo-agent-skill-summary-row">
-                  <span className="yolo-agent-chip">
-                    {t('settings.agent.skillLoadAlways', 'Full inject')}:{' '}
-                    {alwaysSkillRows.length}
-                  </span>
-                  <span className="yolo-agent-chip">
-                    {t('settings.agent.skillLoadLazy', 'On demand')}:{' '}
-                    {lazySkillRows.length}
-                  </span>
-                </div>
-
-                {skillRows.length > 0 ? (
+                {shownSkillRows.length > 0 ? (
                   <div className="yolo-agent-tool-list">
-                    {skillRows.map((skill) => {
+                    {shownSkillRows.map((skill) => {
                       return (
                         <div key={skill.name} className="yolo-agent-tool-row">
                           <div className="yolo-agent-tool-main">
@@ -2136,6 +2206,10 @@ export function AgentsSectionContent({
                         </div>
                       )
                     })}
+                  </div>
+                ) : skillRows.length > 0 ? (
+                  <div className="yolo-agent-tools-empty">
+                    {t('settings.agent.noMatchingSkills', 'No matching skills')}
                   </div>
                 ) : (
                   <div className="yolo-agent-tools-empty">

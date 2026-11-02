@@ -4,7 +4,6 @@ import {
   AssistantToolDisclosureMode,
   AssistantToolPreference,
 } from '../../types/assistant.types'
-import type { McpTool } from '../../types/mcp.types'
 import {
   LOAD_TOOL_SCHEMAS_LOCAL_TOOL_NAME,
   USER_FACING_LOCAL_TOOL_SHORT_NAMES,
@@ -12,7 +11,6 @@ import {
 } from '../mcp/localFileTools'
 import { McpManager } from '../mcp/mcpManager'
 import { parseToolName } from '../mcp/tool-name-utils'
-import { getMcpToolSchemaTokenCost } from '../mcp/toolCatalogTokenCache'
 import {
   getCapability,
   getCapabilityForTool,
@@ -23,49 +21,6 @@ export const DEFAULT_ASSISTANT_TOOL_APPROVAL_MODE: AssistantToolApprovalMode =
   'require_approval'
 export const DEFAULT_ASSISTANT_TOOL_DISCLOSURE_MODE: AssistantToolDisclosureMode =
   'always'
-export const SERVER_TOOL_DISCLOSURE_AUTO_TOKEN_THRESHOLD = 2000
-
-export const resolveDefaultDisclosureModeForServer = (
-  serverTokenBudget: number | undefined,
-): AssistantToolDisclosureMode => {
-  if (
-    typeof serverTokenBudget !== 'number' ||
-    !Number.isFinite(serverTokenBudget)
-  ) {
-    return DEFAULT_ASSISTANT_TOOL_DISCLOSURE_MODE
-  }
-  return serverTokenBudget >= SERVER_TOOL_DISCLOSURE_AUTO_TOKEN_THRESHOLD
-    ? 'on_demand'
-    : 'always'
-}
-
-export const buildServerToolTokenBudgets = async (
-  serverToolsMap: ReadonlyMap<string, readonly McpTool[]>,
-  estimateJsonTokens: (value: unknown) => Promise<number>,
-): Promise<Map<string, number>> => {
-  const budgets = new Map<string, number>()
-  const localServerName = getLocalFileToolServerName()
-
-  await Promise.all(
-    [...serverToolsMap.entries()].map(async ([serverName, tools]) => {
-      if (serverName === localServerName || tools.length === 0) {
-        return
-      }
-      const costs = await Promise.all(
-        tools.map((tool) =>
-          getMcpToolSchemaTokenCost(tool, estimateJsonTokens),
-        ),
-      )
-      budgets.set(
-        serverName,
-        costs.reduce((sum, cost) => sum + cost, 0),
-      )
-    }),
-  )
-
-  return budgets
-}
-
 /**
  * Full set of user-facing built-in tool FQNs that default to on. Used by the
  * settings migration and `getDefaultEnabledForTool` to seed `toolPreferences`
@@ -73,8 +28,7 @@ export const buildServerToolTokenBudgets = async (
  * `toolPreferences` is the single source of truth for per-agent state, and
  * the migration is the only path that writes defaults into it.
  *
- * D7 (docs/plans/2026-08-15-tool-registry/phase2-migration.md D7 item 5):
- * "default off" used to be a hand-maintained deny-list
+ * "Default off" used to be a hand-maintained deny-list
  * (`BUILTIN_DEFAULT_DISABLED_TOOL_SHORT_NAMES`) that had to be kept in sync
  * with each capability's own `defaultEnabled` by inspection. It is now read
  * directly off the owning capability via `getCapabilityForTool` — every
@@ -94,15 +48,6 @@ export const BUILTIN_DEFAULT_ENABLED_TOOL_FQNS: readonly string[] =
     (shortName) =>
       `${getLocalFileToolServerName()}${McpManager.TOOL_NAME_DELIMITER}${shortName}`,
   )
-
-const isLocalFileToolFqn = (toolName: string): boolean => {
-  try {
-    const { serverName } = parseToolName(toolName)
-    return serverName === getLocalFileToolServerName()
-  } catch {
-    return false
-  }
-}
 
 /**
  * The default `enabled` value that the **settings migration** writes for a
@@ -130,17 +75,15 @@ export const getDefaultEnabledForTool = (toolName: string): boolean => {
 }
 
 /**
- * Default disclosure mode for a tool when the user has not customized it.
+ * Fallback disclosure mode for a tool name that does not parse into a server
+ * and a tool.
  *
- * Built-in `yolo_local__*` tools default to `always`: they total ~3.9K tokens
- * across ~13 tools, stub-izing them saves little and only adds a first-use
- * latency hit. Third-party MCP server tools also fall back to `always` here;
- * runtime callers that have the current server token budget pass it through
- * `getAssistantToolDisclosureMode` for automatic server-level selection.
+ * `always`, because a name we cannot parse cannot be addressed through the
+ * deferred path either: `<tool_catalog>` lists fully-qualified names, so a
+ * tool that has none would be listed nowhere and reachable by nothing.
  *
- * `load_tool_schemas` is a protocol-only tool injected by `selectAllowedTools`
- * when on-demand disclosure is in use; it is not a user-configurable surface
- * and never appears in `toolPreferences`.
+ * The ordinary paths never reach here — a host built-in resolves to `always`
+ * and everything else to `on_demand`, both in `getAssistantToolDisclosureMode`.
  */
 export const getDefaultDisclosureModeForTool = (
   toolName: string,
@@ -157,13 +100,13 @@ export const getDefaultDisclosureModeForTool = (
 }
 
 /**
- * D7 (phase2-migration.md D7 items 5-7): this used to consult three
+ * This used to consult three
  * independent side tables (`FULL_ACCESS_LOCAL_TOOLS`,
  * `REQUIRE_APPROVAL_LOCAL_TOOLS`, plus a bash-specific `if`) that each had to
  * be kept in sync with the capability model by hand. It now reads a single
  * fact — the owning capability's `approval.defaultMode` — off the registry,
  * via {@link getCapabilityForTool}. This is also where bash's old
- * `parsedToolName === BASH_TOOL_NAME` special case (D6 batch 7) folds away:
+ * `parsedToolName === BASH_TOOL_NAME` special case folds away:
  * `bash` is `vault_shell`'s only member, so the generic lookup already
  * returns `vault_shell`'s `dangerous_only` default for it — no separate
  * branch needed.
@@ -178,7 +121,7 @@ export const getDefaultApprovalModeForTool = (
     }
 
     // `load_tool_schemas` is the one local tool that is not a `CAPABILITIES`
-    // member (master.md §3.1: "内部协议工具（不属任何 capability）") — it's
+    // member ("内部协议工具（不属任何 capability）") — it's
     // injected by the on-demand tool disclosure mechanism, not a
     // user-configurable capability, so `getCapabilityForTool` can never
     // resolve it. It has always run at `full_access` (the old
@@ -196,7 +139,7 @@ export const getDefaultApprovalModeForTool = (
     }
 
     // Unknown local tool short name — e.g. a retired name like
-    // `fs_list`/`fs_search` (see master.md decision 10) that can still show
+    // `fs_list`/`fs_search` that can still show
     // up in historical `toolPreferences` data. Matches the pre-refactor
     // fallthrough (`REQUIRE_APPROVAL_LOCAL_TOOLS.has(...) ?
     // 'require_approval' : 'full_access'`), which defaulted to full_access
@@ -211,10 +154,9 @@ export const getDefaultApprovalModeForTool = (
  * Builds a freshly-seeded FQN-keyed `toolPreferences` map: every default-on
  * built-in tool FQN gets an explicit `{ enabled, approvalMode }` entry.
  *
- * As of the `80_to_81` settings migration (D9,
- * docs/plans/2026-08-15-tool-registry/phase2-migration.md D9), built-in
- * capability state no longer lives in `toolPreferences` at all — creation
- * paths (default assistant, "new agent" UI) seed
+ * As of the `80_to_81` settings migration, built-in capability state no
+ * longer lives in `toolPreferences` at all — creation paths (default
+ * assistant, "new agent" UI) seed
  * {@link buildDefaultBuiltinCapabilityPreferences} instead. This function is
  * kept **only** because the historical v60→v61 and v78→v79 migrations
  * (`settings/schema/migrations/60_to_61.ts`, `78_to_79.ts`) call it — those
@@ -243,7 +185,7 @@ export const buildDefaultBuiltinToolPreferences = (): Record<
  * `{ enabled, approvalMode }` entry at its own declared defaults. This is
  * the current creation-path seed (default assistant, "new agent" UI) — the
  * capability-model successor to {@link buildDefaultBuiltinToolPreferences}
- * above, which now serves only the frozen pre-D9 migration chain.
+ * above, which now serves only the frozen pre-`80_to_81` migration chain.
  *
  * Explicit seeding (rather than leaving the map empty and relying on the
  * read-time fallback that {@link resolveBuiltinCapabilityPreference} already
@@ -328,6 +270,17 @@ export const getAssistantToolPreferences = (
 }
 
 /**
+ * A registered module tool set, reduced to what enablement needs: the
+ * in-process server it is served under and the short names it serves. Kept
+ * structural rather than importing `RegisteredModuleToolSetV1` so this module
+ * stays free of the module-host layer.
+ */
+export type ModuleToolSetEnablementV1 = Readonly<{
+  serverName: string
+  toolNames: readonly string[]
+}>
+
+/**
  * The set of tool FQNs the runtime treats as enabled for this assistant.
  *
  * Remote MCP tools: the explicit `enabled: true` entries from
@@ -336,53 +289,50 @@ export const getAssistantToolPreferences = (
  * ever explicitly touched has an explicit entry by the time runtime reads
  * it, so this function can safely treat an absent remote entry as disabled.
  *
- * Built-in tools: expanded from `builtinCapabilityPreferences` (D9,
- * docs/plans/2026-08-15-tool-registry/phase2-migration.md D9) — every
+ * Built-in tools: expanded from `builtinCapabilityPreferences` — every
  * *enabled* capability's member tools all count as enabled, resolved via
  * {@link resolveBuiltinCapabilityPreference} (explicit per-assistant entry,
  * or the capability's own default when absent). `toolPreferences` no longer
  * carries built-in entries at all as of that migration.
- *
- * Honors `includeBuiltinTools`: when false, built-in tools are excluded from
- * the result entirely (the capability expansion loop below is skipped),
- * matching what the runtime actually exposes.
- *
- * Does NOT consult `enableTools`; callers gate on that at a higher level so
- * the helper remains useful inside the editor (where the master switch may be
- * temporarily off while the user is staging changes).
  */
 export const getEnabledAssistantToolNames = (
   assistant?: Pick<
     Assistant,
-    | 'toolPreferences'
-    | 'enabledToolNames'
-    | 'includeBuiltinTools'
-    | 'builtinCapabilityPreferences'
+    'toolPreferences' | 'enabledToolNames' | 'builtinCapabilityPreferences'
   > | null,
+  moduleToolSets: readonly ModuleToolSetEnablementV1[] = [],
 ): string[] => {
   const toolPreferences = getAssistantToolPreferences(assistant)
-  const includeBuiltinTools = assistant?.includeBuiltinTools !== false
   const result = new Set<string>()
 
   for (const [toolName, preference] of Object.entries(toolPreferences)) {
     if (!preference.enabled) continue
-    if (!includeBuiltinTools && isLocalFileToolFqn(toolName)) continue
     result.add(toolName)
   }
 
-  if (includeBuiltinTools) {
-    const localServer = getLocalFileToolServerName()
-    for (const capability of listCapabilities()) {
-      if (
-        !resolveBuiltinCapabilityPreference(assistant, capability.id).enabled
-      ) {
-        continue
-      }
-      for (const tool of capability.tools) {
-        result.add(
-          `${localServer}${McpManager.TOOL_NAME_DELIMITER}${tool.name}`,
-        )
-      }
+  const localServer = getLocalFileToolServerName()
+  for (const capability of listCapabilities()) {
+    if (!resolveBuiltinCapabilityPreference(assistant, capability.id).enabled) {
+      continue
+    }
+    for (const tool of capability.tools) {
+      result.add(`${localServer}${McpManager.TOOL_NAME_DELIMITER}${tool.name}`)
+    }
+  }
+
+  // Module tool sets are enabled unless the user turned one off — the
+  // opposite of the remote-MCP rule above, and for a reason that does not
+  // apply to remote servers: a user who installed and enabled an optional
+  // module has already said yes to the thing this set belongs to, and the
+  // set's runtime cost is a handful of names in the deferred catalog rather
+  // than a handful of schemas (see `YoloModuleToolSetV1`). A set the user
+  // never opens settings for is therefore usable, while a set they switched
+  // off stays off.
+  for (const set of moduleToolSets) {
+    for (const toolName of set.toolNames) {
+      const fqn = `${set.serverName}${McpManager.TOOL_NAME_DELIMITER}${toolName}`
+      if (toolPreferences[fqn]?.enabled === false) continue
+      result.add(fqn)
     }
   }
 
@@ -573,16 +523,14 @@ export const renameAssistantToolPreferencesServer = <
 }
 
 /**
- * As of the `80_to_81` settings migration (D9,
- * docs/plans/2026-08-15-tool-registry/phase2-migration.md D9), a built-in
- * tool's enablement is owned by its capability's
- * `builtinCapabilityPreferences` entry, not `toolPreferences` — resolved via
+ * As of the `80_to_81` settings migration, a built-in tool's enablement is
+ * owned by its capability's `builtinCapabilityPreferences` entry, not `toolPreferences` — resolved via
  * {@link getCapabilityForTool} (FQN's short name -> owning capability) and
  * {@link resolveBuiltinCapabilityPreference}. A local short name the
  * registry doesn't recognize (the protocol-only `load_tool_schemas`, or a
  * retired name like `fs_list` that can still appear in historical chat
  * state) falls through to the generic `toolPreferences` lookup below, which
- * mirrors the pre-D9 behavior for those names (never present there, so
+ * mirrors the pre-`80_to_81` behavior for those names (never present there, so
  * always `false`). Remote MCP tools were never affected by this migration
  * and keep reading `toolPreferences` exactly as before.
  */
@@ -595,6 +543,15 @@ export const isAssistantToolEnabled = (
     | null
     | undefined,
   toolName: string,
+  /**
+   * Same registry snapshot `getEnabledAssistantToolNames` takes. Needed so a
+   * module tool set's tool resolves the same "enabled unless explicitly
+   * turned off" default here as it does there — without it, a module tool
+   * set FQN with no explicit `toolPreferences` entry falls through to the
+   * generic `?? false` below, which would show as off in the UI even though
+   * it is actually enabled at runtime.
+   */
+  moduleToolSets: readonly ModuleToolSetEnablementV1[] = [],
 ): boolean => {
   try {
     const { serverName, toolName: shortName } = parseToolName(toolName)
@@ -603,6 +560,14 @@ export const isAssistantToolEnabled = (
       if (capability) {
         return resolveBuiltinCapabilityPreference(assistant, capability.id)
           .enabled
+      }
+    } else {
+      const moduleToolSet = moduleToolSets.find(
+        (set) => set.serverName === serverName,
+      )
+      if (moduleToolSet?.toolNames.includes(shortName)) {
+        const toolPreferences = getAssistantToolPreferences(assistant)
+        return toolPreferences[toolName]?.enabled !== false
       }
     }
   } catch {
@@ -617,7 +582,7 @@ export const isAssistantToolEnabled = (
  * Same split as {@link isAssistantToolEnabled}: a recognized built-in short
  * name resolves its approval tier off `builtinCapabilityPreferences` via its
  * owning capability; everything else (remote MCP tools, and local names the
- * registry doesn't recognize) falls through to the pre-D9 paths unchanged —
+ * registry doesn't recognize) falls through to the pre-`80_to_81` paths unchanged —
  * server-level `toolServerPreferences` for remote tools, and
  * `toolPreferences` + `getDefaultApprovalModeForTool` for anything else.
  */
@@ -658,6 +623,21 @@ export const getAssistantToolApprovalMode = (
   )
 }
 
+/**
+ * Which tier a tool sits on.
+ *
+ * The line is drawn by "high-frequency AND needs generation-time constraint",
+ * not by "built-in vs MCP": host built-ins (~13 tools, ~3.9K tokens) are used
+ * in nearly every conversation and have argument semantics precise enough to
+ * need the provider's own schema enforcement — `fs_edit`'s `old_string` has to
+ * match the file exactly. Everything else — MCP, and optional first-party
+ * feature modules such as the whiteboard — is deferred, so a user who never
+ * touches that feature pays a catalog line rather than a full schema.
+ *
+ * A user can pull any individual tool set back to `always` (the escape hatch
+ * for models that handle the deferred path poorly); that path registers the
+ * real schema natively and never goes through `invoke_tool`.
+ */
 export const getAssistantToolDisclosureMode = (
   assistant:
     | Pick<
@@ -667,18 +647,7 @@ export const getAssistantToolDisclosureMode = (
     | null
     | undefined,
   toolName: string,
-  options?: {
-    enableToolDisclosure?: boolean
-    serverToolTokenBudgets?: ReadonlyMap<string, number>
-  },
 ): AssistantToolDisclosureMode => {
-  if (options?.enableToolDisclosure === false) {
-    return 'always'
-  }
-
-  // Built-in tools are part of the agent's core capabilities (~3.9K tokens
-  // total) and are always loaded. Disclosure is an MCP-only concept now;
-  // any stale `on_demand` value in toolPreferences for a built-in is ignored.
   let parsedServerName: string | null = null
   try {
     const { serverName } = parseToolName(toolName)
@@ -694,9 +663,7 @@ export const getAssistantToolDisclosureMode = (
     const explicitMode =
       assistant?.toolServerPreferences?.[parsedServerName]?.disclosureMode
     if (explicitMode) return explicitMode
-    return resolveDefaultDisclosureModeForServer(
-      options?.serverToolTokenBudgets?.get(parsedServerName),
-    )
+    return 'on_demand'
   }
   return getDefaultDisclosureModeForTool(toolName)
 }

@@ -14,6 +14,7 @@ import { $getRoot, LexicalEditor, SerializedEditorState } from 'lexical'
 import { RefObject, memo, useCallback, useEffect, useState } from 'react'
 
 import { useApp } from '../../../contexts/app-context'
+import { usePlugin } from '../../../contexts/plugin-context'
 import { useSettings } from '../../../contexts/settings-context'
 import { LiteSkillEntry } from '../../../core/skills/liteSkills'
 import { SnippetEntry } from '../../../core/snippets/snippetsManager'
@@ -83,8 +84,10 @@ export type LexicalContentEditableProps = {
   assistants?: Assistant[]
   currentAssistantId?: string
   onSelectAssistant?: (assistantId: string) => void
-  currentChatMode?: import('./ChatModeSelect').ChatMode
-  onSelectChatMode?: (mode: import('./ChatModeSelect').ChatMode) => void
+  currentChatMode?: import('../../../core/agent/chat-mode').ChatMode
+  onSelectChatMode?: (
+    mode: import('../../../core/agent/chat-mode').ChatMode,
+  ) => void
   allowAgentModeOption?: boolean
   models?: ChatModel[]
   selectedModelIds?: string[]
@@ -202,6 +205,7 @@ function LexicalContentEditable({
   plugins,
 }: LexicalContentEditableProps) {
   const app = useApp()
+  const plugin = usePlugin()
   const { settings } = useSettings()
   const [activeFilePath, setActiveFilePath] = useState<string | null>(
     app.workspace.getActiveFile()?.path ?? null,
@@ -225,8 +229,14 @@ function LexicalContentEditable({
   }
 
   const defaultSearch = useCallback(
-    (query: string) => fuzzySearch(app, query, settings),
-    [app, settings],
+    (query: string) =>
+      fuzzySearch(
+        app,
+        query,
+        settings,
+        plugin.getModuleFileTextRendererRegistry().listExtensions(),
+      ),
+    [app, settings, plugin],
   )
   const searchFoldersByQuery = useCallback(
     (query: string): MentionableFolder[] =>

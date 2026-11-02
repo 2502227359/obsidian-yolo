@@ -16,6 +16,14 @@ jest.mock('../browser/activeWebviewProbe', () => ({
   findWebviewHandleByPageId: jest.fn(),
 }))
 
+// Only the vault read + encode + cache step is stubbed: the real cache store
+// needs the YOLO data root on a real adapter, and none of that is what the
+// fs_read image branch decides.
+jest.mock('../../utils/llm/image', () => ({
+  ...jest.requireActual('../../utils/llm/image'),
+  tFileToImageDataUrl: jest.fn(),
+}))
+
 jest.mock('../browser/activeWebviewReader', () => ({
   BrowserReadFailure: class BrowserReadFailure extends Error {
     code: string
@@ -36,6 +44,7 @@ import {
   createCompleteToolCallArguments,
 } from '../../types/tool-call.types'
 import { editUndoSnapshotStore } from '../../utils/chat/editUndoSnapshotStore'
+import { tFileToImageDataUrl } from '../../utils/llm/image'
 import {
   getPendingDangerousBashApproval,
   resolveDangerousBashApproval,
@@ -60,15 +69,17 @@ import {
   formatJsSandboxToolText,
 } from './jsSandboxTool'
 import {
+  fromModelToolName,
   getLocalFileTools,
   isLocalFsWriteToolName,
   parseLocalFsActionFromToolArgs,
   recoverLikelyEscapedBackslashSequences,
+  toModelToolName,
 } from './localFileTools'
 
 /**
  * The old `callLocalFileTool` switch was deleted once every built-in tool
- * lived in the registry (docs/plans/2026-08-15-tool-registry, D12). These
+ * lived in the registry. These
  * suites are the original behavioural coverage for those tools, so they
  * stay — re-pointed at the one remaining execution path. The adapter keeps
  * their call shape unchanged so the re-point is visibly a boundary swap and
@@ -1686,10 +1697,7 @@ describe('local fs tool action helpers', () => {
       } as unknown as App,
       toolCallId: 'compact-1',
       toolName: 'context_compact',
-      args: {
-        reason: 'context window is crowded',
-        instruction: 'preserve pending edits and file paths',
-      },
+      args: {},
     })
 
     expect(result.status).toBe(ToolCallResponseStatus.Success)
@@ -1701,231 +1709,7 @@ describe('local fs tool action helpers', () => {
       tool: 'context_compact',
       toolCallId: 'compact-1',
       operation: 'compact_restart',
-      reason: 'context window is crowded',
-      instruction: 'preserve pending edits and file paths',
     })
-  })
-
-  it('handles memory tools through local tool dispatcher', async () => {
-    const entries = new Map<string, unknown>()
-    const contents = new Map<string, string>()
-
-    const app = {
-      vault: {
-        getAbstractFileByPath: jest
-          .fn()
-          .mockImplementation((path: string) => entries.get(path) ?? null),
-        createFolder: jest.fn().mockImplementation(async (path: string) => {
-          const folder = Object.assign(new TFolder(), {
-            path,
-            children: [],
-          })
-          entries.set(path, folder)
-          return folder
-        }),
-        create: jest
-          .fn()
-          .mockImplementation(async (path: string, content: string) => {
-            const file = Object.assign(new TFile(), {
-              path,
-              stat: { size: content.length },
-            })
-            entries.set(path, file)
-            contents.set(path, content)
-            return file
-          }),
-        read: jest
-          .fn()
-          .mockImplementation(
-            async (file: TFile) => contents.get(file.path) ?? '',
-          ),
-        modify: jest
-          .fn()
-          .mockImplementation(async (file: TFile, content: string) => {
-            contents.set(file.path, content)
-            ;(file as { stat?: { size?: number } }).stat = {
-              size: content.length,
-            }
-          }),
-      },
-    } as unknown as App
-
-    const settings = {
-      yolo: { baseDir: 'YOLO' },
-      currentAssistantId: 'helper',
-      assistants: [
-        {
-          id: 'helper',
-          name: 'Helper Agent',
-          systemPrompt: 'You are helper.',
-        },
-      ],
-    } as never
-
-    const addResult = await callLocalFileTool({
-      app,
-      settings,
-      toolName: 'memory_add',
-      args: {
-        content: '用户希望回答保持简洁',
-        category: 'preferences',
-      },
-    })
-    expect(addResult.status).toBe('success')
-    const assistantMemoryPath = 'YOLO/memory/Helper Agent.md'
-    expect(contents.get(assistantMemoryPath) ?? '').toContain(
-      'Preference_1: 用户希望回答保持简洁',
-    )
-
-    const updateResult = await callLocalFileTool({
-      app,
-      settings,
-      toolName: 'memory_update',
-      args: {
-        id: 'Preference_1',
-        new_content: '用户希望回答保持简洁并直接',
-      },
-    })
-    expect(updateResult.status).toBe('success')
-
-    const deleteResult = await callLocalFileTool({
-      app,
-      settings,
-      toolName: 'memory_delete',
-      args: {
-        id: 'Preference_1',
-      },
-    })
-    expect(deleteResult.status).toBe('success')
-    expect(contents.get(assistantMemoryPath) ?? '').not.toContain(
-      'Preference_1',
-    )
-  })
-
-  it('supports partial-success batch add and delete for memory tools', async () => {
-    const entries = new Map<string, unknown>()
-    const contents = new Map<string, string>()
-
-    const app = {
-      vault: {
-        getAbstractFileByPath: jest
-          .fn()
-          .mockImplementation((path: string) => entries.get(path) ?? null),
-        createFolder: jest.fn().mockImplementation(async (path: string) => {
-          const folder = Object.assign(new TFolder(), {
-            path,
-            children: [],
-          })
-          entries.set(path, folder)
-          return folder
-        }),
-        create: jest
-          .fn()
-          .mockImplementation(async (path: string, content: string) => {
-            const file = Object.assign(new TFile(), {
-              path,
-              stat: { size: content.length },
-            })
-            entries.set(path, file)
-            contents.set(path, content)
-            return file
-          }),
-        read: jest
-          .fn()
-          .mockImplementation(
-            async (file: TFile) => contents.get(file.path) ?? '',
-          ),
-        modify: jest
-          .fn()
-          .mockImplementation(async (file: TFile, content: string) => {
-            contents.set(file.path, content)
-            ;(file as { stat?: { size?: number } }).stat = {
-              size: content.length,
-            }
-          }),
-      },
-    } as unknown as App
-
-    const settings = {
-      yolo: { baseDir: 'YOLO' },
-      currentAssistantId: 'helper',
-      assistants: [
-        {
-          id: 'helper',
-          name: 'Helper Agent',
-          systemPrompt: 'You are helper.',
-        },
-      ],
-    } as never
-
-    const batchAddResult = await callLocalFileTool({
-      app,
-      settings,
-      toolName: 'memory_add',
-      args: {
-        items: [
-          {
-            content: '批量记录 1',
-            category: 'other',
-          },
-          {
-            content: '   ',
-            category: 'other',
-          },
-          {
-            content: '批量记录 2',
-            category: 'other',
-          },
-        ],
-      },
-    })
-    expect(batchAddResult.status).toBe(ToolCallResponseStatus.Success)
-    if (batchAddResult.status !== ToolCallResponseStatus.Success) {
-      throw new Error('expected success')
-    }
-    const batchAddPayload = JSON.parse(batchAddResult.text) as {
-      mode: string
-      okCount: number
-      failCount: number
-      results: Array<{ ok: boolean; id?: string }>
-    }
-    expect(batchAddPayload.mode).toBe('batch')
-    expect(batchAddPayload.okCount).toBe(2)
-    expect(batchAddPayload.failCount).toBe(1)
-    const createdIds = batchAddPayload.results
-      .filter((result) => result.ok)
-      .map((result) => result.id)
-    expect(createdIds).toEqual(['Memory_1', 'Memory_2'])
-
-    const assistantMemoryPath = 'YOLO/memory/Helper Agent.md'
-
-    const batchDeleteResult = await callLocalFileTool({
-      app,
-      settings,
-      toolName: 'memory_delete',
-      args: {
-        ids: ['Memory_1', 'NotExist_404', 'Memory_2'],
-      },
-    })
-    expect(batchDeleteResult.status).toBe(ToolCallResponseStatus.Success)
-    if (batchDeleteResult.status !== ToolCallResponseStatus.Success) {
-      throw new Error('expected success')
-    }
-    const batchDeletePayload = JSON.parse(batchDeleteResult.text) as {
-      mode: string
-      okCount: number
-      failCount: number
-      results: Array<{ ok: boolean; id: string }>
-    }
-    expect(batchDeletePayload.mode).toBe('batch')
-    expect(batchDeletePayload.okCount).toBe(2)
-    expect(batchDeletePayload.failCount).toBe(1)
-    expect(
-      batchDeletePayload.results.filter((result) => !result.ok)[0]?.id,
-    ).toBe('NotExist_404')
-
-    expect(contents.get(assistantMemoryPath) ?? '').not.toContain('Memory_1')
-    expect(contents.get(assistantMemoryPath) ?? '').not.toContain('Memory_2')
   })
 
   it('creates missing parent folders before creating a file', async () => {
@@ -2056,6 +1840,71 @@ describe('local fs tool action helpers', () => {
     if (result.status === ToolCallResponseStatus.Error) {
       expect(result.error).toMatch(/folder/i)
     }
+  })
+
+  // fs_edit / fs_write refuse `.yoloboard` unconditionally — no
+  // `resolveModuleFileTextRenderer` is even passed here, proving the block
+  // does not depend on the whiteboard module being installed or active.
+  it('rejects fs_write against a .yoloboard path, pointing at the whiteboard edit tool', async () => {
+    const create = jest.fn()
+    const modify = jest.fn()
+
+    const result = await callLocalFileTool({
+      app: {
+        vault: {
+          getAbstractFileByPath: jest.fn().mockReturnValue(null),
+          create,
+          modify,
+          createFolder: jest.fn(),
+        },
+      } as unknown as App,
+      toolName: 'fs_write',
+      args: {
+        path: 'Boards/Reading Notes.yoloboard',
+        content: '{"nodes":[]}',
+      },
+    })
+
+    expect(result.status).toBe(ToolCallResponseStatus.Error)
+    if (result.status === ToolCallResponseStatus.Error) {
+      expect(result.error).toMatch(/yolo_whiteboard__edit_board/)
+    }
+    expect(create).not.toHaveBeenCalled()
+    expect(modify).not.toHaveBeenCalled()
+  })
+
+  it('rejects fs_edit against a .yoloboard path, pointing at the whiteboard edit tool', async () => {
+    const file = Object.assign(new TFile(), {
+      path: 'Boards/Reading Notes.yoloboard',
+      extension: 'yoloboard',
+      stat: { size: 100 },
+    })
+    const read = jest.fn().mockResolvedValue('{"nodes":[]}')
+    const modify = jest.fn()
+
+    const result = await callLocalFileTool({
+      app: {
+        vault: {
+          getAbstractFileByPath: jest.fn().mockReturnValue(file),
+          read,
+          modify,
+        },
+      } as unknown as App,
+      toolName: 'fs_edit',
+      args: {
+        path: 'Boards/Reading Notes.yoloboard',
+        oldText: 'nodes',
+        newText: 'cards',
+      },
+    })
+
+    expect(result.status).toBe(ToolCallResponseStatus.Error)
+    if (result.status === ToolCallResponseStatus.Error) {
+      expect(result.error).toMatch(/yolo_whiteboard__edit_board/)
+    }
+    // Rejected before ever reading the file to attempt the edit.
+    expect(read).not.toHaveBeenCalled()
+    expect(modify).not.toHaveBeenCalled()
   })
 
   it('keeps the fs_write tool schema flat without items or top-level combinators', () => {
@@ -2765,6 +2614,357 @@ describe('fs_read wikilink resolution', () => {
   })
 })
 
+// fs_read dispatches a claimed extension to the module's renderer instead of
+// returning raw bytes. `resolveModuleFileTextRenderer` is threaded straight through
+// `ToolContext`, so these tests pass it as a plain function the way
+// `mcpManager.ts` would populate it from `ModuleFileTextRendererRegistry`.
+describe('fs_read module file text renderer dispatch', () => {
+  const makeFile = (path: string, extension: string, size = 100): TFile =>
+    Object.assign(new TFile(), {
+      path,
+      name: path.split('/').pop(),
+      extension,
+      stat: { size, mtime: 1000 },
+    })
+
+  const makeApp = (options: {
+    files: Record<string, TFile>
+    content: Record<string, string>
+  }): App => {
+    const { files, content } = options
+    return {
+      vault: {
+        getFileByPath: jest
+          .fn()
+          .mockImplementation((path: string) => files[path] ?? null),
+        read: jest
+          .fn()
+          .mockImplementation((file: TFile) =>
+            Promise.resolve(content[file.path] ?? ''),
+          ),
+      },
+      metadataCache: {
+        getFirstLinkpathDest: jest.fn().mockReturnValue(null),
+        getFileCache: jest.fn().mockReturnValue(null),
+      },
+    } as unknown as App
+  }
+
+  const parseResults = (result: {
+    status: ToolCallResponseStatus
+    text?: string
+  }): Array<Record<string, unknown>> => {
+    expect(result.status).toBe(ToolCallResponseStatus.Success)
+    return (
+      JSON.parse((result as { text: string }).text) as {
+        results: Array<Record<string, unknown>>
+      }
+    ).results
+  }
+
+  it('renders a claimed extension through the module renderer instead of returning raw content', async () => {
+    const file = makeFile('Board.yoloboard', 'yoloboard')
+    const app = makeApp({
+      files: { 'Board.yoloboard': file },
+      content: { 'Board.yoloboard': '{"nodes":[]}' },
+    })
+    const render = jest.fn().mockResolvedValue('37 cards, 12 edges')
+
+    const result = await callLocalFileTool({
+      app,
+      toolName: 'fs_read',
+      args: { paths: ['Board.yoloboard'] },
+      resolveModuleFileTextRenderer: (extension) =>
+        extension === 'yoloboard'
+          ? { extensions: ['yoloboard'], render }
+          : null,
+    })
+
+    expect(render).toHaveBeenCalledWith({
+      path: 'Board.yoloboard',
+      content: '{"nodes":[]}',
+    })
+    const results = parseResults(result)
+    expect(results).toEqual([
+      expect.objectContaining({
+        path: 'Board.yoloboard',
+        ok: true,
+        content: '1|37 cards, 12 edges',
+      }),
+    ])
+  })
+
+  it('reads raw content unchanged when nothing claims the extension', async () => {
+    const file = makeFile('Board.yoloboard', 'yoloboard')
+    const app = makeApp({
+      files: { 'Board.yoloboard': file },
+      content: { 'Board.yoloboard': '{"nodes":[]}' },
+    })
+    const render = jest.fn()
+
+    const result = await callLocalFileTool({
+      app,
+      toolName: 'fs_read',
+      args: { paths: ['Board.yoloboard'] },
+      // Registered for a different extension only — the module is either
+      // not installed/active, or never claimed `.yoloboard`.
+      resolveModuleFileTextRenderer: (extension) =>
+        extension === 'somethingelse'
+          ? { extensions: ['somethingelse'], render }
+          : null,
+    })
+
+    expect(render).not.toHaveBeenCalled()
+    const results = parseResults(result)
+    expect(results).toEqual([
+      expect.objectContaining({
+        path: 'Board.yoloboard',
+        ok: true,
+        content: '1|{"nodes":[]}',
+      }),
+    ])
+  })
+
+  it('reads raw content unchanged when resolveModuleFileTextRenderer is not wired up at all', async () => {
+    const file = makeFile('Board.yoloboard', 'yoloboard')
+    const app = makeApp({
+      files: { 'Board.yoloboard': file },
+      content: { 'Board.yoloboard': '{"nodes":[]}' },
+    })
+
+    const result = await callLocalFileTool({
+      app,
+      toolName: 'fs_read',
+      args: { paths: ['Board.yoloboard'] },
+    })
+
+    const results = parseResults(result)
+    expect(results).toEqual([
+      expect.objectContaining({
+        path: 'Board.yoloboard',
+        ok: true,
+        content: '1|{"nodes":[]}',
+      }),
+    ])
+  })
+
+  it('returns a clear tool error, not raw JSON, when the renderer throws', async () => {
+    const file = makeFile('Board.yoloboard', 'yoloboard')
+    const app = makeApp({
+      files: { 'Board.yoloboard': file },
+      content: { 'Board.yoloboard': '{"nodes":[]}' },
+    })
+    const render = jest.fn().mockRejectedValue(new Error('board is corrupt'))
+
+    const result = await callLocalFileTool({
+      app,
+      toolName: 'fs_read',
+      args: { paths: ['Board.yoloboard'] },
+      resolveModuleFileTextRenderer: (extension) =>
+        extension === 'yoloboard'
+          ? { extensions: ['yoloboard'], render }
+          : null,
+    })
+
+    const results = parseResults(result)
+    expect(results).toEqual([
+      expect.objectContaining({
+        path: 'Board.yoloboard',
+        ok: false,
+        error: expect.stringContaining('board is corrupt'),
+      }),
+    ])
+    // Model-facing error explains *why* — not a raw JSON dump of the file.
+    expect((results[0].error as string).includes('{"nodes"')).toBe(false)
+  })
+
+  it('rejects an oversized raw file before ever calling the renderer', async () => {
+    // MODULE_RENDERED_FILE_SOURCE_MAX_BYTES (20 MiB) is far above the
+    // MAX_FILE_SIZE_BYTES (2 MiB) an unclaimed text file would be capped at —
+    // this is the "size ordering is reversed for a claimed extension" case:
+    // a huge raw board must still be readable so it can
+    // be rendered down to a small summary.
+    const oversized = 21 * 1024 * 1024
+    const file = makeFile('Board.yoloboard', 'yoloboard', oversized)
+    const app = makeApp({
+      files: { 'Board.yoloboard': file },
+      content: {},
+    })
+    const render = jest.fn()
+
+    const result = await callLocalFileTool({
+      app,
+      toolName: 'fs_read',
+      args: { paths: ['Board.yoloboard'] },
+      resolveModuleFileTextRenderer: (extension) =>
+        extension === 'yoloboard'
+          ? { extensions: ['yoloboard'], render }
+          : null,
+    })
+
+    expect(render).not.toHaveBeenCalled()
+    const results = parseResults(result)
+    expect(results).toEqual([
+      expect.objectContaining({ path: 'Board.yoloboard', ok: false }),
+    ])
+  })
+})
+
+// Issue #595: an image file used to fall through to the text branch and come
+// back as UTF-8-decoded bytes. It now reaches a vision model as an attached
+// image, and is refused (never decoded) when the model or settings can't take
+// it.
+describe('fs_read image and binary files', () => {
+  const imageFile = Object.assign(new TFile(), {
+    path: 'assets/pixel.png',
+    name: 'pixel.png',
+    extension: 'png',
+    stat: { size: 100, mtime: 1000 },
+  })
+  const binaryFile = Object.assign(new TFile(), {
+    path: 'audio/clip.mp3',
+    name: 'clip.mp3',
+    extension: 'mp3',
+    stat: { size: 100, mtime: 1000 },
+  })
+
+  const readText = jest.fn().mockResolvedValue('ID3\u0000\u0000\u0004garbage')
+  const app = {
+    vault: {
+      getFileByPath: jest
+        .fn()
+        .mockImplementation(
+          (path: string) =>
+            ({ [imageFile.path]: imageFile, [binaryFile.path]: binaryFile })[
+              path
+            ] ?? null,
+        ),
+      read: readText,
+    },
+    metadataCache: {
+      getFirstLinkpathDest: jest.fn().mockReturnValue(null),
+      getFileCache: jest.fn().mockReturnValue(null),
+    },
+  } as unknown as App
+
+  const buildSettings = (options: {
+    modalities: string[]
+    imageReadingEnabled?: boolean
+  }) =>
+    ({
+      yolo: { baseDir: 'YOLO' },
+      chatModels: [
+        {
+          id: 'model',
+          providerId: 'provider',
+          model: 'model',
+          modalities: options.modalities,
+        },
+      ],
+      chatOptions: { imageReadingEnabled: options.imageReadingEnabled },
+    }) as unknown as YoloSettings
+
+  const readImage = (settings: YoloSettings) =>
+    callLocalFileTool({
+      app,
+      settings,
+      chatModelId: 'model',
+      toolName: 'fs_read',
+      args: { paths: [imageFile.path] },
+    })
+
+  const parseResults = (result: LocalToolCallResult) =>
+    (
+      JSON.parse((result as { text: string }).text) as {
+        results: Array<Record<string, unknown>>
+      }
+    ).results
+
+  beforeEach(() => {
+    jest
+      .mocked(tFileToImageDataUrl)
+      .mockReset()
+      .mockResolvedValue('data:image/png;base64,AAAA')
+    readText.mockClear()
+  })
+
+  it('attaches the image for a vision-capable model instead of decoding it as text', async () => {
+    const result = await readImage(
+      buildSettings({ modalities: ['text', 'vision'] }),
+    )
+
+    expect(result.status).toBe(ToolCallResponseStatus.Success)
+    expect(readText).not.toHaveBeenCalled()
+    expect(parseResults(result)).toEqual([
+      expect.objectContaining({
+        path: imageFile.path,
+        ok: true,
+        effectiveModality: 'image',
+      }),
+    ])
+    expect((result as { contentParts?: unknown[] }).contentParts).toEqual([
+      {
+        type: 'image_url',
+        image_url: {
+          url: 'data:image/png;base64,AAAA',
+          cacheKey: expect.any(String),
+        },
+      },
+    ])
+  })
+
+  it('refuses the image when the active model cannot accept image input', async () => {
+    const result = await readImage(buildSettings({ modalities: ['text'] }))
+
+    expect(tFileToImageDataUrl).not.toHaveBeenCalled()
+    expect(readText).not.toHaveBeenCalled()
+    expect(parseResults(result)).toEqual([
+      expect.objectContaining({
+        path: imageFile.path,
+        ok: false,
+        error: expect.stringContaining('cannot accept image input'),
+      }),
+    ])
+    expect(
+      (result as { contentParts?: unknown[] }).contentParts,
+    ).toBeUndefined()
+  })
+
+  it('refuses the image when image reading is turned off in settings', async () => {
+    const result = await readImage(
+      buildSettings({
+        modalities: ['text', 'vision'],
+        imageReadingEnabled: false,
+      }),
+    )
+
+    expect(tFileToImageDataUrl).not.toHaveBeenCalled()
+    expect(parseResults(result)).toEqual([
+      expect.objectContaining({
+        path: imageFile.path,
+        ok: false,
+        error: expect.stringContaining('image reading is turned off'),
+      }),
+    ])
+  })
+
+  it('refuses a binary file instead of returning decoded noise', async () => {
+    const result = await callLocalFileTool({
+      app,
+      toolName: 'fs_read',
+      args: { paths: [binaryFile.path] },
+    })
+
+    expect(parseResults(result)).toEqual([
+      expect.objectContaining({
+        path: binaryFile.path,
+        ok: false,
+        error: expect.stringContaining('binary file'),
+      }),
+    ])
+  })
+})
+
 describe('bash tool dispatch', () => {
   const mockApp = { vault: {}, fileManager: {} } as unknown as App
 
@@ -3065,7 +3265,6 @@ describe('delegate_subagent model selection', () => {
       ],
       mcp: {
         servers: [],
-        enableToolDisclosure: false,
         builtinCapabilityOptions: {
           subagent_delegation: {
             allowedModelIds: ['openai/gpt-5', 'openai/gpt-4.1-mini'],
@@ -3126,5 +3325,69 @@ describe('delegate_subagent model selection', () => {
     }
     expect(result.error).toContain('not allowed for delegate_subagent')
     expect(runSubagent).not.toHaveBeenCalled()
+  })
+})
+
+describe('model-facing tool name boundary', () => {
+  describe('toModelToolName', () => {
+    it('drops the yolo_local prefix from built-in tools', () => {
+      expect(toModelToolName('yolo_local__fs_read')).toBe('fs_read')
+      expect(toModelToolName('yolo_local__terminal_command')).toBe(
+        'terminal_command',
+      )
+      expect(toModelToolName('yolo_local__invoke_tool')).toBe('invoke_tool')
+    })
+
+    it('leaves MCP and module tools fully qualified', () => {
+      // The prefix is their routing key and their only provenance signal.
+      expect(toModelToolName('github__create_issue')).toBe(
+        'github__create_issue',
+      )
+      expect(toModelToolName('yolo_whiteboard__edit_board')).toBe(
+        'yolo_whiteboard__edit_board',
+      )
+    })
+
+    it('passes through a name that carries no server prefix', () => {
+      expect(toModelToolName('fs_read')).toBe('fs_read')
+    })
+  })
+
+  describe('fromModelToolName', () => {
+    it('qualifies built-in short names', () => {
+      expect(fromModelToolName('fs_read')).toBe('yolo_local__fs_read')
+      expect(fromModelToolName('context_compact')).toBe(
+        'yolo_local__context_compact',
+      )
+    })
+
+    it('qualifies the two protocol tools, which own no capability', () => {
+      expect(fromModelToolName('load_tool_schemas')).toBe(
+        'yolo_local__load_tool_schemas',
+      )
+      expect(fromModelToolName('invoke_tool')).toBe('yolo_local__invoke_tool')
+    })
+
+    it('leaves an already-qualified name alone', () => {
+      expect(fromModelToolName('github__create_issue')).toBe(
+        'github__create_issue',
+      )
+      expect(fromModelToolName('yolo_local__fs_read')).toBe(
+        'yolo_local__fs_read',
+      )
+    })
+
+    it('leaves an unknown short name alone, so the error names what was asked for', () => {
+      expect(fromModelToolName('definitely_not_a_tool')).toBe(
+        'definitely_not_a_tool',
+      )
+    })
+
+    it('round-trips every built-in tool', () => {
+      for (const tool of getLocalFileTools()) {
+        const fqn = `yolo_local__${tool.name}`
+        expect(fromModelToolName(toModelToolName(fqn))).toBe(fqn)
+      }
+    })
   })
 })

@@ -4,11 +4,12 @@ import { v4 as uuidv4 } from 'uuid'
 
 import { ensureUserDataRootDir } from '../../../core/paths/yoloManagedData'
 import { getYoloUserDataRootDir } from '../../../core/paths/yoloPaths'
+import { editUndoSnapshotStore } from '../../../utils/chat/editUndoSnapshotStore'
+import { deleteEditReviewSnapshotStore } from '../../edit-review/editReviewSnapshotStore'
 import { AbstractJsonRepository } from '../base'
 import { CHAT_DIR } from '../constants'
 import { EmptyChatTitleException } from '../exception'
 
-import { deleteEditReviewSnapshotStore } from './editReviewSnapshotStore'
 import { deletePromptSnapshotStore } from './promptSnapshotStore'
 import {
   CHAT_SCHEMA_VERSION,
@@ -188,7 +189,8 @@ export class ChatManager extends AbstractJsonRepository<
 
     await this.delete(targetMetadata.fileName)
     await deletePromptSnapshotStore(this.app, id, this.settings)
-    await deleteEditReviewSnapshotStore(this.app, id, this.settings)
+    await deleteEditReviewSnapshotStore(this.app, id)
+    editUndoSnapshotStore.deleteConversation(id)
     await this.removeFromIndex(id)
     return true
   }
@@ -236,8 +238,14 @@ export class ChatManager extends AbstractJsonRepository<
       return await this.read(fileName)
     } catch (error) {
       // A single corrupt / half-written conversation file must not reject the
-      // whole list; surface a filename-derived placeholder instead.
-      console.error('[YOLO] Failed to read chat file', fileName, error)
+      // whole list; surface a filename-derived placeholder instead. Log only
+      // the message: the console retains logged objects, and a JSON
+      // SyntaxError keeps the whole file content alive (#626).
+      console.error(
+        '[YOLO] Failed to read chat file',
+        fileName,
+        error instanceof Error ? error.message : String(error),
+      )
       return null
     }
   }

@@ -1,3 +1,20 @@
+/**
+ * The owner of an agent *session*: conversation state, its persistence, and
+ * the approval and question pauses that have to be answered by a human in a
+ * chat surface. A session outlives any single run — it is what a chat view
+ * subscribes to, reloads, branches, and resumes.
+ *
+ * `NativeAgentRuntime` (native-runtime.ts) sits below it and owns the loop
+ * itself: LLM turns, tool calls, compaction, guardrails. `AgentRunApi`
+ * (agent-api.ts) sits above it and turns one programmatic call into an event
+ * stream for callers that have no conversation of their own.
+ *
+ * Only a caller that actually holds a conversation — the chat views — should
+ * use this class directly. Everyone else (host features under `src/features/`,
+ * and modules arriving through `host.agent.stream`) goes through `AgentRunApi`
+ * and states a trust tier as `capability` rather than assembling a run input
+ * here.
+ */
 import { v4 as uuidv4 } from 'uuid'
 
 import type { YoloSettings } from '../../settings/schema/setting.types'
@@ -28,6 +45,7 @@ import {
   getLocalFileToolServerName,
 } from '../mcp/localFileTools'
 import { parseToolName } from '../mcp/tool-name-utils'
+import { getExtraAllowanceKeysForRequest } from '../tools/native/paths'
 
 import {
   type AssistantRenderStreamListener,
@@ -179,7 +197,7 @@ type AgentRunEntry = {
  */
 type ConversationPublishMode = 'immediate' | 'stream-only'
 
-type AgentServiceOptions = {
+type AgentSessionServiceOptions = {
   getSettings?: () => YoloSettings
   persistConversationMessages?: (payload: {
     conversationId: string
@@ -570,34 +588,68 @@ const isBlockedTerminalCommandRequest = (
   )
 }
 
-const mergeVisibleMessages = (
-  previousVisibleMessages: ChatMessage[],
+/**
+ * 可见历史前缀：合并锚点及其之前的那段消息，也就是本次 run 不会再改动的
+ * 那段历史。`input.messages` 与合并锚点都是 run 启动时定下的常量（锚点被
+ * 刻意固定，见 `run` 里 `historyMergeAnchorMessageId` 的注释），所以这段
+ * 前缀在整个 run 期间不变，按 run 解析一次即可，不必每个流式 chunk 重新
+ * `findIndex` + `slice` 一遍整段会话。
+ *
+ * 锚点缺失或在 `baseMessages` 里找不到时返回空前缀，可见历史完全由运行时
+ * 快照决定——与之前"没有锚点 / anchorIndex === -1 就只用 responseMessages"
+ * 的行为一致。
+ */
+export const resolveVisibleHistoryPrefix = (
   baseMessages: ChatMessage[],
   anchorMessageId: string | undefined,
-  responseMessages: ChatMessage[],
 ): ChatMessage[] => {
   if (!anchorMessageId) {
-    return reconcileAssistantGenerationState(
-      previousVisibleMessages,
-      responseMessages,
-    )
+    return []
   }
 
   const anchorIndex = baseMessages.findIndex(
     (message) => message.id === anchorMessageId,
   )
 
-  if (anchorIndex === -1) {
+  return anchorIndex === -1 ? [] : baseMessages.slice(0, anchorIndex + 1)
+}
+
+/**
+ * 把运行时快照折回成可见消息列表：固定的历史前缀 + 折叠过的响应段。
+ *
+ * 折叠只作用于锚点之后的响应段。`reconcileAssistantGenerationState` 只会在
+ * "上一轮同 id 的工具调用已是 Aborted 而这一轮不是"或"上一轮同 id 的
+ * assistant 已是 aborted 而这一轮报 streaming"时改写消息；前缀里的每条消息
+ * 在上一轮就是它自己（同一个对象引用），两个条件都不可能成立，因此对前缀
+ * 折叠必然是恒等变换。跳过它之后，每个 chunk 不再为整段历史建两张 Map、分配
+ * 中间数组或按 id 查找锚点。
+ *
+ * 注意这并没有把每 chunk 的代价降到与历史长度无关：下面那次 spread 仍然要把
+ * 前缀的每一个引用抄进新数组。数组身份必须每帧重建——最后一条消息的文本变了
+ * 就得是新对象，装着它的数组也得是新数组，dev 构建还会把发布出去的状态深冻结。
+ * 结构共享保的是元素身份而不是数组身份，所以前缀里的消息对象是复用的，剩下的
+ * 只有纯指针复制，量级远低于原先的 Map 构建。要连这一趟也去掉，得让 stream-only
+ * 帧完全不折数组、只把变化的那条 assistant 推进 render stream，那是独立的一轮。
+ */
+export const mergeVisibleMessages = (
+  previousVisibleMessages: ChatMessage[],
+  historyPrefix: ChatMessage[],
+  responseMessages: ChatMessage[],
+): ChatMessage[] => {
+  if (historyPrefix.length === 0) {
     return reconcileAssistantGenerationState(
       previousVisibleMessages,
       responseMessages,
     )
   }
 
-  return reconcileAssistantGenerationState(previousVisibleMessages, [
-    ...baseMessages.slice(0, anchorIndex + 1),
-    ...responseMessages,
-  ])
+  return [
+    ...historyPrefix,
+    ...reconcileAssistantGenerationState(
+      previousVisibleMessages.slice(historyPrefix.length),
+      responseMessages,
+    ),
+  ]
 }
 
 const hasPendingApproval = (messages: ChatMessage[]): boolean => {
@@ -752,15 +804,6 @@ const isAssistantOrToolMessage = (
   message: ChatMessage,
 ): message is Extract<ChatMessage, { role: 'assistant' | 'tool' }> => {
   return message.role === 'assistant' || message.role === 'tool'
-}
-
-// Mirrors NativeAgentRuntime.shouldUseSingleTurnFastPath. A fast-path run does
-// not call drainPendingUserMessages (no llm_request boundary), so queued
-// messages can never be consumed inside that run. Treat fast-path runs as
-// "not enqueueable" and skip after-run continuation that would otherwise loop
-// forever re-launching fast-path runs that ignore the queue.
-const isFastPathLoopConfig = (config: AgentRuntimeLoopConfig): boolean => {
-  return !config.enableTools && config.maxAutoIterations <= 1
 }
 
 const matchesBranchMessage = (
@@ -934,7 +977,7 @@ export type AbortedQueuedMessagesSubscriber = (
 
 type ForegroundToolAborter = () => void
 
-export class AgentService {
+export class AgentSessionService {
   private conversationEntries = new Map<string, ConversationEntry>()
   private runEntriesByKey = new Map<string, AgentRunEntry>()
   private foregroundToolAbortersByConversation = new Map<
@@ -987,7 +1030,7 @@ export class AgentService {
    */
   private readonly assistantRenderStreams = new AssistantRenderStreamStore()
 
-  constructor(private readonly options: AgentServiceOptions = {}) {}
+  constructor(private readonly options: AgentSessionServiceOptions = {}) {}
 
   getAssistantRenderStream(
     conversationId: string,
@@ -1104,14 +1147,6 @@ export class AgentService {
     if (!runEntry || runEntry.state.status !== 'running') {
       return 'idle'
     }
-    if (
-      runEntry.lastLoopConfig &&
-      isFastPathLoopConfig(runEntry.lastLoopConfig)
-    ) {
-      // Fast-path runs have no llm_request boundary to drain at. Fall through
-      // to the normal submit path so the caller starts a fresh run instead.
-      return 'idle'
-    }
     if (hasPendingUserInteraction(runEntry.state.messages)) {
       return 'blocked_awaiting_approval'
     }
@@ -1161,8 +1196,9 @@ export class AgentService {
   }
 
   /**
-   * Subscribe to abort events that carry the queued user messages dropped at
-   * abort time, so the UI can restore them into the input box.
+   * Subscribe to queued user messages that will never be sent — dropped by an
+   * abort, or by a run that ended on a tool call awaiting the user — so the UI
+   * can restore them into the input box.
    */
   subscribeToAbortedQueuedMessages(
     fn: AbortedQueuedMessagesSubscriber,
@@ -1476,7 +1512,6 @@ export class AgentService {
   }): Promise<boolean> {
     // If this toolCallId belongs to a running subagent, route the approval
     // into that subagent's runtime instead of the parent conversation.
-    // See `docs/plans/2026-06-18-subagent-tool-approval-routing.md`.
     const subagentEntry = subagentRuntimeRegistry.findByToolCallId(toolCallId)
     if (subagentEntry) {
       return this.approveSubagentToolCall(
@@ -1555,6 +1590,7 @@ export class AgentService {
           toolCall.request.name,
           conversationId,
           getToolCallArgumentsObject(toolCall.request.arguments),
+          getExtraAllowanceKeysForRequest(toolCall.request),
         )
       }
     }
@@ -1566,7 +1602,6 @@ export class AgentService {
       conversationId,
       toolCallId,
       response: { status: ToolCallResponseStatus.Running },
-      status: 'running',
     })
     if (!runningMessages) {
       return false
@@ -1613,6 +1648,9 @@ export class AgentService {
             // `ToolCallRequest.metadata.executionConstraints`.
             bashReadOnly:
               toolCall.request.metadata?.executionConstraints?.bashReadOnly,
+            capabilityForceEnabled:
+              toolCall.request.metadata?.executionConstraints
+                ?.capabilityForceEnabled,
           }),
         getResponseBody: (response) => response,
       }),
@@ -1874,6 +1912,7 @@ export class AgentService {
         request.name,
         entry.parentConversationId,
         getToolCallArgumentsObject(request.arguments),
+        getExtraAllowanceKeysForRequest(request),
       )
     }
 
@@ -1892,6 +1931,10 @@ export class AgentService {
           conversationId: entry.parentConversationId,
           conversationMessages: entry.runtime.getMessages(),
           roundId: located.toolMessage.id,
+          // Same snapshot the parent path reads: a subagent inherits the
+          // parent mode's capability grant, so its approved calls must too.
+          capabilityForceEnabled:
+            request.metadata?.executionConstraints?.capabilityForceEnabled,
         }),
       )
     } catch (error) {
@@ -2165,6 +2208,12 @@ export class AgentService {
     // for subsequent assistant/tool messages within the same runtime.
     const historyMergeAnchorMessageId =
       input.sourceUserMessageId ?? input.messages.at(-1)?.id
+    // 锚点与 `input.messages` 在本次 run 内都不再变化，前缀因此只解析一次；
+    // 流式回调每个 chunk 只折叠锚点之后的响应段。
+    const visibleHistoryPrefix = resolveVisibleHistoryPrefix(
+      input.messages,
+      historyMergeAnchorMessageId,
+    )
 
     const runtimeInput: AgentRuntimeRunInput = {
       ...input,
@@ -2216,8 +2265,7 @@ export class AgentService {
       const previousRunState = currentRunEntry.state
       const mergedMessages = mergeVisibleMessages(
         previousRunState.messages,
-        input.messages,
-        historyMergeAnchorMessageId,
+        visibleHistoryPrefix,
         snapshot.messages,
       )
       const nextRunState = {
@@ -2326,11 +2374,17 @@ export class AgentService {
       // Abort path is responsible for clearing the queue; do not continue.
       return
     }
-    if (isFastPathLoopConfig(lastLoopConfig)) {
-      // Defensive: enqueueUserMessage already rejects fast-path runs, but a
-      // queued message could in principle reach here through other paths.
-      // Skip continuation to avoid an infinite loop of fast-path runs that
-      // never drain the queue.
+    const conversationEntry = this.conversationEntries.get(conversationId)
+    if (
+      conversationEntry &&
+      hasPendingUserInteraction(conversationEntry.state.messages)
+    ) {
+      // The run stopped on a tool call the user still has to answer; a request
+      // now would carry that call without a result. `enqueueUserMessage`
+      // refuses new messages in this state, so hand these back the same way.
+      this.pendingUserMessagesByKey.delete(runKey)
+      this.notifyConversationSubscribers(conversationId)
+      this.notifyDroppedQueuedMessages(conversationId, queue)
       return
     }
     this.continuationScheduledByKey.add(runKey)
@@ -2441,12 +2495,23 @@ export class AgentService {
       }
     }
 
-    if (droppedQueuedByConversation.length > 0) {
-      for (const subscriber of this.abortedQueuedMessagesSubscribers) {
-        subscriber(conversationId, droppedQueuedByConversation)
-      }
-    }
+    this.notifyDroppedQueuedMessages(
+      conversationId,
+      droppedQueuedByConversation,
+    )
     return didAbort
+  }
+
+  private notifyDroppedQueuedMessages(
+    conversationId: string,
+    messages: ChatUserMessage[],
+  ): void {
+    if (messages.length === 0) {
+      return
+    }
+    for (const subscriber of this.abortedQueuedMessagesSubscribers) {
+      subscriber(conversationId, messages)
+    }
   }
 
   abortAll(): void {
@@ -2945,12 +3010,10 @@ export class AgentService {
     conversationId,
     toolCallId,
     response,
-    status,
   }: {
     conversationId: string
     toolCallId: string
     response: ToolCallResponse
-    status?: AgentRunStatus
   }): ChatMessage[] | null {
     const located = this.findToolCall(conversationId, toolCallId)
     if (!located) {
@@ -2973,7 +3036,6 @@ export class AgentService {
       located.runEntry.state = {
         ...located.runEntry.state,
         messages: updatedMessages,
-        status: status ?? located.runEntry.state.status,
       }
     } else {
       const conversationEntry =
@@ -2982,7 +3044,6 @@ export class AgentService {
       conversationEntry.state = {
         ...conversationEntry.state,
         messages: updatedMessages,
-        status: status ?? conversationEntry.state.status,
       }
       this.syncPendingApprovalRecoveryContext(conversationId, updatedMessages)
     }

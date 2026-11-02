@@ -39,9 +39,6 @@ const EXPECTED_TOOL_NAMES = [
   'fs_edit',
   'fs_write',
   'bash',
-  'memory_add',
-  'memory_update',
-  'memory_delete',
   'context_prune_tool_results',
   'context_compact',
   'todo_write',
@@ -51,6 +48,10 @@ const EXPECTED_TOOL_NAMES = [
   'js_eval',
   'terminal_command',
   'delegate_subagent',
+  'read_file',
+  'write_file',
+  'edit_file',
+  'vault_search',
 ] as const
 
 const EXPECTED_CAPABILITY_IDS = [
@@ -61,11 +62,12 @@ const EXPECTED_CAPABILITY_IDS = [
   'context_compaction',
   'user_questions',
   'todo_list',
-  'memory',
   'web_access',
   'js_sandbox',
   'terminal',
   'subagent_delegation',
+  'native_files',
+  'vault_search',
 ] as const
 
 // The load-bearing assertions. Widening either union to `string` breaks
@@ -85,6 +87,7 @@ const probeTool = defineTool({
   name: 'probe_tool',
   getMcpTool: () => ({ description: '', inputSchema: { type: 'object' } }),
   chatLabel: { key: 'probe', fallback: 'probe' },
+  summaryAction: 'agentInternal',
   execute: () =>
     Promise.resolve({ status: ToolCallResponseStatus.Success, text: '' }),
 })
@@ -94,6 +97,7 @@ const _probeCapability = defineCapability({
   id: 'probe_capability',
   label: { key: 'probe', fallback: 'probe' },
   category: 'context',
+  chatModes: ['ask', 'agent', 'max'],
   defaultEnabled: false,
   approval: {
     defaultMode: 'full_access',

@@ -6,6 +6,9 @@ import {
   selectAllowedTools,
 } from './tool-selection'
 
+/** No provider-run tools, so the hosted web-search carve-out never applies. */
+const MODEL_WITHOUT_HOSTED_TOOLS = {}
+
 describe('selectAllowedTools', () => {
   it('keeps full schemas for tools left in always mode', async () => {
     const availableTools: McpTool[] = [
@@ -21,6 +24,7 @@ describe('selectAllowedTools', () => {
 
     const result = await selectAllowedTools({
       availableTools,
+      model: MODEL_WITHOUT_HOSTED_TOOLS,
       allowedToolNames: ['server__tool_a'],
       toolPreferences: {
         server__tool_a: {
@@ -74,7 +78,6 @@ describe('selectAllowedTools', () => {
       ],
       mcp: {
         servers: [],
-        enableToolDisclosure: false,
         builtinCapabilityOptions: {
           subagent_delegation: {
             allowedModelIds: ['openai/gpt-4.1-mini'],
@@ -86,6 +89,7 @@ describe('selectAllowedTools', () => {
 
     const result = await selectAllowedTools({
       availableTools,
+      model: MODEL_WITHOUT_HOSTED_TOOLS,
       allowedToolNames: ['yolo_local__delegate_subagent'],
       toolPreferences: {
         yolo_local__delegate_subagent: {
@@ -109,7 +113,7 @@ describe('selectAllowedTools', () => {
     })
   })
 
-  it('replaces on-demand tools with a permissive stub schema (non-Gemini)', async () => {
+  it('does not register deferred tools at all, injecting the two protocol tools instead', async () => {
     const availableTools: McpTool[] = [
       {
         name: 'server__tool_a',
@@ -124,6 +128,7 @@ describe('selectAllowedTools', () => {
 
     const result = await selectAllowedTools({
       availableTools,
+      model: MODEL_WITHOUT_HOSTED_TOOLS,
       allowedToolNames: ['server__tool_a'],
       toolPreferences: {
         server__tool_a: { enabled: true },
@@ -132,24 +137,20 @@ describe('selectAllowedTools', () => {
       apiType: 'anthropic',
     })
 
-    // The loader is injected automatically whenever any surviving tool is
-    // on-demand; it stays as a full schema and rides at the head of the list.
+    // A deferred tool costs a catalog line, not a `tools` entry — so the
+    // registered set is exactly the two protocol tools.
     expect(result.requestTools?.map((tool) => tool.function.name)).toEqual([
-      'yolo_local__load_tool_schemas',
-      'server__tool_a',
+      'load_tool_schemas',
+      'invoke_tool',
     ])
-    const stub = result.requestTools?.find(
-      (tool) => tool.function.name === 'server__tool_a',
+    expect(result.hasOnDemandTools).toBe(true)
+    // ...but the gateway still needs the real definition to validate against.
+    expect(result.filteredTools.map((tool) => tool.name)).toContain(
+      'server__tool_a',
     )
-    expect(stub?.function.parameters).toEqual({
-      type: 'object',
-      properties: {},
-      additionalProperties: true,
-    })
-    expect(stub?.function.description).toContain('load_tool_schemas')
   })
 
-  it('uses args_json stub form on Gemini', async () => {
+  it('gives invoke_tool a native object for arguments, and a JSON string only on Gemini', async () => {
     const availableTools: McpTool[] = [
       {
         name: 'server__tool_a',
@@ -157,30 +158,41 @@ describe('selectAllowedTools', () => {
         inputSchema: { type: 'object', properties: {} },
       },
     ]
+    const select = (apiType: 'anthropic' | 'gemini') =>
+      selectAllowedTools({
+        availableTools,
+        model: MODEL_WITHOUT_HOSTED_TOOLS,
+        allowedToolNames: ['server__tool_a'],
+        toolPreferences: { server__tool_a: { enabled: true } },
+        toolServerPreferences: { server: { disclosureMode: 'on_demand' } },
+        apiType,
+      })
+    const argumentsSchemaOf = (result: { requestTools?: unknown[] }) =>
+      (
+        result.requestTools as
+          | Array<{
+              function: {
+                name: string
+                parameters: { properties?: Record<string, unknown> }
+              }
+            }>
+          | undefined
+      )?.find((tool) => tool.function.name === 'invoke_tool')?.function
+        .parameters.properties?.arguments
 
-    const result = await selectAllowedTools({
-      availableTools,
-      allowedToolNames: ['server__tool_a'],
-      toolPreferences: {
-        server__tool_a: { enabled: true },
-      },
-      toolServerPreferences: { server: { disclosureMode: 'on_demand' } },
-      apiType: 'gemini',
-    })
-
-    const stub = result.requestTools?.find(
-      (tool) => tool.function.name === 'server__tool_a',
-    )
-    expect(stub?.function.parameters).toEqual({
+    expect(argumentsSchemaOf(await select('anthropic'))).toMatchObject({
       type: 'object',
-      properties: {
-        args_json: expect.objectContaining({ type: 'string' }),
-      },
-      required: ['args_json'],
+      additionalProperties: true,
+    })
+    expect(argumentsSchemaOf(await select('gemini'))).toMatchObject({
+      type: 'string',
     })
   })
 
-  it('uses full schemas and skips loader injection when disclosure is disabled', async () => {
+  it('keeps a tool set the user pinned to always registered natively', async () => {
+    // The escape hatch that replaced the global opt-out: it is per tool set,
+    // and it puts the real schema back in `tools` rather than routing the
+    // call through invoke_tool.
     const availableTools: McpTool[] = [
       {
         name: 'server__tool_a',
@@ -195,14 +207,14 @@ describe('selectAllowedTools', () => {
 
     const result = await selectAllowedTools({
       availableTools,
+      model: MODEL_WITHOUT_HOSTED_TOOLS,
       allowedToolNames: ['server__tool_a'],
-      enableToolDisclosure: false,
-      toolPreferences: {
-        server__tool_a: { enabled: true },
-      },
-      toolServerPreferences: { server: { disclosureMode: 'on_demand' } },
+      toolPreferences: { server__tool_a: { enabled: true } },
+      toolServerPreferences: { server: { disclosureMode: 'always' } },
+      apiType: 'anthropic',
     })
 
+    expect(result.hasOnDemandTools).toBe(false)
     expect(result.requestTools?.map((tool) => tool.function.name)).toEqual([
       'server__tool_a',
     ])
@@ -211,6 +223,7 @@ describe('selectAllowedTools', () => {
       properties: { foo: { type: 'string' } },
       required: ['foo'],
     })
+    expect(result.deferredToolCatalog).toBeNull()
   })
 
   it('omits the loader when no surviving tool is on-demand', async () => {
@@ -224,6 +237,7 @@ describe('selectAllowedTools', () => {
 
     const result = await selectAllowedTools({
       availableTools,
+      model: MODEL_WITHOUT_HOSTED_TOOLS,
       allowedToolNames: ['server__tool_a'],
       toolPreferences: {
         server__tool_a: {
@@ -238,7 +252,10 @@ describe('selectAllowedTools', () => {
     ])
   })
 
-  it('defaults lightweight MCP servers to always-loaded full schemas', async () => {
+  it('defers every MCP server by default, regardless of how small its schemas are', async () => {
+    // The old default weighed a per-server token budget against a 2000-token
+    // threshold. That existed only because deferral was opt-in; with it on by
+    // default the threshold just left small servers inexplicably resident.
     const availableTools: McpTool[] = [
       {
         name: 'server__tool_a',
@@ -252,64 +269,100 @@ describe('selectAllowedTools', () => {
 
     const result = await selectAllowedTools({
       availableTools,
+      model: MODEL_WITHOUT_HOSTED_TOOLS,
       allowedToolNames: ['server__tool_a'],
       toolPreferences: {
-        server__tool_a: {
-          enabled: true,
-          approvalMode: 'full_access',
-        },
-      },
-    })
-
-    expect(result.hasOnDemandTools).toBe(false)
-    expect(result.requestTools?.map((tool) => tool.function.name)).toEqual([
-      'server__tool_a',
-    ])
-    expect(result.requestTools?.[0]?.function.parameters).toEqual({
-      type: 'object',
-      properties: { foo: { type: 'string' } },
-    })
-  })
-
-  it('defaults heavy MCP servers to on-demand stubs', async () => {
-    const availableTools: McpTool[] = [
-      {
-        name: 'server__tool_a',
-        description: 'Tool A '.repeat(12000),
-        inputSchema: {
-          type: 'object',
-          properties: { foo: { type: 'string' } },
-          required: ['foo'],
-        },
-      },
-    ]
-
-    const result = await selectAllowedTools({
-      availableTools,
-      allowedToolNames: ['server__tool_a'],
-      toolPreferences: {
-        server__tool_a: {
-          enabled: true,
-          approvalMode: 'full_access',
-        },
+        server__tool_a: { enabled: true, approvalMode: 'full_access' },
       },
       apiType: 'anthropic',
     })
 
     expect(result.hasOnDemandTools).toBe(true)
     expect(result.requestTools?.map((tool) => tool.function.name)).toEqual([
-      'yolo_local__load_tool_schemas',
-      'server__tool_a',
+      'load_tool_schemas',
+      'invoke_tool',
     ])
-    const stub = result.requestTools?.find(
-      (tool) => tool.function.name === 'server__tool_a',
-    )
-    expect(stub?.function.parameters).toEqual({
-      type: 'object',
-      properties: {},
-      additionalProperties: true,
+  })
+
+  it('keeps host built-ins registered natively', async () => {
+    const availableTools: McpTool[] = [
+      {
+        name: 'yolo_local__fs_read',
+        description: 'Read a file',
+        inputSchema: {
+          type: 'object',
+          properties: { path: { type: 'string' } },
+          required: ['path'],
+        },
+      },
+    ]
+
+    const result = await selectAllowedTools({
+      availableTools,
+      model: MODEL_WITHOUT_HOSTED_TOOLS,
+      allowedToolNames: ['yolo_local__fs_read'],
+      toolPreferences: { yolo_local__fs_read: { enabled: true } },
+      apiType: 'anthropic',
     })
-    expect(stub?.function.description).toContain('ON-DEMAND')
+
+    expect(result.hasOnDemandTools).toBe(false)
+    // Registered under the model-facing short name; the internal identity
+    // (allow-list, preferences, gateway) stays fully qualified.
+    expect(result.requestTools?.map((tool) => tool.function.name)).toEqual([
+      'fs_read',
+    ])
+    expect(result.requestTools?.[0]?.function.parameters).toEqual({
+      type: 'object',
+      properties: { path: { type: 'string' } },
+      required: ['path'],
+    })
+  })
+
+  it('drops our web_search when the provider runs search itself', async () => {
+    // Both would reach the model as the bare `web_search` — the name the
+    // hosted tool's protocol fixes — so offering ours would be a duplicate
+    // tool name, not merely a redundant option. `web_scrape` still earns its
+    // place: hosted results carry titles and URLs but no page content.
+    const availableTools: McpTool[] = [
+      {
+        name: 'yolo_local__web_search',
+        description: 'Search the web',
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        name: 'yolo_local__web_scrape',
+        description: 'Scrape a page',
+        inputSchema: { type: 'object', properties: {} },
+      },
+    ]
+    const params = {
+      availableTools,
+      allowedToolNames: ['yolo_local__web_search', 'yolo_local__web_scrape'],
+      toolPreferences: {
+        yolo_local__web_search: { enabled: true },
+        yolo_local__web_scrape: { enabled: true },
+      },
+      apiType: 'anthropic' as const,
+    }
+
+    const withHostedSearch = await selectAllowedTools({
+      ...params,
+      model: {
+        builtinToolProvider: 'deepseek',
+        builtinTools: { deepseek: { webSearch: { enabled: true } } },
+      } as never,
+    })
+    expect(
+      withHostedSearch.requestTools?.map((tool) => tool.function.name),
+    ).toEqual(['web_scrape'])
+
+    const withoutHostedSearch = await selectAllowedTools({
+      ...params,
+      model: MODEL_WITHOUT_HOSTED_TOOLS,
+    })
+    expect(
+      withoutHostedSearch.requestTools?.map((tool) => tool.function.name),
+    ).toEqual(['web_search', 'web_scrape'])
   })
 
   it('keeps the tools-field stable across identical selections', async () => {
@@ -325,6 +378,7 @@ describe('selectAllowedTools', () => {
     ]
     const params = {
       availableTools,
+      model: MODEL_WITHOUT_HOSTED_TOOLS,
       allowedToolNames: ['server__tool_a'],
       toolPreferences: {
         server__tool_a: { enabled: true },
@@ -358,7 +412,7 @@ describe('applyDynamicToolDescriptions', () => {
   const settings = { knowledgeBases } as unknown as YoloSettings
   const tools: McpTool[] = [
     {
-      name: 'yolo_local__bash',
+      name: 'yolo_local__vault_search',
       description: 'static',
       inputSchema: { type: 'object', properties: {} },
     },
@@ -369,26 +423,37 @@ describe('applyDynamicToolDescriptions', () => {
     },
   ]
 
-  it('lists the configured knowledge bases in bash and js_eval descriptions', () => {
-    const [bash, jsEval] = applyDynamicToolDescriptions(tools, {
+  const knowledgeBaseArgDescription = (tool: McpTool): string =>
+    (
+      (tool.inputSchema.properties?.knowledgeBase ?? {}) as {
+        description?: string
+      }
+    ).description ?? ''
+
+  it("lists the configured knowledge bases in vault_search's knowledgeBase argument and js_eval's description", () => {
+    const [vaultSearch, jsEval] = applyDynamicToolDescriptions(tools, {
       jsSandboxSettings: { allowDbQuery: true },
       settings,
     })
-    for (const tool of [bash, jsEval]) {
-      expect(tool.description).toContain('- 读书笔记 - 书摘与书评')
-      expect(tool.description).toContain('- Work')
+    for (const text of [
+      knowledgeBaseArgDescription(vaultSearch),
+      jsEval.description,
+    ]) {
+      expect(text).toContain('- 读书笔记 - 书摘与书评')
+      expect(text).toContain('- Work')
     }
-    expect(bash.description).toContain('--kb')
     expect(jsEval.description).toContain(
       '$db.search(query, limit?, knowledgeBase?)',
     )
   })
 
   it('tells the model when no knowledge base exists', () => {
-    const [bash] = applyDynamicToolDescriptions(tools, {
+    const [vaultSearch] = applyDynamicToolDescriptions(tools, {
       jsSandboxSettings: {},
       settings: { knowledgeBases: [] } as unknown as YoloSettings,
     })
-    expect(bash.description).toContain('No knowledge bases are configured')
+    expect(knowledgeBaseArgDescription(vaultSearch)).toContain(
+      'No knowledge bases are configured',
+    )
   })
 })

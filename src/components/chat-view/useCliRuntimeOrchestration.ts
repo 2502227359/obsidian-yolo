@@ -11,6 +11,8 @@ import {
 } from 'react'
 import { v4 as uuidv4 } from 'uuid'
 
+import type { ChatModeSelectValue } from '../../core/agent/chat-mode'
+import { isModuleChatMode } from '../../core/agent/chat-mode'
 import {
   type ChatRuntimeActions,
   type ChatRuntimeApprovalAction,
@@ -18,7 +20,6 @@ import {
   type CliChatMode,
   type CliConversationController,
   type CliConversationSnapshot,
-  type CliRuntimeConfiguration,
   type CliRuntimeId,
   type CliRuntimeModel,
   type CliRuntimeScope,
@@ -39,10 +40,6 @@ import type { CurrentFileViewState, Mentionable } from '../../types/mentionable'
 import type { ReasoningLevel } from '../../types/reasoning'
 import { AcknowledgementModal } from '../modals/AcknowledgementModal'
 
-import {
-  type ChatModeSelectValue,
-  isModuleChatMode,
-} from './chat-input/ChatModeSelect'
 import {
   type CliChatOperationSnapshot,
   getCliChatOperationCoordinator,
@@ -66,9 +63,9 @@ import {
   prunePrePlanCliMode,
   readPrePlanCliMode,
   rememberCliModePreference,
-  rememberCliRuntimeConfiguration,
   rememberPrePlanCliMode,
   resolveCliRuntimePreference,
+  setCliRuntimeDefault,
 } from './cliRuntimePreferences'
 
 function useLatestRef<T>(value: T) {
@@ -315,6 +312,9 @@ export function useCliRuntimeOrchestration({
   const refreshCliSkills = useCallback(() => {
     setCliSkillsRefreshTick((tick) => tick + 1)
   }, [])
+  // An ACP agent advertises its skills after the session binds, and again
+  // when they change: each time, the list below is read again.
+  const cliSkillsRevision = cliConversationSnapshot?.skillsRevision ?? 0
   useEffect(() => {
     if (
       !isCliRuntime(activeRuntimeId) ||
@@ -356,6 +356,7 @@ export function useCliRuntimeOrchestration({
     cliConversationController,
     cliRuntimeScope,
     cliSkillsRefreshTick,
+    cliSkillsRevision,
   ])
   useEffect(() => {
     if (activeRuntimeId === 'yolo' || !cliConversationController) return
@@ -461,62 +462,67 @@ export function useCliRuntimeOrchestration({
           ref: seededRef,
           isCurrent: isCurrentRestore,
         })
-        if (!result.hydration || !isCurrentRestore()) {
-          return
-        }
-        await prepareCliConversation({
-          controller: result.controller,
-          scope: cliRuntimeScope,
-          runtimeId: seededRef.runtimeId,
-          settings,
-          permissionProfile: cliPermissionProfileRef.current,
-        })
-        if (!isCurrentRestore()) return
-        const restoredConversationId = seededCliConversationId ?? uuidv4()
-        setCliConversationController(result.controller)
-        setCliConversationId(restoredConversationId)
-        lastCliRuntimeIdRef.current = seededRef.runtimeId
-        setRequestedRuntimeId(seededRef.runtimeId)
-        activeRuntimeIdRef.current = seededRef.runtimeId
-        // A resumed session's own ref is authoritative on which Hermes
-        // profile it lives under — unless a fallback occurred, in the
-        // `openSession()` peek above or in `prepareCliConversation()`'s own
-        // `ensureReady()` load, because the requested profile no longer
-        // resolves (see `AcpCliRuntimeOptions.sessionRecovery`). Either way
-        // the *fallback* session is what's actually live and must be
-        // reflected in both the header and conversation storage, not the
-        // now-dead requested profile — so this reads the controller's
-        // settled snapshot, not just the first load's hydration, to catch a
-        // fallback from either load (see `resolveHermesSessionFallbackUpdate`).
-        const fallbackUpdate = resolveHermesSessionFallbackUpdate(
-          seededRef.runtimeId,
-          result.controller.getSnapshot(),
-        )
-        setHermesProfileId(
-          fallbackUpdate
-            ? fallbackUpdate.hermesProfileId
-            : seededRef.runtimeId === 'hermes'
-              ? seededRef.profileId
-              : undefined,
-        )
-        if (fallbackUpdate) {
-          void createOrTouchCliConversation(
-            restoredConversationId,
-            fallbackUpdate.cliSession,
-            conversationOverridesRef.current.get(restoredConversationId) ??
-              conversationOverrides,
-          ).catch((error: unknown) => {
-            console.error(
-              '[YOLO] Failed to persist Hermes fallback session',
-              error,
-            )
+        try {
+          if (!result.hydration || !isCurrentRestore()) {
+            return
+          }
+          await prepareCliConversation({
+            controller: result.controller,
+            scope: cliRuntimeScope,
+            runtimeId: seededRef.runtimeId,
+            settings,
+            permissionProfile: cliPermissionProfileRef.current,
           })
-        }
-        if (result.overlayError) {
-          console.warn('[YOLO] Failed to restore CLI conversation metadata', {
-            conversationId: seededCliConversationId,
-            error: result.overlayError.message,
-          })
+          if (!isCurrentRestore()) return
+          result.commit()
+          const restoredConversationId = seededCliConversationId ?? uuidv4()
+          setCliConversationController(result.controller)
+          setCliConversationId(restoredConversationId)
+          lastCliRuntimeIdRef.current = seededRef.runtimeId
+          setRequestedRuntimeId(seededRef.runtimeId)
+          activeRuntimeIdRef.current = seededRef.runtimeId
+          // A resumed session's own ref is authoritative on which Hermes
+          // profile it lives under — unless a fallback occurred, in the
+          // `openSession()` peek above or in `prepareCliConversation()`'s own
+          // `ensureReady()` load, because the requested profile no longer
+          // resolves (see `AcpCliRuntimeOptions.sessionRecovery`). Either way
+          // the *fallback* session is what's actually live and must be
+          // reflected in both the header and conversation storage, not the
+          // now-dead requested profile — so this reads the controller's
+          // settled snapshot, not just the first load's hydration, to catch a
+          // fallback from either load (see `resolveHermesSessionFallbackUpdate`).
+          const fallbackUpdate = resolveHermesSessionFallbackUpdate(
+            seededRef.runtimeId,
+            result.controller.getSnapshot(),
+          )
+          setHermesProfileId(
+            fallbackUpdate
+              ? fallbackUpdate.hermesProfileId
+              : seededRef.runtimeId === 'hermes'
+                ? seededRef.profileId
+                : undefined,
+          )
+          if (fallbackUpdate) {
+            void createOrTouchCliConversation(
+              restoredConversationId,
+              fallbackUpdate.cliSession,
+              conversationOverridesRef.current.get(restoredConversationId) ??
+                conversationOverrides,
+            ).catch((error: unknown) => {
+              console.error(
+                '[YOLO] Failed to persist Hermes fallback session',
+                error,
+              )
+            })
+          }
+          if (result.overlayError) {
+            console.warn('[YOLO] Failed to restore CLI conversation metadata', {
+              conversationId: seededCliConversationId,
+              error: result.overlayError.message,
+            })
+          }
+        } finally {
+          result.release()
         }
       })
       .catch((error) => {
@@ -590,10 +596,6 @@ export function useCliRuntimeOrchestration({
         activeHistoryConversationId,
         conversationOverrides,
       )
-      const previousConfiguration =
-        cliConversationController?.getSnapshot().runtimeId === runtimeId
-          ? cliConversationController.getSnapshot().configuration
-          : null
       const controller = cliRuntimeScope.createConversationRuntime(
         runtimeId,
         profileId,
@@ -602,31 +604,13 @@ export function useCliRuntimeOrchestration({
         if (profileId) registerCliConversationProfileId(controller, profileId)
         setHermesProfileId(profileId)
       }
-      const preference = previousConfiguration
-        ? {
-            modelId: previousConfiguration.modelId,
-            reasoningEffort: previousConfiguration.reasoningEffort,
-          }
-        : resolveCliRuntimePreference(
-            cliPreferenceSettingsRef.current,
-            runtimeId,
-            cliModelCatalog.get(runtimeId) ?? [],
-          )
-      controller.stageConfiguration(preference)
-      if (previousConfiguration) {
-        cliPreferenceSettingsRef.current = rememberCliRuntimeConfiguration(
+      controller.stageConfiguration(
+        resolveCliRuntimePreference(
           cliPreferenceSettingsRef.current,
           runtimeId,
-          previousConfiguration,
-        )
-        void updateSettings((current) =>
-          rememberCliRuntimeConfiguration(
-            current,
-            runtimeId,
-            previousConfiguration,
-          ),
-        )
-      }
+          cliModelCatalog.get(runtimeId) ?? [],
+        ),
+      )
       const nextCliConversationId = uuidv4()
       setCliConversationController(controller)
       setCliConversationId(nextCliConversationId)
@@ -636,11 +620,9 @@ export function useCliRuntimeOrchestration({
     },
     [
       activeHistoryConversationId,
-      cliConversationController,
       cliModelCatalog,
       cliRuntimeScope,
       conversationOverrides,
-      updateSettings,
     ],
   )
 
@@ -674,26 +656,18 @@ export function useCliRuntimeOrchestration({
       }
       void transitionCliSession((isCurrent) => {
         if (!isCurrent()) return
-        const previousConfiguration =
-          cliConversationController?.getSnapshot().runtimeId === 'hermes'
-            ? cliConversationController.getSnapshot().configuration
-            : null
         const controller = cliRuntimeScope.createConversationRuntime(
           'hermes',
           profileId,
         )
         if (profileId) registerCliConversationProfileId(controller, profileId)
-        const preference = previousConfiguration
-          ? {
-              modelId: previousConfiguration.modelId,
-              reasoningEffort: previousConfiguration.reasoningEffort,
-            }
-          : resolveCliRuntimePreference(
-              cliPreferenceSettingsRef.current,
-              'hermes',
-              cliModelCatalog.get('hermes') ?? [],
-            )
-        controller.stageConfiguration(preference)
+        controller.stageConfiguration(
+          resolveCliRuntimePreference(
+            cliPreferenceSettingsRef.current,
+            'hermes',
+            cliModelCatalog.get('hermes') ?? [],
+          ),
+        )
         setCliConversationController(controller)
         setHermesProfileId(profileId)
       })
@@ -878,10 +852,12 @@ export function useCliRuntimeOrchestration({
     (nextMode: ChatModeSelectValue) => {
       if (!isCliRuntime(activeRuntimeId)) return
       if (nextMode === 'ask') return
-      // CLI runtimes never offer a module chat mode (`CLAUDE_CODE_CHAT_MODES`
-      // / `CODEX_CHAT_MODES` are fixed 'agent'/'plan' lists) — this is an
-      // unreachable defensive guard, needed only to narrow `ChatModeSelectValue`
-      // (which structurally includes module ids) down to `CliChatMode`.
+      // CLI runtimes never offer Max or a module chat mode
+      // (`CLAUDE_CODE_CHAT_MODES` / `CODEX_CHAT_MODES` are fixed
+      // 'agent'/'plan' lists) — these are unreachable defensive guards,
+      // needed only to narrow `ChatModeSelectValue` (which structurally
+      // includes both) down to `CliChatMode`.
+      if (nextMode === 'max') return
       if (isModuleChatMode(nextMode)) return
       if (
         activeRuntimeId === 'claude-code' &&
@@ -1079,71 +1055,83 @@ export function useCliRuntimeOrchestration({
     restoreClaudeAgentMode,
   ])
 
-  const persistCliConfiguration = useCallback(
-    (configuration: CliRuntimeConfiguration) => {
-      if (!cliConversationController || !isCliRuntime(activeRuntimeId)) return
-      const ref = cliConversationController.getSnapshot().sessionRef
-      if (ref && cliRuntimeScope) {
-        void cliRuntimeScope.sessionService.rememberConfiguration(ref, {
-          modelId: configuration.modelId,
-          reasoningEffort: configuration.reasoningEffort,
-        })
-      }
-      cliPreferenceSettingsRef.current = rememberCliRuntimeConfiguration(
+  // Each session remembers the model/effort it runs on, so reopening it later
+  // restores that choice (Claude Code resumes need it; the other runtimes
+  // restore it natively). This is per-session memory only — the default for
+  // new conversations changes solely through `handleCliDefaultModelToggle`.
+  const rememberedSessionConfigurationRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!isCliRuntime(activeRuntimeId) || !cliRuntimeScope) return
+    const ref = activeCliConversationSnapshot?.sessionRef
+    const configuration = activeCliConversationSnapshot?.configuration
+    if (!ref || !configuration?.modelId) return
+    const key = JSON.stringify([
+      ref.runtimeId,
+      ref.nativeSessionId,
+      configuration.modelId,
+      configuration.reasoningEffort,
+    ])
+    if (rememberedSessionConfigurationRef.current === key) return
+    rememberedSessionConfigurationRef.current = key
+    void cliRuntimeScope.sessionService.rememberConfiguration(ref, {
+      modelId: configuration.modelId,
+      reasoningEffort: configuration.reasoningEffort,
+    })
+  }, [activeRuntimeId, activeCliConversationSnapshot, cliRuntimeScope])
+
+  /**
+   * "Set as default" / "Remove default" from the model picker. The default is
+   * the model plus, when it is the conversation's current model, the effort
+   * chosen alongside it; without one, new conversations follow the CLI's own
+   * configuration.
+   */
+  const handleCliDefaultModelToggle = useCallback(
+    (modelId: string) => {
+      if (!isCliRuntime(activeRuntimeId)) return
+      const runtimeId = activeRuntimeId
+      const isDefault =
+        cliPreferenceSettingsRef.current.chatOptions.cliModelIdByRuntime?.[
+          runtimeId
+        ] === modelId
+      const configuration =
+        cliConversationController?.getSnapshot().configuration
+      const preference = isDefault
+        ? null
+        : {
+            modelId,
+            reasoningEffort:
+              configuration?.modelId === modelId
+                ? configuration.reasoningEffort
+                : null,
+          }
+      cliPreferenceSettingsRef.current = setCliRuntimeDefault(
         cliPreferenceSettingsRef.current,
-        activeRuntimeId,
-        configuration,
+        runtimeId,
+        preference,
       )
       void updateSettings((current) =>
-        rememberCliRuntimeConfiguration(
-          current,
-          activeRuntimeId,
-          configuration,
-        ),
+        setCliRuntimeDefault(current, runtimeId, preference),
       )
     },
-    [
-      activeRuntimeId,
-      cliConversationController,
-      cliRuntimeScope,
-      updateSettings,
-    ],
+    [activeRuntimeId, cliConversationController, updateSettings],
   )
-
-  // Runtimes that restore their real current model on bind (pi via
-  // get_state, Hermes via ACP's currentModelId) are the source of truth for
-  // "which model will actually run". Remember that restored model so the next
-  // fresh conversation's staged (pre-bind) picker shows it instead of an
-  // empty selection — staging deliberately never invents a pick on its own.
-  useEffect(() => {
-    if (!isCliRuntime(activeRuntimeId)) return
-    const configuration = activeCliConversationSnapshot?.configuration
-    if (!configuration?.modelId || !activeCliConversationSnapshot?.sessionRef) {
-      return
-    }
-    const remembered =
-      cliPreferenceSettingsRef.current.chatOptions.cliModelIdByRuntime?.[
-        activeRuntimeId
-      ]
-    if (remembered === configuration.modelId) return
-    persistCliConfiguration(configuration)
-  }, [activeRuntimeId, activeCliConversationSnapshot, persistCliConfiguration])
 
   const handleCliModelChange = useCallback(
     (modelId: string | null) => {
       if (!cliConversationController || !isCliRuntime(activeRuntimeId)) return
-      const rememberedEffort = modelId
-        ? cliPreferenceSettingsRef.current.chatOptions
-            .cliReasoningEffortByModel?.[`${activeRuntimeId}:${modelId}`]
-        : undefined
+      const defaultPreference = resolveCliRuntimePreference(
+        cliPreferenceSettingsRef.current,
+        activeRuntimeId,
+        [],
+      )
+      const rememberedEffort =
+        modelId && defaultPreference.modelId === modelId
+          ? defaultPreference.reasoningEffort
+          : undefined
       void cliConversationController
         .updateConfiguration({
           modelId,
           reasoningEffort: rememberedEffort ?? null,
-        })
-        .then((configuration) => {
-          if (!configuration) return
-          persistCliConfiguration(configuration)
         })
         .catch((error) => {
           new Notice(
@@ -1157,7 +1145,7 @@ export function useCliRuntimeOrchestration({
           )
         })
     },
-    [activeRuntimeId, cliConversationController, persistCliConfiguration, t],
+    [activeRuntimeId, cliConversationController, t],
   )
 
   const handleCliReasoningEffortChange = useCallback(
@@ -1165,10 +1153,6 @@ export function useCliRuntimeOrchestration({
       if (!cliConversationController || !isCliRuntime(activeRuntimeId)) return
       void cliConversationController
         .updateConfiguration({ reasoningEffort })
-        .then((configuration) => {
-          if (!configuration) return
-          persistCliConfiguration(configuration)
-        })
         .catch((error) => {
           new Notice(
             t(
@@ -1181,7 +1165,7 @@ export function useCliRuntimeOrchestration({
           )
         })
     },
-    [activeRuntimeId, cliConversationController, persistCliConfiguration, t],
+    [activeRuntimeId, cliConversationController, t],
   )
 
   const handleCliUserMessageRewrite = useCallback(
@@ -1209,7 +1193,7 @@ export function useCliRuntimeOrchestration({
           async (isCurrent) => {
             const environmentContext = await buildCliEnvironmentContext({
               app,
-              settings,
+              runtimeId: activeRuntimeId,
               currentFile: activeFile,
               currentFileViewState: activeViewState,
             })
@@ -1228,13 +1212,6 @@ export function useCliRuntimeOrchestration({
               },
             })
             if (!isCurrent() || !rewriteResult) return
-            if (turnConfiguration) {
-              const appliedConfiguration =
-                cliConversationController.getSnapshot().configuration
-              if (appliedConfiguration) {
-                persistCliConfiguration(appliedConfiguration)
-              }
-            }
             await createOrTouchCliConversation(
               cliConversationId,
               {
@@ -1285,7 +1262,6 @@ export function useCliRuntimeOrchestration({
       cliRuntimeScope,
       createOrTouchCliConversation,
       conversationOverrides,
-      persistCliConfiguration,
       settings,
       t,
     ],
@@ -1334,6 +1310,7 @@ export function useCliRuntimeOrchestration({
 
     handleCliModelChange,
     handleCliReasoningEffortChange,
+    handleCliDefaultModelToggle,
     handleCliUserMessageRewrite,
   }
 }

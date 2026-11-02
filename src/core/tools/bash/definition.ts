@@ -1,4 +1,3 @@
-import type { KnowledgeBase } from '../../../settings/schema/setting.types'
 import type { McpTool } from '../../../types/mcp.types'
 import { ToolCallResponseStatus } from '../../../types/tool-call.types'
 import {
@@ -12,8 +11,6 @@ import {
   truncateBashOutputForContext,
 } from '../../agent/bash/outputBudget'
 import { createVaultBashFileSystem } from '../../agent/bash/vaultBashFileSystem'
-import { createVaultBashSearch } from '../../agent/bash/vaultBashSearch'
-import { describeKnowledgeBaseCatalog } from '../../rag/knowledgeBaseCatalog'
 import {
   acquireRuntimeComponent,
   isRuntimeComponentEnabled,
@@ -24,16 +21,9 @@ import { getTextArg } from '../tool-args'
 // Schema copied verbatim from the `bash` entry in `getLocalFileTools()`
 // (`src/core/mcp/localFileTools.ts`). `getMcpTool` only ever describes the
 // protocol shape — it stays unconditional; whether the tool is currently
-// offered is `isAvailable`'s job (see below, D6b).
-/**
- * @param knowledgeBases When given, the `search --kb` hint lists the
- * configured knowledge bases by name; the settings-agnostic catalog omits it
- * and `applyDynamicToolDescriptions` fills it in per request.
- */
-export function buildBashToolDescription(
-  knowledgeBases?: readonly KnowledgeBase[],
-): string {
-  return `A sandboxed virtual shell over the vault, mounted at /vault (cwd defaults there); nothing outside /vault exists. To read a file, call the separate \`fs_read\` tool — this shell has no read command. To search, use the \`search [-n N] [--kb "NAME"] "query" [path]\` command inside this shell (hybrid RAG + keyword retrieval; \`--kb\` restricts semantic retrieval to one knowledge base by name).${knowledgeBases ? ` ${describeKnowledgeBaseCatalog(knowledgeBases)}` : ''} Path operations — mkdir, mv, rm — run directly here. Content writes are unavailable here — call the separate \`fs_edit\` or \`fs_write\` tool instead.`
+// offered is `isAvailable`'s job (see below).
+export function buildBashToolDescription(): string {
+  return `A sandboxed virtual shell over the vault, mounted at /vault (the default cwd); nothing outside /vault exists. grep and find match literally. mkdir, mv, and rm run here. There is no command that prints or writes file contents — use the file tools for that.`
 }
 
 const BASH_MCP_TOOL: Omit<McpTool, 'name'> = {
@@ -52,20 +42,21 @@ const BASH_MCP_TOOL: Omit<McpTool, 'name'> = {
 
 export const bashDefinition = defineTool({
   name: 'bash',
+  summaryAction: 'virtualTerminal',
   getMcpTool: () => BASH_MCP_TOOL,
-  // D6b: this tool's catalog-inclusion gate — previously
+  // This tool's catalog-inclusion gate — previously
   // `isRuntimeComponentEnabled('bash-engine')` embedded directly inside
   // `getLocalFileTools()`'s array-building conditional — now lives here as
   // this tool's own `isAvailable`, the same dimension `web_search`'s
   // provider-readiness gate and `terminal_command`'s platform gate already
-  // use (master.md §3.1b). `getLocalFileTools()` still explicitly consults
+  // use. `getLocalFileTools()` still explicitly consults
   // this (see that function's own comment) rather than applying `isAvailable`
   // uniformly to every registered tool: `ToolCatalogContext` carries no
   // `settings` snapshot, so a uniform pass there would silently drop
   // `web_search` (whose `isAvailable` needs `settings`) from every catalog
   // built without one — including the settings-page call sites that need the
   // full, unfiltered tool list to render toggles regardless of runtime
-  // readiness (decision 18). `isRuntimeComponentEnabled` is a synchronous,
+  // readiness. `isRuntimeComponentEnabled` is a synchronous,
   // side-effect-free global read (see its own doc comment) — exactly like
   // `terminal_command`'s `Platform.isDesktop` check — so no `ToolContext`
   // threading is needed for it.
@@ -79,10 +70,9 @@ export const bashDefinition = defineTool({
   // `callLocalFileTool` (`src/core/mcp/localFileTools.ts`), minus the abort
   // check / workspace-scope / YOLO-data-root guards and the outer try/catch
   // that normalizes thrown errors to an Error-status result — those are
-  // dispatcher responsibilities (master.md §3.4), not tool semantics.
+  // dispatcher responsibilities, not tool semantics.
   //
-  // Note on the security boundary (master.md §5, decision documented in this
-  // batch's task brief): `bash`'s per-path enforcement happens *inside*
+  // Note on the security boundary: `bash`'s per-path enforcement happens *inside*
   // `createVaultBashFileSystem` below, at the virtual filesystem layer, not
   // via the dispatcher's parameter-level `findPathOutsideScope` scan — this
   // tool's only argument is an opaque `command` string, so there is no path
@@ -96,7 +86,6 @@ export const bashDefinition = defineTool({
       app,
       settings,
       workspaceScope,
-      ragAccess,
       signal,
       toolCallId,
       bashApprovalMode,
@@ -131,13 +120,6 @@ export const bashDefinition = defineTool({
       const session = lease.api.createSession({
         fs,
         confirmDangerousOperation,
-        search: createVaultBashSearch({
-          app,
-          settings,
-          ragAccess,
-          workspaceScope,
-          signal,
-        }),
         signal,
         readOnly: bashReadOnly ?? false,
       })

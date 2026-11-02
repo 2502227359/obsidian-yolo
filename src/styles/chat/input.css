@@ -124,7 +124,8 @@ button.yolo-runtime-selector:disabled {
   user-select: none;
 }
 
-body.theme-dark .yolo-runtime-selector__provider-logo[data-provider='openai'] {
+body.theme-dark .yolo-runtime-selector__provider-logo[data-provider='openai'],
+body.theme-dark .yolo-runtime-selector__provider-logo[data-provider='xai'] {
   filter: invert(1);
 }
 
@@ -188,6 +189,14 @@ button.yolo-runtime-selector[data-compact='true']
   padding-block: 7px;
 }
 
+/* 行本身不是 Radix item（内嵌开关需要键盘可达），没有 [data-highlighted]，
+   键盘高亮态由 :focus-visible 提供 —— 与 .yolo-chat-mode-toggle-card 同一约定。 */
+.yolo-runtime-selector__option:focus-visible:not([data-state='checked']) {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--interactive-accent);
+  border-radius: var(--radius-s);
+}
+
 .yolo-runtime-selector__option-copy {
   display: flex;
   min-width: 0;
@@ -196,23 +205,114 @@ button.yolo-runtime-selector[data-compact='true']
   gap: 2px;
 }
 
-.yolo-runtime-selector__option-label,
-.yolo-runtime-selector__option-description {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.yolo-runtime-selector__option-title-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+/* 名字吃掉整行的空余，把它右边的一切（变体开关、对钩）顶到行尾成列。
+   这里靠 flex-grow 而不是 auto margin：开关自己带 `margin-left: auto`，
+   再给对钩加一个的话，两个 auto margin 会平分剩余空间，开关就会悬在行
+   中间而不是靠右。 */
+.yolo-runtime-selector__option-title-row
+  > .yolo-runtime-selector__option-label {
+  flex: 1 1 auto;
+}
+
+/* 对钩贴在行尾，开关排在它内侧。共享的 .yolo-popover-item__indicator 是用
+   opacity 隐藏的，仍然占位 —— 那在模型列表那种纯文字行里无所谓，但这里行尾
+   紧挨着变体开关，未勾选的行会让开关凭空左移一个对钩的宽度，看着就是没靠
+   右。所以只在本组件内、且只对未勾选的行撤掉占位。 */
+.yolo-runtime-selector__option-title-row > .yolo-popover-item__indicator {
+  flex: 0 0 auto;
+}
+
+.yolo-runtime-selector__option:not([data-state='checked'])
+  .yolo-popover-item__indicator {
+  display: none;
+}
+
+/* 家族变体开关：视觉语汇对齐对话模式弹窗里的 YOLO 开关。
+   这里是 <button>，Obsidian 全局 button 样式会盖上 border / background /
+   box-shadow，必须 !important 复位（与 .yolo-chat-mode-yolo-toggle 同一原因）。 */
+.yolo-runtime-selector__variant-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  margin-left: auto;
+  height: 18px;
+  min-height: 0;
+  padding: 2px 0;
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smallest);
+  font-weight: var(--font-medium);
+  line-height: 1;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.yolo-runtime-selector__variant-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--interactive-accent) !important;
+  border-radius: var(--radius-s);
+}
+
+.yolo-runtime-selector__variant-toggle[data-active='true'] {
+  color: var(--interactive-accent);
+}
+
+.yolo-runtime-selector__variant-toggle-label {
+  letter-spacing: 0.02em;
+}
+
+.yolo-runtime-selector__variant-toggle-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 26px;
+  height: 15px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: var(--background-modifier-border);
+  transition: background var(--yolo-anim-duration-feedback) ease;
+}
+
+.yolo-runtime-selector__variant-toggle[data-active='true']
+  .yolo-runtime-selector__variant-toggle-switch {
+  background: var(--interactive-accent);
+}
+
+.yolo-runtime-selector__variant-toggle-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--background-primary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: transform var(--yolo-anim-duration-feedback) ease;
+}
+
+.yolo-runtime-selector__variant-toggle[data-active='true']
+  .yolo-runtime-selector__variant-toggle-thumb {
+  transform: translateX(11px);
 }
 
 .yolo-runtime-selector__option-label {
+  overflow: hidden;
   color: var(--text-normal);
   font-size: var(--font-ui-smaller);
   font-weight: var(--font-medium);
-}
-
-.yolo-runtime-selector__option-description {
-  color: var(--text-muted);
-  font-size: var(--font-ui-smallest);
-  font-weight: var(--font-normal);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .yolo-context-usage-ring {
@@ -631,7 +731,9 @@ button.yolo-chat-quick-access-add {
     opacity var(--yolo-anim-duration-feedback) ease;
 }
 
-button.yolo-chat-quick-access-entry {
+/* 平板：见下方发送按钮注释里的 `.is-tablet button:not(.clickable-icon)`。 */
+button.yolo-chat-quick-access-entry,
+body.is-tablet button.yolo-chat-quick-access-entry {
   gap: var(--size-2-2);
   min-width: 0;
   max-width: 100%;
@@ -665,7 +767,9 @@ button.yolo-chat-quick-access-entry.is-dragging {
   opacity: 0.72;
 }
 
-button.yolo-chat-quick-access-add {
+/* 平板：见下方发送按钮注释里的 `.is-tablet button:not(.clickable-icon)`。 */
+button.yolo-chat-quick-access-add,
+body.is-tablet button.yolo-chat-quick-access-add {
   width: 32px;
   padding: 0;
 }
@@ -852,8 +956,14 @@ button.yolo-chat-quick-access-picker-row > svg {
   margin-right: auto;
 }
 
+/* 消息导航条贴在对话区左侧 host 内边距处。宽 pane 里居中剩下的留白自然避开它，
+ * 窄 pane 里正文会铺到它下面，所以两侧都让出与侧边栏布局相同的 20px 间距。
+ * 侧边栏布局的这 20px 见上方 .yolo-chat-container--sidebar 的同名规则。 */
 .yolo-chat-container--centered .yolo-chat-messages .yolo-chat-timeline-row {
-  width: min(100%, var(--yolo-chat-content-max-width));
+  width: min(
+    calc(100% - (var(--yolo-chat-host-inline-padding) + 20px) * 2),
+    var(--yolo-chat-content-max-width)
+  );
   margin-left: auto;
   margin-right: auto;
 }
@@ -1649,6 +1759,15 @@ button.yolo-chat-quick-access-picker-row > svg {
   container: yolo-chat-conversation / inline-size;
 }
 
+/* 主聊天滚动容器的高度只由会话面板的 flex 分配决定，从不取决于内容，所以可以
+ * 声明尺寸约束，让它成为独立的重排边界。不加的话，流式输出时尾段每长高一次，
+ * 重排都会沿着 flex 祖先链一路传到整个 Obsidian 工作区：每次只有几十个脏节点，
+ * 布局却要遍历上千个。实测加上后布局耗时降到原来的四分之一，无障碍树更新随之
+ * 大减。Quick Ask 也用 .yolo-chat-messages，但它的高度跟随内容，不能加。 */
+.yolo-chat-conversation-surface > .yolo-chat-messages {
+  contain: size;
+}
+
 .yolo-chat-messages {
   flex: 1 1 auto;
   min-height: 0;
@@ -1787,6 +1906,9 @@ button.yolo-chat-quick-access-picker-row > svg {
   box-shadow: none !important;
   pointer-events: auto;
   cursor: pointer;
+  /* 手指按住刻度上下拖动是在刻度间滑选，不能被浏览器认领成滚动，
+   * 否则 pointercancel 之后就收不到 pointermove 了。 */
+  touch-action: none;
   --yolo-message-navigator-wave: 0;
 }
 
@@ -1883,12 +2005,6 @@ button.yolo-chat-quick-access-picker-row > svg {
   to {
     opacity: 1;
     transform: translate(0, -50%);
-  }
-}
-
-@media (max-width: 768px) {
-  .yolo-message-navigator {
-    display: none;
   }
 }
 
@@ -2519,6 +2635,83 @@ button.yolo-assistant-annotation-marker.is-active {
   color: var(--text-normal);
 }
 
+/* ── countdown of the card reporting automatic updates, around its close
+   button; hovering or focusing the card holds it at full ── */
+.yolo-update-toast-icon-button:has(.yolo-update-toast-countdown) {
+  position: relative;
+}
+
+.yolo-update-toast-countdown {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+  pointer-events: none;
+}
+
+.yolo-update-toast-countdown-ring {
+  fill: none;
+  stroke: var(--text-faint);
+  stroke-width: 1.5;
+  stroke-dasharray: 1;
+  stroke-dashoffset: 0;
+}
+
+.yolo-update-toast-countdown-ring.is-running {
+  /* Exempt from the opacity/transform rule: the ring's length is the
+     countdown itself, and a paint-only stroke on a 24px icon never reflows. */
+  animation: yolo-update-toast-countdown linear forwards;
+}
+
+@keyframes yolo-update-toast-countdown {
+  to {
+    stroke-dashoffset: 1;
+  }
+}
+
+/* ── one tab per update when the card holds several ── */
+.yolo-update-toast-tabs {
+  display: flex;
+  gap: 4px;
+  margin-top: 10px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+button.yolo-update-toast-tab {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  height: auto;
+  padding: 3px 9px;
+  border: none !important;
+  border-radius: 6px;
+  background: transparent !important;
+  box-shadow: none !important;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  cursor: var(--cursor);
+}
+
+button.yolo-update-toast-tab:hover {
+  background: var(--background-modifier-hover) !important;
+  color: var(--text-normal);
+}
+
+button.yolo-update-toast-tab.is-active {
+  background: var(--background-modifier-hover) !important;
+  color: var(--text-normal);
+}
+
+.yolo-update-toast-tab-version {
+  font-family: var(--font-monospace);
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
 /* ── divider + body ── */
 .yolo-update-toast-divider {
   height: 1px;
@@ -2687,7 +2880,12 @@ button.yolo-assistant-annotation-marker.is-active {
 
 .yolo-update-toast-history-btn {
   flex-shrink: 0;
-  padding: 4px 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
   border: none !important;
   border-radius: var(--radius-s);
   box-shadow: none !important;
@@ -3670,7 +3868,9 @@ button.yolo-assistant-annotation-marker.is-active {
 }
 
 .yolo-chat-user-input-controls__left .yolo-chat-input-model-select {
-  max-width: 160px;
+  /* 上限只是「别把整行吃光」的护栏，不是常态约束：行内有空间时完整显示模型名，
+   * 空间不足时再由 flex 收缩 + 省略号处理 */
+  max-width: 320px;
   min-width: 0;
   flex-shrink: 1;
 }
@@ -3678,10 +3878,6 @@ button.yolo-assistant-annotation-marker.is-active {
 .yolo-chat-user-input-controls__left .yolo-reasoning-select {
   min-width: 72px;
   flex: 0 1 auto;
-}
-
-.yolo-chat-user-input-controls__left .yolo-chat-input-model-select__model-name {
-  max-width: 120px;
 }
 
 .yolo-chat-user-input-toolbar {
@@ -3724,7 +3920,8 @@ button.yolo-assistant-annotation-marker.is-active {
 }
 
 .yolo-chat-user-input-toolbar__right .yolo-chat-input-model-select {
-  max-width: 160px;
+  /* 同 controls__left：上限是护栏而非常态约束 */
+  max-width: 320px;
   min-width: 0;
   flex-shrink: 1;
 }
@@ -3732,10 +3929,6 @@ button.yolo-assistant-annotation-marker.is-active {
 .yolo-chat-user-input-toolbar__right .yolo-reasoning-select {
   min-width: 72px;
   flex: 0 1 auto;
-}
-
-.yolo-chat-user-input-toolbar__right .yolo-chat-input-model-select__model-name {
-  max-width: 120px;
 }
 
 /* 底部工具栏控件：默认用 text-muted + normal 字重，比全局 medium 略轻但仍可读 */
@@ -3819,8 +4012,14 @@ button.yolo-assistant-annotation-marker.is-active {
  *
  * 同样地，Obsidian 的全局规则 `svg { width/height: var(--icon-size) }`
  * 会覆盖 lucide 通过 inline 属性写入的尺寸 —— 必须在选择器内显式给 svg
- * 兜底宽高，否则图标会被撑大或缩成奇形怪状。 */
-button.yolo-chat-user-input-submit-button-circle {
+ * 兜底宽高，否则图标会被撑大或缩成奇形怪状。
+ *
+ * iPad 上 Obsidian 还有 `.is-tablet button:not(.clickable-icon)
+ * { padding: var(--size-4-1) var(--size-4-5) }`，特异度 (0,2,1) 高于这里，
+ * 会把 24px 圆按钮撑成椭圆、图标宽度挤成 0。聊天面板里自己定内边距的按钮
+ * 都要带上 `body.is-tablet` 版本的选择器才能在平板上保住自己的内边距。 */
+button.yolo-chat-user-input-submit-button-circle,
+body.is-tablet button.yolo-chat-user-input-submit-button-circle {
   /* 略大于左侧 `+` 按钮（var(--size-4-5) ≈ 20px），强化"主按钮"地位但
    * 又不至于撑出 var(--size-4-4) 行高太多。 */
   width: 24px;
@@ -4051,15 +4250,18 @@ button.yolo-chat-user-input-submit-button-circle.is-stop:hover:not(:disabled) {
 
 .yolo-chat-mode-select-item[data-state='checked']
   .yolo-chat-mode-select-item__icon,
-.yolo-chat-mode-agent-card[data-state='checked']
+.yolo-chat-mode-toggle-card[data-state='checked']
   .yolo-chat-mode-select-item__icon,
 .yolo-chat-mode-select-item[data-highlighted]
   .yolo-chat-mode-select-item__icon {
   color: var(--text-normal);
 }
 
-/* Self-drawn dropdown rows: Ask remains a plain button; Agent hosts the YOLO
- * switch while the outer row keeps the same popover-item sizing as before. */
+/* Self-drawn dropdown rows: Ask remains a plain button; every tool mode
+ * (Agent, Max — see `isToolChatMode`) hosts its own YOLO switch while the
+ * outer row keeps the same popover-item sizing as before. Cards are told
+ * apart by `data-mode`, so the shared `.yolo-chat-mode-toggle-card` block
+ * styles both. */
 button.yolo-chat-mode-select-item {
   width: 100%;
   height: auto;
@@ -4074,7 +4276,12 @@ button.yolo-chat-mode-select-item {
   appearance: none;
 }
 
-button.yolo-chat-mode-select-item:focus-visible {
+/* 焦点环只在焦点离开选中项时出现。打开菜单会把焦点程序化地放到选中项上
+ * （见 ChatModeSelect 的 focusSelectedItem），而选中态自身已用背景与描边
+ * 指明了位置，此时再叠一圈只是重复——且 :focus-visible 是否命中取决于
+ * 浏览器对"最近交互模态"的判断，于是刚启动后的第一次打开有环、之后没有。
+ * 焦点离开选中项后，这圈环是键盘上下导航唯一的视觉反馈，不能省。 */
+button.yolo-chat-mode-select-item:focus-visible:not([data-state='checked']) {
   outline: none;
   box-shadow: inset 0 0 0 2px var(--interactive-accent) !important;
   border-radius: var(--radius-s);
@@ -4099,26 +4306,27 @@ button.yolo-chat-mode-select-item[data-state='checked'] {
     color-mix(in srgb, var(--background-modifier-border) 60%, transparent) !important;
 }
 
-.yolo-chat-mode-agent-card {
+.yolo-chat-mode-toggle-card {
   display: flex;
   align-items: flex-start;
   gap: 10px;
 }
 
-.yolo-chat-mode-agent-card:focus-visible {
+/* 与 button.yolo-chat-mode-select-item:focus-visible 同一约定。 */
+.yolo-chat-mode-toggle-card:focus-visible:not([data-state='checked']) {
   outline: none;
   box-shadow: inset 0 0 0 2px var(--interactive-accent) !important;
   border-radius: var(--radius-s);
 }
 
-.yolo-chat-mode-agent-card__title-row {
+.yolo-chat-mode-toggle-card__title-row {
   display: flex;
   align-items: center;
   gap: 10px;
   min-width: 0;
 }
 
-.yolo-chat-mode-agent-card__title-row .yolo-chat-mode-select-item__label {
+.yolo-chat-mode-toggle-card__title-row .yolo-chat-mode-select-item__label {
   flex: 0 0 auto;
 }
 
@@ -4635,6 +4843,80 @@ button.yolo-chat-user-input-file-badge-delete:focus-visible,
   border: 0 !important;
   box-shadow: none !important;
   outline: none !important;
+}
+
+/* An attached image, shown as itself rather than by its file name. */
+.yolo-chat-user-input-image-badge {
+  position: relative;
+  flex-shrink: 0;
+}
+
+button.yolo-chat-user-input-image-badge-thumbnail {
+  display: block;
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  margin: 0;
+  border: 1px solid
+    color-mix(in srgb, var(--background-modifier-border) 60%, transparent);
+  border-radius: var(--radius-s);
+  background: var(--background-primary);
+  box-shadow: none;
+  overflow: hidden;
+  cursor: zoom-in;
+}
+
+button.yolo-chat-user-input-image-badge-thumbnail:hover {
+  border-color: var(--background-modifier-border-hover);
+}
+
+button.yolo-chat-user-input-image-badge-thumbnail img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+button.yolo-chat-user-input-image-badge-delete {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 50%;
+  background: var(--background-primary);
+  box-shadow: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+button.yolo-chat-user-input-image-badge-delete:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+@media (hover: hover) {
+  button.yolo-chat-user-input-image-badge-delete {
+    opacity: 0;
+  }
+
+  .yolo-chat-user-input-image-badge:hover
+    button.yolo-chat-user-input-image-badge-delete,
+  button.yolo-chat-user-input-image-badge-delete:focus-visible {
+    opacity: 1;
+  }
+}
+
+.yolo-chat-user-input-wrapper--compact
+  button.yolo-chat-user-input-image-badge-delete {
+  display: none;
 }
 
 .yolo-chat-user-input-file-badge-expand {

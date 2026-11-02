@@ -40,6 +40,23 @@ export {
   type RegisteredModuleChatModeV1,
 } from './moduleChatModeRegistry'
 export {
+  MODULE_RENDERED_FILE_SOURCE_MAX_BYTES,
+  ModuleFileTextRendererRegistry,
+  snapshotModuleFileTextRenderer,
+  type ModuleFileTextRendererContributionSinkV1,
+  type RegisteredModuleFileTextRendererV1,
+} from './moduleFileTextRendererRegistry'
+export {
+  MAX_MODULE_TOOL_SETS_PER_MODULE,
+  MODULE_TOOL_SET_ID_RE,
+  ModuleToolSetRegistry,
+  buildModuleToolSetServerName,
+  snapshotModuleToolSet,
+  type ModuleToolSetAvailabilityV1,
+  type ModuleToolSetContributionSinkV1,
+  type RegisteredModuleToolSetV1,
+} from './moduleToolSetRegistry'
+export {
   createModuleSkillMaterializer,
   createObsidianModuleSkillProjectionVault,
   planModuleSkillPackages,
@@ -119,6 +136,7 @@ export {
   type ModulePathsCapabilityActivationV1,
   type ModulePathsCapabilityProviderV1,
 } from './modulePaths'
+export { ModulePdfCapabilityProvider } from './modulePdf'
 export {
   ModulePrivateStorageCapabilityProvider,
   ModulePrivateStorageVerificationError,
@@ -189,12 +207,9 @@ export {
   type ModuleManagerOptions,
 } from './moduleManager'
 export {
-  findCompatibleUpdate,
-  getOfficialModuleCompatibilityIssues,
-  parseOfficialModuleCatalog,
-  selectInitialCompatibleVersion,
+  isHostApiCompatible,
+  isModuleHostApiRange,
   type OfficialModuleCatalogModule,
-  type OfficialModuleCatalogParserOptions,
   type OfficialModuleCatalogV1,
   type OfficialModuleCatalogVersion,
   type OfficialModuleCompatibility,
@@ -245,7 +260,6 @@ export {
   ModuleArtifactMissingError,
   ModuleStore,
   collectModuleManifestFiles,
-  isModuleHostApiRange,
   moduleArtifactReleaseParent,
   parseModuleArtifactManifest,
   selectModuleManifestVariant,
@@ -263,6 +277,7 @@ export {
   ObsidianModuleContributionRegistrar,
   type ModuleContributionRegistrar,
 } from './moduleRuntime'
+export type { ModuleRibbonSlots } from './moduleRibbonSlots'
 export {
   ModuleRuntimeReservation,
   type ModuleRuntimeQuiescence,
@@ -321,6 +336,7 @@ export type {
   YoloModulePathsV1,
   YoloModuleConfirmOptionsV1,
   YoloModuleHoverLinkOptionsV1,
+  YoloModuleMarkdownRendererOptionsV1,
   YoloModuleMarkdownRendererV1,
   YoloModuleUiV1,
   YoloModuleRibbonActionV1,
@@ -358,3 +374,8 @@ export {
   type LearningLegacyInstallMigrationOptions,
   type LearningLegacyInstallMigrationResult,
 } from './learningLegacyInstallMigration'
+export {
+  DEFAULT_INSTALLED_MODULE_IDS,
+  seedDefaultModuleInstallIntents,
+  type DefaultModuleInstallSeedOptions,
+} from './defaultModuleInstalls'

@@ -8,7 +8,13 @@ import {
   Settings,
   Wrench,
 } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 
 import { useApp } from '../../contexts/app-context'
 import { useLanguage } from '../../contexts/language-context'
@@ -20,6 +26,7 @@ import {
   isDefaultAssistantId,
 } from '../../core/agent/default-assistant'
 import { countEnabledVisibleAssistantTools } from '../../core/agent/tool-display-count'
+import { toModuleToolSetEnablement } from '../../core/modules/moduleToolSetRegistry'
 import { Assistant } from '../../types/assistant.types'
 import type { McpTool } from '../../types/mcp.types'
 import { renderAssistantIcon } from '../../utils/assistant-icon'
@@ -49,6 +56,20 @@ export function AssistantSelector({
   const triggerRef = useRef<HTMLButtonElement | null>(null)
   const isControlled = typeof currentAssistantId === 'string'
 
+  // Module tool sets: same registry `useSyncExternalStore` pattern as `Chat.tsx`'s
+  // module chat mode subscription, reduced to what
+  // `countEnabledVisibleAssistantTools` needs so this selector's per-agent
+  // tool count matches what the agent editor and chat runtime resolve.
+  const moduleToolSetRegistry = plugin.getModuleToolSetRegistry()
+  const moduleToolSetSnapshot = useSyncExternalStore(
+    moduleToolSetRegistry.subscribe,
+    moduleToolSetRegistry.getSnapshot,
+  )
+  const moduleToolSetEnablement = useMemo(
+    () => toModuleToolSetEnablement(moduleToolSetSnapshot),
+    [moduleToolSetSnapshot],
+  )
+
   useEffect(() => {
     let mounted = true
     let requestId = 0
@@ -64,7 +85,7 @@ export function AssistantSelector({
         const refreshAvailableTools = () => {
           const currentRequestId = ++requestId
           void manager
-            .listAvailableTools({ includeBuiltinTools: true })
+            .listAvailableTools()
             .then((tools) => {
               if (mounted && currentRequestId === requestId) {
                 setAvailableTools(tools)
@@ -158,13 +179,6 @@ export function AssistantSelector({
     openPluginSettingsTab(app, plugin, 'agent')
   }
 
-  const defaultAssistant = assistants.find((assistant) =>
-    isDefaultAssistantId(assistant.id),
-  )
-  const customAssistants = assistants.filter(
-    (assistant) => !isDefaultAssistantId(assistant.id),
-  )
-
   const renderMetaRow = (assistant: Assistant) => {
     const followDefaultLabel = t(
       'settings.agent.followDefaultModel',
@@ -178,9 +192,11 @@ export function AssistantSelector({
       rawModelId === followDefaultLabel || !rawModelId.includes('/')
         ? rawModelId
         : rawModelId.slice(rawModelId.lastIndexOf('/') + 1)
-    const toolCount = assistant.enableTools
-      ? countEnabledVisibleAssistantTools(assistant, availableTools)
-      : 0
+    const toolCount = countEnabledVisibleAssistantTools(
+      assistant,
+      availableTools,
+      moduleToolSetEnablement,
+    )
     return (
       <div className="yolo-assistant-selector-item-meta">
         {modelLabel && (
@@ -296,8 +312,7 @@ export function AssistantSelector({
         sideOffset={14}
       >
         <ul className="yolo-assistant-selector-list yolo-model-select-list">
-          {defaultAssistant && renderAssistantRow(defaultAssistant)}
-          {customAssistants.map((assistant) => renderAssistantRow(assistant))}
+          {assistants.map((assistant) => renderAssistantRow(assistant))}
         </ul>
 
         <div className="yolo-assistant-selector-footer">

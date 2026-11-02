@@ -11,16 +11,24 @@ import type YoloPlugin from '../../../main'
 import type { YoloSettings } from '../../../settings/schema/setting.types'
 import type { Mentionable } from '../../../types/mentionable'
 import { getPdfLeafContentEl } from '../selection-chat/getPdfSelectionData'
+import { getReadingViewRenderer } from '../selection-chat/readingViewSections'
 import { pdfSelectionHighlightController } from '../selection-highlight/pdfSelectionHighlightController'
+import { readingSelectionHighlightController } from '../selection-highlight/readingSelectionHighlightController'
 import { selectionHighlightController } from '../selection-highlight/selectionHighlightController'
 
-import { createCmAnchor, createPdfAnchor } from './quickAsk.anchor'
+import {
+  type QuickAskAnchor,
+  createCmAnchor,
+  createPdfAnchor,
+  createReadingAnchor,
+} from './quickAsk.anchor'
+import { buildQuickAskContextText } from './quickAsk.context'
+import { createQuickAskTriggerExtension } from './quickAsk.trigger'
 import type {
   QuickAskLaunchMode,
   QuickAskSelectionScope,
   QuickAskShowOptions,
 } from './quickAsk.types'
-import { QUICK_ASK_CURSOR_MARKER } from './quickAsk.types'
 
 type QuickAskWidgetPayload = {
   pos: number
@@ -31,6 +39,7 @@ type QuickAskWidgetPayload = {
     contextText: string
     fileTitle: string
     sourceFilePath?: string
+    getSurfaceContext?: () => string | Promise<string>
     initialPrompt?: string
     initialMentionables?: Mentionable[]
     initialMode?: QuickAskLaunchMode
@@ -50,6 +59,31 @@ type QuickAskWidgetState = {
   close: (restoreFocus?: boolean) => void
 } | null
 
+/**
+ * A selection on a rendered, non-editable surface Quick Ask can open from:
+ * a PDF page or a Markdown view in reading mode.
+ */
+export type ReadOnlyQuickAskSource =
+  | {
+      kind: 'pdf'
+      leaf: WorkspaceLeaf
+      range: Range
+      file: TFile
+      pageNumber: number
+    }
+  | { kind: 'reading'; leaf: WorkspaceLeaf; range: Range; file: TFile }
+
+export type ReadOnlyQuickAskArgs = {
+  source: ReadOnlyQuickAskSource
+  contextText?: string
+  initialMentionables?: Mentionable[]
+  initialPrompt?: string
+  initialMode?: QuickAskLaunchMode
+  initialInput?: string
+  autoSend?: boolean
+  initialAssistantId?: string
+}
+
 type QuickAskControllerDeps = {
   plugin: YoloPlugin
   getSettings: () => YoloSettings
@@ -58,8 +92,6 @@ type QuickAskControllerDeps = {
   getActiveFileTitle: () => string
 }
 
-const DEFAULT_QUICK_ASK_CONTEXT_BEFORE_CHARS = 5000
-const DEFAULT_QUICK_ASK_CONTEXT_AFTER_CHARS = 2000
 const quickAskWidgetEffect = StateEffect.define<QuickAskWidgetPayload | null>()
 
 const quickAskOverlayPlugin = ViewPlugin.fromClass(
@@ -112,15 +144,15 @@ const quickAskOverlayPlugin = ViewPlugin.fromClass(
 
 export class QuickAskController {
   private quickAskWidgetState: QuickAskWidgetState = null
-  private pdfQuickAskInstance: {
+  private readOnlyQuickAskInstance: {
     overlay: QuickAskOverlay
     leaf: WorkspaceLeaf
   } | null = null
   private highlightTakeoverToken = 0
   /** id of the current quickask highlight, so we can clear it on close */
   private currentHighlightId: string | null = null
-  /** id of the current quickask PDF highlight, so we can clear it on close */
-  private currentPdfHighlightId: string | null = null
+  /** Clears the current quickask highlight on a read-only surface. */
+  private clearReadOnlyHighlight: (() => void) | null = null
 
   constructor(private readonly deps: QuickAskControllerDeps) {}
 
@@ -131,17 +163,14 @@ export class QuickAskController {
   }
 
   close(restoreFocus = true) {
-    // Destroy PDF instance if present
-    if (this.pdfQuickAskInstance) {
-      const { overlay } = this.pdfQuickAskInstance
-      this.pdfQuickAskInstance = null
+    // Destroy the read-only surface instance if present
+    if (this.readOnlyQuickAskInstance) {
+      const { overlay } = this.readOnlyQuickAskInstance
+      this.readOnlyQuickAskInstance = null
       overlay.destroy()
     }
 
-    if (this.currentPdfHighlightId) {
-      pdfSelectionHighlightController.clearById(this.currentPdfHighlightId)
-      this.currentPdfHighlightId = null
-    }
+    this.clearReadOnlyHighlightNow()
 
     const state = this.quickAskWidgetState
     if (!state) {
@@ -233,26 +262,11 @@ export class QuickAskController {
         : { from: selection.from, to: selection.to }
 
     // Get context text around cursor with marker
-    const continuationOptions = this.deps.getSettings().continuationOptions
-    const beforeChars = Math.max(
-      0,
-      continuationOptions?.quickAskContextBeforeChars ??
-        DEFAULT_QUICK_ASK_CONTEXT_BEFORE_CHARS,
+    const contextText = buildQuickAskContextText(
+      view,
+      pos,
+      this.deps.getSettings(),
     )
-    const afterChars = Math.max(
-      0,
-      continuationOptions?.quickAskContextAfterChars ??
-        DEFAULT_QUICK_ASK_CONTEXT_AFTER_CHARS,
-    )
-    const doc = view.state.doc
-    const beforeStart = Math.max(0, pos - beforeChars)
-    const afterEnd = Math.min(doc.length, pos + afterChars)
-    const before = doc.sliceString(beforeStart, pos)
-    const after = doc.sliceString(pos, afterEnd)
-    const contextText =
-      before.length > 0 || after.length > 0
-        ? `${before}${QUICK_ASK_CURSOR_MARKER}${after}`
-        : ''
     const fileTitle = this.deps.getActiveFileTitle()
     const sourceFilePath = this.deps.getActiveMarkdownView()?.file?.path
     const initialPrompt = options?.initialPrompt
@@ -263,6 +277,7 @@ export class QuickAskController {
     const isRewriteEntry = options?.isRewriteEntry
     const autoSend = options?.autoSend
     const initialAssistantId = options?.initialAssistantId
+    const getSurfaceContext = options?.getSurfaceContext
 
     // Close any existing Quick Ask panel (CM or PDF)
     this.close(false)
@@ -282,10 +297,7 @@ export class QuickAskController {
           selectionHighlightController.clearById(this.currentHighlightId)
           this.currentHighlightId = null
         }
-        if (this.currentPdfHighlightId) {
-          pdfSelectionHighlightController.clearById(this.currentPdfHighlightId)
-          this.currentPdfHighlightId = null
-        }
+        this.clearReadOnlyHighlightNow()
         this.quickAskWidgetState = null
       }
       view.dispatch({ effects: quickAskWidgetEffect.of(null) })
@@ -316,6 +328,7 @@ export class QuickAskController {
             contextText,
             fileTitle,
             sourceFilePath,
+            getSurfaceContext,
             initialPrompt,
             initialMentionables,
             initialMode,
@@ -336,55 +349,31 @@ export class QuickAskController {
   }
 
   /**
-   * Launch a Quick Ask overlay from a PDF selection.
+   * Launch a Quick Ask overlay from a selection on a read-only surface.
    * Bypasses the CodeMirror ViewPlugin path entirely.
    */
-  showFromPdf(args: {
-    leaf: WorkspaceLeaf
-    range: Range
-    file: TFile
-    pageNumber: number
-    contextText?: string
-    initialMentionables?: Mentionable[]
-    initialPrompt?: string
-    initialMode?: QuickAskLaunchMode
-    initialInput?: string
-    autoSend?: boolean
-    initialAssistantId?: string
-  }): void {
-    void this.showFromPdfAfterWarmup(args).catch((error: unknown) => {
-      console.error('[YOLO] Failed to open Quick Ask from PDF:', error)
-    })
+  showFromReadOnlySelection(args: ReadOnlyQuickAskArgs): void {
+    void this.showFromReadOnlySelectionAfterWarmup(args).catch(
+      (error: unknown) => {
+        console.error('[YOLO] Failed to open Quick Ask from selection:', error)
+      },
+    )
   }
 
-  private async showFromPdfAfterWarmup(args: {
-    leaf: WorkspaceLeaf
-    range: Range
-    file: TFile
-    pageNumber: number
-    contextText?: string
-    initialMentionables?: Mentionable[]
-    initialPrompt?: string
-    initialMode?: QuickAskLaunchMode
-    initialInput?: string
-    autoSend?: boolean
-    initialAssistantId?: string
-  }): Promise<void> {
+  private async showFromReadOnlySelectionAfterWarmup(
+    args: ReadOnlyQuickAskArgs,
+  ): Promise<void> {
     await this.deps.plugin.warmupAgentService()
 
-    const hostEl = getPdfLeafContentEl(args.leaf)
-    if (!hostEl) {
-      // PDF leaf DOM not in expected shape — refuse to mount rather than
-      // falling back to document.body (would float in wrong coordinate space).
+    const { source } = args
+    // Refuse to mount when the leaf DOM is not in the expected shape rather
+    // than falling back to document.body (wrong coordinate space).
+    const anchor = this.createReadOnlyAnchor(source)
+    if (!anchor?.isValid()) {
       return
     }
 
-    const anchor = createPdfAnchor(args.range, hostEl)
-    if (!anchor.isValid()) {
-      return
-    }
-
-    // Close any existing Quick Ask (CM or PDF)
+    // Close any existing Quick Ask (CM or read-only surface)
     this.close(false)
 
     const capabilities: QuickAskCapabilities = {
@@ -394,15 +383,12 @@ export class QuickAskController {
     }
 
     const onClose = () => {
-      const instance = this.pdfQuickAskInstance
+      const instance = this.readOnlyQuickAskInstance
       if (instance) {
-        this.pdfQuickAskInstance = null
+        this.readOnlyQuickAskInstance = null
         instance.overlay.destroy()
       }
-      if (this.currentPdfHighlightId) {
-        pdfSelectionHighlightController.clearById(this.currentPdfHighlightId)
-        this.currentPdfHighlightId = null
-      }
+      this.clearReadOnlyHighlightNow()
     }
 
     const overlay = new QuickAskOverlay({
@@ -410,8 +396,8 @@ export class QuickAskController {
       anchor,
       capabilities,
       contextText: args.contextText ?? '',
-      fileTitle: args.file.basename,
-      sourceFilePath: args.file.path,
+      fileTitle: source.file.basename,
+      sourceFilePath: source.file.path,
       initialPrompt: args.initialPrompt,
       initialMentionables: args.initialMentionables,
       initialMode: args.initialMode ?? 'ask',
@@ -421,38 +407,78 @@ export class QuickAskController {
       onClose,
     })
 
-    this.pdfQuickAskInstance = { overlay, leaf: args.leaf }
+    this.readOnlyQuickAskInstance = { overlay, leaf: source.leaf }
     overlay.mount()
 
-    // Mirror Markdown's persistence: register a 'sync' highlight on the PDF
-    // leaf so the selected range stays visually highlighted while the Quick
-    // Ask floats. Cleared in close()/onClose. Gated by the same setting.
+    // Mirror Markdown's persistence: register a 'sync' highlight so the
+    // selected range stays visually highlighted while the Quick Ask floats.
+    // Cleared in close()/onClose. Gated by the same setting.
     if (
       this.deps.getSettings().continuationOptions.persistSelectionHighlight ??
       true
     ) {
       const id = `quickask:${crypto.randomUUID()}`
-      this.currentPdfHighlightId = id
-      pdfSelectionHighlightController.addHighlight(
-        args.leaf,
-        id,
-        { range: args.range, pageNumber: args.pageNumber, file: args.file },
-        'sync',
-        'quickask',
-      )
+      if (source.kind === 'pdf') {
+        pdfSelectionHighlightController.addHighlight(
+          source.leaf,
+          id,
+          {
+            range: source.range,
+            pageNumber: source.pageNumber,
+            file: source.file,
+          },
+          'sync',
+          'quickask',
+        )
+        this.clearReadOnlyHighlight = () =>
+          pdfSelectionHighlightController.clearById(id)
+      } else {
+        readingSelectionHighlightController.addHighlight(
+          source.leaf,
+          id,
+          { range: source.range, file: source.file },
+          'sync',
+          'quickask',
+        )
+        this.clearReadOnlyHighlight = () =>
+          readingSelectionHighlightController.clearById(id)
+      }
     }
   }
 
+  private createReadOnlyAnchor(
+    source: ReadOnlyQuickAskSource,
+  ): QuickAskAnchor | null {
+    if (source.kind === 'pdf') {
+      const hostEl = getPdfLeafContentEl(source.leaf)
+      return hostEl ? createPdfAnchor(source.range, hostEl) : null
+    }
+    const renderer = getReadingViewRenderer(source.leaf.view)
+    if (!renderer) return null
+    return createReadingAnchor(
+      source.range,
+      source.leaf.view.containerEl,
+      renderer.previewEl,
+      renderer.sizerEl,
+    )
+  }
+
+  private clearReadOnlyHighlightNow(): void {
+    const clear = this.clearReadOnlyHighlight
+    this.clearReadOnlyHighlight = null
+    clear?.()
+  }
+
   /**
-   * If the owning PDF leaf is no longer in the workspace, drop the lingering
-   * Quick Ask instance.  Caller (SelectionChatController) drives this from
-   * `layout-change`.
+   * If the owning leaf is no longer in the workspace, drop the lingering
+   * read-only Quick Ask instance. Caller (SelectionChatController) drives
+   * this from `layout-change`.
    */
-  pruneOrphanedPdfInstance(activePdfLeaves: Set<WorkspaceLeaf>): void {
-    const instance = this.pdfQuickAskInstance
+  pruneOrphanedReadOnlyInstance(openLeaves: Set<WorkspaceLeaf>): void {
+    const instance = this.readOnlyQuickAskInstance
     if (!instance) return
-    if (!activePdfLeaves.has(instance.leaf)) {
-      this.pdfQuickAskInstance = null
+    if (!openLeaves.has(instance.leaf)) {
+      this.readOnlyQuickAskInstance = null
       instance.overlay.destroy()
     }
   }
@@ -488,99 +514,30 @@ export class QuickAskController {
     )
   }
 
+  /**
+   * The Markdown-view route: the same trigger every surface uses, resolving
+   * the editor to show on from the active Markdown view. `quickAskOverlayPlugin`
+   * rides along because this route mounts the panel through a CodeMirror state
+   * effect, so the overlay's lifetime follows the view it was opened on.
+   */
   createTriggerExtension(): Extension {
+    const resolveEditor = (view: EditorView): Editor | null => {
+      const editor = this.deps.getActiveMarkdownView()?.editor
+      if (!editor) return null
+      const activeView = this.deps.getEditorView(editor)
+      if (activeView && activeView !== view) return null
+      return editor
+    }
+
     return [
       quickAskOverlayPlugin,
-      EditorView.domEventHandlers({
-        beforeinput: (event, view) => {
-          // Check if Quick Ask feature is enabled (default: true)
-          const enableQuickAsk =
-            this.deps.getSettings().continuationOptions?.enableQuickAsk ?? true
-          if (!enableQuickAsk) {
-            return false
-          }
-
-          if (event.defaultPrevented) {
-            return false
-          }
-
-          // Get trigger string from settings (default: @)
-          const triggerStr =
-            this.deps.getSettings().continuationOptions?.quickAskTrigger ?? '@'
-
-          const inputEvent = event
-          if (inputEvent.inputType !== 'insertText') {
-            return false
-          }
-          if (inputEvent.isComposing) {
-            return false
-          }
-
-          // Determine what character the user is typing
-          const typedChar = inputEvent.data ?? ''
-
-          // Only proceed if the typed character could be part of the trigger
-          if (typedChar.length !== 1) {
-            return false
-          }
-
-          const selection = view.state.selection.main
-          if (!selection.empty) {
-            return false
-          }
-
-          // Check if cursor is at an empty line or at line start
-          const line = view.state.doc.lineAt(selection.head)
-          const lineTextBeforeCursor = line.text.slice(
-            0,
-            selection.head - line.from,
-          )
-
-          // Build the potential trigger sequence: existing text + new character
-          const potentialSequence = lineTextBeforeCursor + typedChar
-
-          // Check if the potential sequence matches the trigger string
-          if (potentialSequence !== triggerStr) {
-            // Check if it could be a partial match (for multi-char triggers)
-            if (
-              triggerStr.length > 1 &&
-              triggerStr.startsWith(potentialSequence)
-            ) {
-              // Allow the character to be typed, it might complete the trigger later
-              return false
-            }
-            return false
-          }
-
-          const markdownView = this.deps.getActiveMarkdownView()
-          const editor = markdownView?.editor
-          if (!editor) {
-            return false
-          }
-
-          const activeView = this.deps.getEditorView(editor)
-          if (activeView && activeView !== view) {
-            return false
-          }
-
-          // Prevent default input
-          event.preventDefault()
-          event.stopPropagation()
-
-          // Clear the trigger characters from the line before showing panel
-          if (lineTextBeforeCursor.length > 0) {
-            // Delete the partial trigger that was already typed
-            const deleteFrom = line.from
-            const deleteTo = selection.head
-            view.dispatch({
-              changes: { from: deleteFrom, to: deleteTo },
-              selection: { anchor: deleteFrom },
-            })
-          }
-
-          // Show Quick Ask panel
+      createQuickAskTriggerExtension({
+        getSettings: () => this.deps.getSettings(),
+        canTrigger: (view) => resolveEditor(view) !== null,
+        show: (view) => {
+          const editor = resolveEditor(view)
+          if (!editor) return
           this.show(editor, view)
-          return true
         },
       }),
     ]

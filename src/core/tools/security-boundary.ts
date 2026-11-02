@@ -1,7 +1,7 @@
 import type { YoloSettings } from '../../settings/schema/setting.types'
 import type { AssistantWorkspaceScope } from '../../types/assistant.types'
 import {
-  buildAllowedSkillPathSet,
+  buildScopeExemptPathSet,
   describePathDenial,
   findPathOutsideScope,
   findPathWithinExcludedRoot,
@@ -10,7 +10,7 @@ import { isWithinYoloUserDataRoot } from '../paths/yoloPaths'
 
 /**
  * The two safety-critical checks that live outside every built-in tool's own
- * logic (master.md §3.4). `dispatcher.ts` is the only caller.
+ * logic. `dispatcher.ts` is the only caller.
  *
  * Throws with the exact same messages the pre-registry inline checks threw.
  * Callers must run this inside the same try/catch that normalizes thrown
@@ -64,9 +64,10 @@ export function enforceBuiltinToolSecurityBoundary(
   // for UI Rejected status, but we re-validate here so manual-approval /
   // direct-call code paths cannot bypass the constraint.
   if (workspaceScope?.enabled) {
-    const exemptPaths = allowedSkillPaths
-      ? buildAllowedSkillPathSet(allowedSkillPaths)
-      : undefined
+    const exemptPaths = buildScopeExemptPathSet({
+      allowedSkillPaths,
+      settings,
+    })
     const offendingPath = findPathOutsideScope(toolName, args, workspaceScope, {
       exemptPaths,
     })

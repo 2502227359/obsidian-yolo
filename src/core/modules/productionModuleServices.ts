@@ -21,7 +21,7 @@ import {
 import { SynchronizedModuleIntentStateSource } from './moduleIntentStateSource'
 import type { ModuleIntentStore } from './moduleIntentStore'
 import { ModuleLoader } from './moduleLoader'
-import { ModuleManager, compareModuleVersions } from './moduleManager'
+import { ModuleManager } from './moduleManager'
 import {
   ModuleReadinessReconciler,
   type ModuleReadinessResult,
@@ -30,6 +30,7 @@ import type { ModuleRuntimeQuiescence } from './moduleRuntimeReservation'
 import type { ModuleService } from './moduleService'
 import { ModuleStartupReconciler } from './moduleStartupReconciler'
 import {
+  ModuleArtifactMissingError,
   type ModuleArtifactPlatform,
   type ModuleStore,
   assertModuleId,
@@ -40,6 +41,7 @@ import {
   createOfficialModuleArtifactDownloader,
 } from './officialModuleArtifactDownloader'
 import { resolveOfficialModuleArtifactSources } from './officialModuleArtifactSources'
+import { compareModuleVersions } from './officialModuleCatalog'
 import {
   OfficialModuleCatalogSource,
   type OfficialModuleCompatibilityProvider,
@@ -64,9 +66,6 @@ export type ProductionModuleReadinessReconciler = Readonly<{
     moduleId: string,
     options?: Readonly<{ waitForSynchronizedArtifact?: boolean }>,
   ): Promise<ModuleReadinessResult>
-  reconcile(
-    moduleIds: readonly string[],
-  ): Promise<readonly ModuleReadinessResult[]>
   dispose(): void
 }>
 
@@ -340,6 +339,38 @@ export function createProductionModuleServices(
     manager,
     scheduleSafeUninstall: (moduleId: string) =>
       uninstallCoordinator.uninstall(moduleId),
+    // A device state is this device's claim about artifacts on this device.
+    // Deleting or reinstalling the plugin folder wipes the artifacts while the
+    // IndexedDB row survives, and that row then reports the module installed at
+    // a version whose bytes are gone: install is refused (nothing is newer than
+    // the "active" version) and uninstall is refused (no intent left to clear),
+    // leaving no way out. Drop the row once nothing declares the module and no
+    // artifacts remain. A missing intent alone is not enough — a moved YOLO
+    // base directory or a Vault that has not synced must never cost the user an
+    // installed module.
+    repairOrphanedInstall: async (moduleId: string) => {
+      const state = (await options.deviceStateStore.list()).find(
+        (candidate) => candidate.moduleId === moduleId,
+      )
+      if (!state) return
+      const versions = new Set(
+        [state.active?.version, state.pending?.descriptor.version].filter(
+          (version): version is string => version !== undefined,
+        ),
+      )
+      for (const version of versions) {
+        try {
+          const files = await options.store.listVersionFiles(moduleId, version)
+          if (files.length > 0) return
+        } catch (error) {
+          // An absent version tree is the case being repaired. Any other
+          // listing failure leaves presence unproven, and nothing is removed
+          // on uncertainty.
+          if (!(error instanceof ModuleArtifactMissingError)) throw error
+        }
+      }
+      await uninstallCoordinator.uninstall(moduleId)
+    },
     ...(options.reportStartupError
       ? { reportError: options.reportStartupError }
       : {}),
@@ -408,11 +439,10 @@ export function createProductionModuleServices(
       candidate.expectedVersion,
       options.platform,
     )
+    // See ModuleInstallationCoordinator: the hash, not the version, is what
+    // binds this download to the candidate the user confirmed.
     if (
       !descriptor ||
-      descriptor.id !== candidate.moduleId ||
-      descriptor.version !== candidate.expectedVersion ||
-      descriptor.platform !== options.platform ||
       descriptor.manifest.sha256 !== candidate.expectedManifestSha256
     ) {
       throw new Error(
@@ -687,53 +717,21 @@ export function createProductionModuleServices(
   })
 }
 
+/**
+ * The composition root's own invariants — the two that TypeScript cannot state.
+ *
+ * Everything this function used to check was the shape of internal host
+ * objects wired up a few lines below, which the type system already covers.
+ * What survives is the platform enum (it names on-disk state and artifact
+ * variants, so a wrong value is silent corruption rather than a type error)
+ * and the requirement that a catalog can be resolved at all.
+ */
 function assertOptions(options: ProductionModuleServicesOptions): void {
-  if (
-    !options ||
-    !options.store ||
-    !options.deviceStateStore ||
-    (!options.distributionFeedClient && !options.catalogSource) ||
-    (options.platform !== 'desktop' && options.platform !== 'mobile') ||
-    typeof options.getCompatibility !== 'function' ||
-    typeof options.isActive !== 'function' ||
-    typeof options.runtimeReservation?.isActive !== 'function' ||
-    typeof options.runtimeReservation?.activate !== 'function' ||
-    typeof options.runtimeReservation?.deactivate !== 'function' ||
-    typeof options.runtimeReservation?.runWithModuleQuiesced !== 'function' ||
-    typeof options.intentStore?.get !== 'function' ||
-    typeof options.intentStore?.set !== 'function' ||
-    typeof options.intentStore?.listModuleIds !== 'function' ||
-    typeof options.intentStore?.subscribeAll !== 'function' ||
-    (options.activationLoader !== undefined &&
-      typeof options.activationLoader.load !== 'function') ||
-    (options.skillProjection !== undefined &&
-      (typeof options.skillProjection.materialize !== 'function' ||
-        typeof options.skillProjection.remove !== 'function')) ||
-    (options.verifiedArtifactRegistry !== undefined &&
-      !(
-        options.verifiedArtifactRegistry instanceof
-        VerifiedModuleArtifactRegistry
-      )) ||
-    (options.artifactRequest !== undefined &&
-      typeof options.artifactRequest !== 'function') ||
-    (options.resolveDownloadSources !== undefined &&
-      typeof options.resolveDownloadSources !== 'function') ||
-    (options.artifactArrivalGrace !== undefined &&
-      typeof options.artifactArrivalGrace.waitForArtifact !== 'function') ||
-    (options.subscribeLocale !== undefined &&
-      typeof options.subscribeLocale !== 'function') ||
-    (options.reportCleanupError !== undefined &&
-      typeof options.reportCleanupError !== 'function') ||
-    (options.reportRefreshError !== undefined &&
-      typeof options.reportRefreshError !== 'function') ||
-    (options.reportActivationError !== undefined &&
-      typeof options.reportActivationError !== 'function') ||
-    (options.reportSkillProjectionError !== undefined &&
-      typeof options.reportSkillProjectionError !== 'function') ||
-    (options.reportStartupError !== undefined &&
-      typeof options.reportStartupError !== 'function')
-  ) {
-    throw new TypeError('Production module services options are invalid')
+  if (options.platform !== 'desktop' && options.platform !== 'mobile') {
+    throw new TypeError('Production module services platform is invalid')
+  }
+  if (!options.distributionFeedClient && !options.catalogSource) {
+    throw new TypeError('Production module services need a catalog source')
   }
 }
 
@@ -746,7 +744,6 @@ function createGuardedReadinessReconciler(
   runtime: ProductionModuleRuntimeReservation,
   setFailure: (moduleId: string, failure?: ModuleFailure) => void,
 ): ProductionModuleReadinessReconciler {
-  let disposed = false
   const record = (result: ModuleReadinessResult): ModuleReadinessResult => {
     setFailure(
       result.moduleId,
@@ -774,36 +771,6 @@ function createGuardedReadinessReconciler(
 
   return Object.freeze({
     ensureModuleReady,
-    async reconcile(moduleIds: readonly string[]) {
-      if (!Array.isArray(moduleIds)) {
-        throw new TypeError('Module readiness ids must be an array')
-      }
-      const ids = [...new Set(moduleIds)]
-      for (const moduleId of ids) assertModuleId(moduleId, 'Module id')
-      if (disposed) {
-        throw new Error('Module readiness reconciler is disposed')
-      }
-      return Object.freeze(
-        await Promise.all(
-          ids.sort().map(async (moduleId) => {
-            try {
-              return await ensureModuleReady(moduleId)
-            } catch (error) {
-              return Object.freeze({
-                moduleId,
-                status: 'failed' as const,
-                versions: Object.freeze([]),
-                repairedVersions: Object.freeze([]),
-                error: error instanceof Error ? error.message : String(error),
-              })
-            }
-          }),
-        ),
-      )
-    },
-    dispose: () => {
-      disposed = true
-      reconciler.dispose()
-    },
+    dispose: () => reconciler.dispose(),
   })
 }
